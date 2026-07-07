@@ -138,7 +138,6 @@ export function createHomeOutput({ bin, sessions, includeSessions = true }) {
       "Run `lavish-axi poll <html-file>` to wait for user feedback or browser-reported layout_warnings. It long-polls and stays silent until the user sends feedback, ends the session, or the real browser reports fresh layout_warnings, so leave it running - never kill it. Fix and re-check fresh error-severity layout_warnings before involving the human; if the poll says every current warning is persistent or low-severity, proceed with a note instead of looping. If your harness limits how long a foreground command may run, run the poll as a background task; if it gets killed or times out anyway, just re-run it - queued feedback is never lost. When it reports the session ended, stop polling and do not reopen it uninvited - deliver remaining updates in this conversation instead",
       "Run `lavish-axi end <html-file>` to end a session as the agent - ending it this way still allows a plain reopen later. When the user ends it from the browser instead, a later `lavish-axi <html-file>` refuses to reopen it without `--reopen`",
       "Run `lavish-axi export <html-file> [--out <path>]` to write a portable copy of the artifact - one HTML file with its LOCAL assets inlined - so it opens with no Lavish server and no sibling files. Remote CDN/font references are left as links, so it needs network to render those. Users can also export from the browser chrome's overflow menu",
-      "Run `lavish-axi share <html-file> [--password <pw>] [--token <t>]` to publish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and get back a visitable URL. Shares are PUBLIC by default, so anyone with the link can open them. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Local assets are inlined; remote refs load over the network. It returns the url plus a secret update_key for managing the page later. Use --token or LAVISH_AXI_HTML_APP_TOKEN only when you have an optional bearer token; it is never required. Users can also publish from the browser chrome's overflow menu",
       "Run `lavish-axi stop` to shut down the background server (it also self-stops when idle or after the last session ends with nothing connected)",
       `Run \`lavish-axi playbook <playbook_id>\` for focused artifact guidance. ${PLAYBOOK_ROUTER_HELP}`,
       DESIGN_SYSTEM_HINT,
@@ -450,24 +449,15 @@ function assetWarningSummaries(warnings) {
 // sending the artifact to ht-ml.app's servers. The service is not part of Lavish, needs no
 // account or API key, and returns the share URL plus the secret update_key for
 // managing the page later. Server-independent.
-async function shareCommand(args) {
-  const file = firstPositionalArg(args, ["--password", "--token"]);
-  if (!file) {
-    throw new AxiError("HTML file path is required", "VALIDATION_ERROR", ["Run `lavish-axi share <html-file>`"]);
-  }
-  await assertHtmlFile(file);
-  const absolute = await canonicalFile(file);
-  const password = optionalFlagString(flagValue(args, "--password"));
-  const token = optionalFlagString(flagValue(args, "--token"));
-  const root = path.dirname(absolute);
-  const source = await readFile(absolute, "utf8");
-  const { html, warnings } = await buildSelfContainedHtml(source, {
-    baseDir: root,
-    confineDir: root,
-    resolveAbsolute: resolveDesignAssetPath,
-  });
-  const site = await publishToHtmlApp(html, { password, token });
-  return createShareOutput({ source: absolute, site, warnings, passwordProtected: Boolean(password) });
+async function shareCommand(_args) {
+  throw new AxiError(
+    "The `share` command is disabled in this fork.",
+    "VALIDATION_ERROR",
+    [
+      "This fork of lavish-axi (askzy/lavish-axi) removes outbound publishing to ht-ml.app.",
+      "Use `lavish-axi export <html-file>` to produce a portable local HTML file instead.",
+    ],
+  );
 }
 
 export function createShareOutput({ source, site, warnings, passwordProtected = false }) {
@@ -561,32 +551,15 @@ async function designCommand() {
   return createDesignOutput();
 }
 
-async function setupCommand(args) {
-  if (args.length !== 1 || args[0] !== "hooks") {
-    throw new AxiError("Unknown setup action", "VALIDATION_ERROR", ["Run `lavish-axi setup hooks`"]);
-  }
-
-  const errors = [];
-  installSessionStartHooks({
-    marker: "lavish-axi",
-    binaryNames: ["lavish-axi"],
-    distEntrypoints: ["dist/cli.mjs", "bin/lavish-axi.js"],
-    homeDir: resolveHookHomeDir(),
-    onError: (message) => errors.push(message),
-  });
-  installCopilotCliSessionStartHook({
-    hookDir: resolveCopilotHookDir(process.env, resolveHookHomeDir()),
-    onError: (message) => errors.push(message),
-  });
-
-  if (errors.length > 0) {
-    throw new AxiError("Failed to install lavish-axi agent hooks", "SERVER_ERROR", errors);
-  }
-
-  return {
-    hooks: { status: "installed", integrations: "Claude Code, Codex, OpenCode, GitHub Copilot CLI" },
-    help: ["Restart your agent session to receive lavish-axi ambient context"],
-  };
+async function setupCommand(_args) {
+  throw new AxiError(
+    "The `setup hooks` command is disabled in this fork.",
+    "VALIDATION_ERROR",
+    [
+      "This fork of lavish-axi (askzy/lavish-axi) removes automated SessionStart hook installation.",
+      "If you want lavish-axi ambient context in your agent, wire it up manually in your agent settings.",
+    ],
+  );
 }
 
 export function resolveHookHomeDir(env = process.env, fallback = os.homedir()) {
@@ -1012,18 +985,18 @@ export function getCommandHelp(command) {
   return COMMAND_HELP[command] || null;
 }
 
-const TOP_LEVEL_HELP = `lavish-axi - Lavish Editor AXI\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--agent-reply "..."]\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi share <html-file> [--password <pw>] [--token <t>]\n  lavish-axi stop\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n  lavish-axi setup hooks\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback, ends the session, or the browser reports fresh layout_warnings, staying silent while it waits - never kill it. Fix and re-check fresh error-severity layout_warnings before involving the human; persistent or low-severity findings may be surfaced with a note when the cause is not obvious. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. If your harness limits how long a foreground command may run, run the poll as a background task; if it gets killed or times out anyway, just re-run it - queued feedback is never lost. When the user ends a session from the browser, stop polling and do not reopen it uninvited - pass --reopen to <html-file> only when the user asks for further review or something important needs their visual attention.\n\n`;
+const TOP_LEVEL_HELP = `lavish-axi - Lavish Editor AXI (askzy fork: share + setup hooks disabled)\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--agent-reply "..."]\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi stop\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback, ends the session, or the browser reports fresh layout_warnings, staying silent while it waits - never kill it. Fix and re-check fresh error-severity layout_warnings before involving the human; persistent or low-severity findings may be surfaced with a note when the cause is not obvious. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. If your harness limits how long a foreground command may run, run the poll as a background task; if it gets killed or times out anyway, just re-run it - queued feedback is never lost. When the user ends a session from the browser, stop polling and do not reopen it uninvited - pass --reopen to <html-file> only when the user asks for further review or something important needs their visual attention.\n\n`;
 
 const COMMAND_HELP = {
   open: `Usage: lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n\nOpen or resume a Lavish Editor review session for an HTML artifact. Use --no-open when you need to ensure the server/session exists without opening another browser window. Use --no-gate to skip the open-time layout curtain for this browser open. If the user explicitly ended the session from the browser, this refuses to reopen it and returns guidance instead - pass --reopen to force it open when the user asks for further review or something important needs their visual attention. Sessions ended by the agent (\`lavish-axi end\`) reopen normally without the flag.\n`,
   poll: `Usage: lavish-axi poll <html-file> [--agent-reply "..."]\n\nThis command long-polls indefinitely for queued user prompts and browser-reported layout_warnings, then returns them to the agent. It stays silent while it waits - that is normal, never kill it. Fix and re-check fresh error-severity layout_warnings before involving the human; persistent or low-severity findings may be surfaced with a note when the cause is not obvious. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. If your harness limits how long a foreground command may run, run the poll as a background task and wait for it to finish; if it still gets killed or times out, just re-run it - queued feedback is never lost. Use --agent-reply after applying prior feedback to display your response in Lavish Editor before waiting again. When status is ended, stop polling and do not reopen the session uninvited - deliver remaining updates directly in this conversation instead.\n`,
   end: `Usage: lavish-axi end <html-file>\n\nEnd a Lavish Editor session as the agent. A session ended this way still reopens normally on the next \`lavish-axi <html-file>\`, unlike a user ending it from the browser, which requires --reopen.\n`,
   export: `Usage: lavish-axi export <html-file> [--out <path>]\n\nWrite a portable copy of an artifact: one HTML file with its LOCAL assets inlined (relative-path stylesheets, scripts, images, and fonts become inline <style>/<script> blocks and data URIs). Remote CDN/font references (https URLs) are left as links for the browser to load, so the file needs network to render those. Lavish makes no outbound requests - it only reads local files, confined to the artifact's directory. Defaults to writing <name>.export.html next to the source; pass --out to choose a path. The Lavish annotation SDK is never included in an export.\n`,
-  share: `Usage: lavish-axi share <html-file> [--password <pw>] [--token <t>]\n\nPublish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and print a visitable URL. Shares are PUBLIC by default: anyone with the link can open the page, and it may be indexed or scraped. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Builds the same local-inlined HTML as 'export' (local assets inlined; remote CDN/font URLs left as links and are not blocked by CSP on ht-ml.app, but still load over the viewer's network), then POSTs it to ht-ml.app's /v1 API. Creating a site needs no account or API key. The response includes the url plus a secret update_key (shown once) for updating or deleting the page later. Set LAVISH_AXI_HTML_APP_TOKEN (or pass --token) to attach an optional bearer token; it is never required. The annotation SDK is never included.\n`,
+  share: `The \`share\` command is disabled in this fork (askzy/lavish-axi). Use \`lavish-axi export\` for a portable local file instead.\n`,
   stop: `Usage: lavish-axi stop [--port <port>]\n\nShut down the background Lavish Editor server. The server also stops itself when no browser or poll has been connected for a while (LAVISH_AXI_IDLE_TIMEOUT_MS, default 30m) and immediately when the last session ends with nothing connected.\n`,
   playbook: `Usage: lavish-axi playbook [playbook_id]\n\nList focused artifact guidance playbooks, or show one playbook by ID. Known IDs: diagram, table, comparison, plan, code, input, slides.\n\n${PLAYBOOK_ROUTER_HELP}\n\nExamples:\n  lavish-axi playbook\n  lavish-axi playbook diagram\n  lavish-axi playbook input\n`,
   design: `Usage: lavish-axi design\n\nShow a copy-pasteable CDN snippet for Tailwind CSS browser runtime v4 + DaisyUI v5 + themes, Mermaid diagram tooling, a content-to-playbook router, an optional layout safety CSS snippet, plus technical reference for DaisyUI components. ${PLAYBOOK_ROUTER_HELP} Lavish artifacts stay portable HTML. This CDN snippet is the design fallback, not the default: inspect the subject project before falling back, and paste the layout safety CSS only when useful for dense nested grid/flex layouts, badges, wide fonts, or local media. The strict priority order is: (1) if the user asked for a specific look or named design system, follow that; (2) otherwise, match the design system of the project the artifact is about, not necessarily your current working directory. If the artifact previews, proposes, or mocks a specific app's UI, use that app's own design system; (3) only when both come up empty, prefer the Lavish-recommended Tailwind + DaisyUI CDN snippet over hand-writing styles unless explicitly instructed otherwise by the user.\n`,
-  setup: `Usage: lavish-axi setup hooks\n\nInstall or repair agent SessionStart hooks for lavish-axi ambient context in Claude Code, Codex, OpenCode, and GitHub Copilot CLI. Restart your agent session afterward to receive the context.\n`,
+  setup: `The \`setup hooks\` command is disabled in this fork (askzy/lavish-axi). Wire up any lavish-axi ambient context manually in your agent settings if desired.\n`,
   server: `Usage: lavish-axi server [--port 4387] [--verbose]\n\nRun the local Lavish Editor server. Pass --verbose (or set LAVISH_AXI_DEBUG=1) to log session and watcher events to stderr. Detached server output is appended to ~/.lavish-axi/server.log, or LAVISH_AXI_STATE_DIR/server.log when set, for startup and crash diagnostics.\n\nLAVISH_AXI_HOST sets the bind address (default 127.0.0.1; a wildcard 0.0.0.0 or :: binds every interface). Binding beyond loopback exposes an unauthenticated server that can read and serve arbitrary local files to anything that can reach it, so only do so on a trusted network. LAVISH_AXI_LINK_HOST sets the hostname written into generated session links (default: the bind address, or loopback when bound to a wildcard). LAVISH_AXI_NO_OPEN=1 (or --no-open) suppresses the local browser launch.\n`,
 };
 
