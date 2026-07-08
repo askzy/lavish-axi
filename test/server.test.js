@@ -613,7 +613,7 @@ test("chrome disables sending only while working or ended", async () => {
   assert.match(js, /let agentPresence = "waiting"/);
   assert.match(js, /function updateSendState\(\)/);
   assert.match(js, /sendButton\.disabled = ended \|\| agentPresence === "working"/);
-  assert.match(js, /sendCaret\.disabled = ended \|\| agentPresence === "working"/);
+  assert.match(js, /sendAndEndButton\.disabled = sendButton\.disabled/);
   assert.doesNotMatch(js, /hasContent/);
 });
 
@@ -622,23 +622,28 @@ test("sending with an empty composer nudges instead of blocking", async () => {
   const js = await chromeClientSource();
   const css = await chromeCssSource();
 
-  assert.match(html, /class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.</);
+  assert.match(html, /class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div>/);
   assert.match(js, /function showSendHint\(\)/);
   assert.match(js, /sendHint\.hidden = false/);
   assert.match(js, /chatInput\.focus\(\)/);
   assert.match(css, /\.send-hint\{/);
 });
 
-test("composer send is a split button with a send-and-end option", async () => {
+test("composer offers two always-visible top-level send actions", async () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
   const css = await chromeCssSource();
 
-  assert.match(html, /class="button send-main" id="send">Send to Agent</);
-  assert.match(html, /class="button send-caret" id="sendCaret"/);
-  assert.match(html, /class="menu send-menu" id="sendMenu" hidden/);
-  assert.match(html, /id="sendAndEnd"[^<]*>.*Send &amp; end session/);
-  assert.match(css, /\.send-main\{[^}]*border-radius:var\(--radius-md\) 0 0 var\(--radius-md\)/);
-  assert.match(css, /\.send-caret\{[^}]*border-left:1px solid rgba\(23,19,10,.22\)/);
+  assert.match(html, /class="button" id="send">Send to Agent</);
+  assert.match(html, /class="button button-danger" id="sendAndEnd"[^<]*>.*Send &amp; End</);
+  assert.match(
+    html,
+    /<div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">.*<button class="button" id="send">Send to Agent<\/button><\/div>/,
+  );
+  assert.doesNotMatch(html, /id="sendCaret"/);
+  assert.doesNotMatch(html, /id="sendMenu"/);
+  assert.doesNotMatch(html, /id="sendFromMenu"/);
+  assert.match(css, /\.button-danger\{[^}]*color:var\(--danger\)/);
+  assert.match(css, /\.actions\{[^}]*min-width:0/);
 });
 
 test("send and end submits queued prompts before ending the session", async () => {
