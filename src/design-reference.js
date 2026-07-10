@@ -19,11 +19,108 @@ export const DESIGN_CDN_SNIPPET = `<link rel="stylesheet" href="${DESIGN_CDN_URL
 export const MERMAID_CDN_SNIPPET = `<script type="module">
   import mermaid from "${MERMAID_CDN_URL}";
 
-  mermaid.initialize({
-    startOnLoad: true,
-    theme: "base",
-    securityLevel: "strict",
-  });
+  // Render Mermaid in a theme that matches the artifact page, and re-render when
+  // the viewer flips the page theme - Mermaid never restyles an already-rendered
+  // SVG on its own, so a fixed theme clashes in either light or dark mode.
+  const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+  // Normalize any CSS color the browser produces (rgb, oklch, hsl, named, ...)
+  // to [r, g, b, a] bytes via a 1x1 canvas, so parsing never breaks on modern
+  // color syntaxes like DaisyUI's oklch() values.
+  const paint = document.createElement("canvas").getContext("2d");
+  function toRgba(color) {
+    paint.clearRect(0, 0, 1, 1);
+    paint.fillStyle = "#000";
+    paint.fillStyle = color;
+    paint.fillRect(0, 0, 1, 1);
+    return paint.getImageData(0, 0, 1, 1).data;
+  }
+
+  function compositeRgba(foreground, background) {
+    const foregroundAlpha = foreground[3] / 255;
+    const backgroundAlpha = background[3] / 255;
+    const alpha = foregroundAlpha + backgroundAlpha * (1 - foregroundAlpha);
+    if (alpha === 0) return [0, 0, 0, 0];
+    return [
+      (foreground[0] * foregroundAlpha + background[0] * backgroundAlpha * (1 - foregroundAlpha)) / alpha,
+      (foreground[1] * foregroundAlpha + background[1] * backgroundAlpha * (1 - foregroundAlpha)) / alpha,
+      (foreground[2] * foregroundAlpha + background[2] * backgroundAlpha * (1 - foregroundAlpha)) / alpha,
+      alpha * 255,
+    ];
+  }
+
+  function pageIsDark() {
+    // Trust the actually-rendered page background so this works with any theming
+    // mechanism: prefers-color-scheme, a data-theme attribute, or plain CSS.
+    const root = document.documentElement;
+    const rootBackground = toRgba(getComputedStyle(root).backgroundColor);
+    const bodyBackground = document.body ? toRgba(getComputedStyle(document.body).backgroundColor) : [0, 0, 0, 0];
+    const [r, g, b, a] = compositeRgba(bodyBackground, rootBackground);
+    if (a > 0) {
+      return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.5;
+    }
+    const colorScheme = getComputedStyle(root).colorScheme;
+    if (colorScheme.includes("dark") && !colorScheme.includes("light")) return true;
+    if (colorScheme.includes("light") && !colorScheme.includes("dark")) return false;
+    return darkQuery.matches;
+  }
+
+  const diagrams = [...document.querySelectorAll(".mermaid")].map((el) => ({ el, src: el.textContent }));
+  let applied;
+  let rendering = false;
+  let queued = false;
+  function queueRender() {
+    queued = true;
+    if (rendering) return;
+    void render();
+  }
+  async function render() {
+    rendering = true;
+    try {
+      while (queued) {
+        queued = false;
+        const theme = pageIsDark() ? "dark" : "default";
+        if (theme === applied) continue;
+        mermaid.initialize({ startOnLoad: false, theme, securityLevel: "strict" });
+        for (const { el, src } of diagrams) {
+          el.removeAttribute("data-processed");
+          el.textContent = src;
+        }
+        try {
+          await mermaid.run({ nodes: diagrams.map((d) => d.el) });
+        } catch (error) {
+          console.error("Mermaid diagram render failed:", error);
+          return;
+        }
+        applied = theme;
+      }
+    } finally {
+      rendering = false;
+      if (queued) queueRender();
+    }
+  }
+
+  // First render once stylesheets are applied (no wrong-theme flash), then keep
+  // the diagrams in sync with page-theme toggles and OS light/dark changes.
+  if (document.readyState === "complete") queueRender();
+  else window.addEventListener("load", queueRender, { once: true });
+  const themeObserver = new MutationObserver(queueRender);
+  for (const el of [document.documentElement, document.body]) {
+    if (!el) continue;
+    themeObserver.observe(el, {
+      attributes: true,
+      attributeFilter: ["data-theme", "class", "style"],
+    });
+  }
+  document.addEventListener("change", queueRender, true);
+  document.addEventListener(
+    "transitionend",
+    ({ propertyName }) => {
+      if (propertyName === "background-color") queueRender();
+    },
+    true,
+  );
+  darkQuery.addEventListener("change", queueRender);
 </script>`;
 
 export const LAYOUT_SAFETY_CSS_SNIPPET = `<style>
