@@ -50,6 +50,26 @@ import {
 import { DESIGN_PRIORITY_RULE, DESIGN_SYSTEM_HINT } from "../src/design-reference.js";
 import { serve } from "../src/server.js";
 
+// Upstream #174's wake-path contract, minus its foreground-by-default mandate: this fork keeps an
+// explicit background-poll allowance because the harness caps foreground command duration. The
+// observability requirements below are the part that matters and are asserted unchanged.
+function assertObservablePollWakePath(text) {
+  assert.match(text, /Run the poll in the foreground when your harness allows it/i);
+  assert.match(text, /returns the feedback directly to the agent/i);
+  assert.match(text, /running the poll as a background task is expected and supported/i);
+  assert.match(text, /harness-native tracked background-job facility/i);
+  assert.match(text, /guaranteed to resume or notify the same agent/i);
+  assert.match(text, /Never use `nohup`/);
+  assert.match(text, /shell `&`/);
+  assert.match(text, /`disown`/);
+  assert.match(text, /redirected fire-and-forget processes/);
+  assert.match(text, /detached terminal without an explicit verified callback/);
+  assert.match(text, /no completion-aware background facility/i);
+  assert.match(text, /verified wake callback into the surrounding supervisor/i);
+  assert.match(text, /Do not tell the user the artifact is being monitored until that wake path is live/i);
+}
+
+
 test("CLI version tracks package.json so release-please bumps reach the published binary", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(VERSION, packageJson.version);
@@ -119,7 +139,7 @@ test("the design-priority rule is single-sourced and keeps its three-step semant
   assert.match(DESIGN_SYSTEM_HINT, /state which of the three design sources/);
 });
 
-test("home output warns agents that poll is a long poll they must not kill", () => {
+test("home output warns agents that poll needs an observable wake path", () => {
   const output = createHomeOutput({ bin: "lavish-axi", sessions: [] });
   const pollHelp = output.help.find((item) => item.includes("lavish-axi poll <html-file>"));
 
@@ -127,9 +147,11 @@ test("home output warns agents that poll is a long poll they must not kill", () 
   assert.match(pollHelp, /long-poll/);
   assert.match(pollHelp, /stays silent/);
   assert.match(pollHelp, /never kill it/);
-  assert.match(pollHelp, /background task/);
+  assertObservablePollWakePath(pollHelp);
   assert.match(pollHelp, /re-run/);
   assert.match(pollHelp, /queued feedback is never lost/);
+  assert.match(pollHelp, /`Send & End` ends the session/);
+  assert.match(pollHelp, /final feedback is still delivered once/);
   assert.doesNotMatch(pollHelp, /above 10 minutes/);
 });
 
@@ -570,12 +592,14 @@ test("open output keeps the user URL in session data and next_step focused on po
   // Keyword-level lock on the load-bearing semantics of this agent-facing string:
   // poll now (not the user-facing URL), never kill the poll, no --timeout-ms, and the
   // reopen etiquette. Sentence-level phrasing is free to change without touching this test.
-  assert.doesNotMatch(output.next_step, /Tell the user/i);
+  assert.doesNotMatch(output.next_step, /Tell the user (?:to open|to visit)/i);
   assert.doesNotMatch(output.next_step, /http:\/\/localhost:4387\/session\/abc123/);
   assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
   assert.match(output.next_step, /lavish-axi poll \/tmp\/artifact\.html/);
   assert.match(output.next_step, /layout_warnings/);
   assert.match(output.next_step, /never kill it/);
+  assertObservablePollWakePath(output.next_step);
+  assert.match(output.next_step, /queued feedback is never lost/);
   assert.match(output.next_step, /Do not pass --timeout-ms/);
   assert.match(output.next_step, /If the user ends the session, stop polling and do not reopen it/);
   assert.match(output.next_step, /--reopen/);
@@ -807,16 +831,18 @@ test("password-protected share output with unresolved assets still mentions the 
 // inverted guards - restoring the command would have turned them green.
 // test/fork-customizations.test.js asserts the rejection instead.
 
-test("poll help warns agents to leave the long poll running", () => {
+test("poll help requires an observable wake path", () => {
   const help = getCommandHelp("poll");
 
   assert.match(help, /long-polls indefinitely/);
   assert.match(help, /stays silent/);
   assert.match(help, /never kill it/);
-  assert.match(help, /background task/);
+  assertObservablePollWakePath(help);
   assert.match(help, /queued feedback is never lost/);
   assert.match(help, /Do not pass --timeout-ms/);
   assert.match(help, /tests and debugging only/);
+  assert.match(help, /`Send & End` ends the session/);
+  assert.match(help, /final feedback is still delivered once/);
   assert.doesNotMatch(help, /above 10 minutes/);
 });
 
@@ -824,7 +850,7 @@ test("poll help warns agents to leave the long poll running", () => {
 // gone: this fork's share help says the command is disabled. See
 // test/fork-customizations.test.js for the fork-branded help assertions.
 
-test("feedback next step tells agents to keep polling without timeout flag", () => {
+test("feedback next step keeps the next poll completion observable", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
     response: { status: "feedback", dom_snapshot: "", prompts: [] },
@@ -833,7 +859,7 @@ test("feedback next step tells agents to keep polling without timeout flag", () 
   assert.equal("layout_warnings" in output, false);
   assert.match(output.next_step, /never kill it/);
   assert.match(output.next_step, /without --timeout-ms/);
-  assert.match(output.next_step, /background task/);
+  assertObservablePollWakePath(output.next_step);
   assert.match(output.next_step, /queued feedback is never lost/);
   assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
   assert.match(output.next_step, /fresh layout_warnings/);

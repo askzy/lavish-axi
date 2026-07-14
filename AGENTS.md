@@ -115,6 +115,8 @@ ht-ml.app serves hosted pages with no CSP and no sandbox header, so remote CDN/f
 
 The CLI is built on `axi-sdk-js` (`runAxiCli`).
 The `home()` callback returns the rich object shown when the user runs `lavish-axi` with no arguments - the same TOON-serialized output that lands in the agent's optional `SessionStart` hook after `lavish-axi setup hooks`; top-level `--help` returns the same static guidance without dynamic sessions.
+Poll execution guidance is shared across home output, help, `next_step` responses, and the generated skill through `POLL_WAKE_PATH_RULES`, so every surface states one completion-aware wake-path contract. This fork keeps upstream's requirement that a poll's wake path be observable but drops its foreground-by-default mandate: harnesses here cap foreground command duration, so a tracked background poll is a supported path, and the remaining rules (a completion-aware facility, no fire-and-forget, no "monitoring" claim before the wake path is live) are what keep it from becoming a dead feedback loop.
+
 Agent-facing design guidance is single-sourced in `src/design-reference.js`: `DESIGN_PRIORITY_RULE` states the design-direction priority order exactly once, and `DESIGN_SYSTEM_HINT`, the `lavish-axi design` summary, and the design command help all embed it - never restate the rule on another surface (README carries only a one-sentence summary).
 `src/skill.js` renders the installable Agent Skill from the same home output, rewriting command examples to non-interactive `npx -y lavish-axi ...` invocations and omitting live session state.
 The generated skill intentionally omits a `version` frontmatter field because release-please updates `package.json` without regenerating `skills/lavish/SKILL.md`.
