@@ -887,8 +887,8 @@ test("layout warning feedback tells agents to fix layout before involving the hu
 
   assert.ok("layout_warnings" in output);
   assert.equal(output.layout_warnings.length, 1);
-  assert.match(output.next_step, /1 layout warning detected/);
-  assert.match(output.next_step, /fix horizontal overflow/);
+  assert.match(output.next_step, /1 proven severe layout failure detected/);
+  assert.match(output.next_step, /repair the inaccessible or unusable content/);
   assert.match(output.next_step, /before involving the human/);
   assert.doesNotMatch(output.next_step, /reload or re-open/);
 });
@@ -960,7 +960,41 @@ test("the final feedback batch before an agent end preserves ended_by and allows
   assert.doesNotMatch(output.next_step, /user ended this Lavish Editor session/);
 });
 
-test("persistent layout warnings after a failed fix attempt permit proceeding to the human", () => {
+test("final user-ended feedback still requires severe layout repair without reopening", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      prompts: [],
+      layout_warnings: [{ selector: "button", kind: "clipped-control", severity: "error" }],
+      session_ended: true,
+      ended_by: "user",
+    },
+  });
+
+  assert.match(output.next_step, /Repair the inaccessible or unusable content/);
+  assert.match(output.next_step, /open it directly at the affected viewport/);
+  assert.match(output.next_step, /without reopening this ended Lavish session/);
+  assert.doesNotMatch(output.next_step, /--reopen/);
+});
+
+test("final agent-ended feedback requires repair in a fresh audit session", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      prompts: [],
+      layout_warnings: [{ selector: "button", kind: "clipped-control", severity: "error" }],
+      session_ended: true,
+      ended_by: "agent",
+    },
+  });
+
+  assert.match(output.next_step, /Repair the inaccessible or unusable content/);
+  assert.match(output.next_step, /open a fresh session and re-check the real-browser audit/);
+});
+
+test("persistent severe layout failures still require repair before review", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
     response: {
@@ -969,23 +1003,23 @@ test("persistent layout warnings after a failed fix attempt permit proceeding to
       prompts: [],
       layout_warnings: [
         {
-          selector: "main > header > strong",
-          kind: "overlapping-text",
-          overflowPx: 0,
-          viewportWidth: 720,
-          severity: "warning",
+          selector: "html",
+          kind: "page-horizontal-overflow",
+          overflowPx: 120,
+          viewportWidth: 390,
+          severity: "error",
           persistent: true,
         },
       ],
     },
   });
 
-  assert.match(output.next_step, /already reported in a prior poll/);
-  assert.match(output.next_step, /fine to proceed to the human with a short note/);
-  assert.doesNotMatch(output.next_step, /fix horizontal overflow/);
+  assert.match(output.next_step, /proven severe layout failure/);
+  assert.match(output.next_step, /before involving the human/);
+  assert.doesNotMatch(output.next_step, /fine to proceed/);
 });
 
-test("low-severity text-flow warnings permit proceeding to the human without looping", () => {
+test("warning-only layout observations are omitted from poll output", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
     response: {
@@ -994,23 +1028,29 @@ test("low-severity text-flow warnings permit proceeding to the human without loo
       prompts: [],
       layout_warnings: [
         {
-          selector: "main > header > code",
-          kind: "overlapping-text",
-          overflowPx: 0,
+          selector: ".accent",
+          kind: "element-parent-overflow",
+          overflowPx: 20,
           viewportWidth: 720,
           severity: "warning",
+          persistent: false,
+        },
+        {
+          selector: ".unproven",
+          kind: "clipped-text",
+          overflowPx: 200,
+          viewportWidth: 720,
           persistent: false,
         },
       ],
     },
   });
 
-  assert.match(output.next_step, /low-severity layout warning/);
-  assert.match(output.next_step, /fine to proceed to the human with a note/);
-  assert.doesNotMatch(output.next_step, /fix horizontal overflow/);
+  assert.equal("layout_warnings" in output, false);
+  assert.doesNotMatch(output.next_step, /layout warning/);
 });
 
-test("a mix of fresh error-severity and persistent warnings still mandates a fix pass", () => {
+test("a mix of fresh and persistent severe failures still mandates a fix pass", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
     response: {
@@ -1038,41 +1078,8 @@ test("a mix of fresh error-severity and persistent warnings still mandates a fix
     },
   });
 
-  assert.match(output.next_step, /2 layout warnings detected - fix horizontal overflow/);
+  assert.match(output.next_step, /2 proven severe layout failures detected/);
   assert.match(output.next_step, /before involving the human/);
-});
-
-test("a mix of persistent errors and fresh low-severity warnings permits proceeding", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      dom_snapshot: "",
-      prompts: [],
-      layout_warnings: [
-        {
-          selector: ".badge",
-          kind: "clipped-text",
-          overflowPx: 12,
-          viewportWidth: 720,
-          severity: "error",
-          persistent: true,
-        },
-        {
-          selector: "main > header > code",
-          kind: "overlapping-text",
-          overflowPx: 0,
-          viewportWidth: 720,
-          severity: "warning",
-          persistent: false,
-        },
-      ],
-    },
-  });
-
-  assert.match(output.next_step, /no fresh error-severity findings/);
-  assert.match(output.next_step, /fine to proceed to the human with a note/);
-  assert.doesNotMatch(output.next_step, /fix horizontal overflow/);
 });
 
 test("poll wait messages tell watching agents the silence is normal", () => {
