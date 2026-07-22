@@ -7,25 +7,84 @@ import { normalizeMermaidNodeTarget } from "./mermaid-node.js";
 export class SessionStore {
   constructor(file) {
     this.file = file;
+    // Serializes every public operation into a single promise chain. The store's methods are
+    // read-modify-write over one JSON file with `await`s in the middle (readFile ... writeFile),
+    // so two overlapping HTTP handlers (e.g. POST /prompts racing POST /layout-warnings or a poll
+    // drain) would each read the same snapshot and the last writer would clobber the other's
+    // mutation - dropping queued feedback. Running each operation to completion before the next
+    // starts makes the read-modify-write atomic and removes that lost-update race.
+    this._tail = Promise.resolve();
   }
 
-  async listSessions() {
+  // Run `task` after all previously-enqueued operations settle, keeping the chain alive across
+  // both fulfilment and rejection so one failed op never wedges the store.
+  /**
+   * @template T
+   * @param {() => Promise<T>} task
+   * @returns {Promise<T>}
+   */
+  _locked(task) {
+    const run = this._tail.then(task, task);
+    this._tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  listSessions() {
+    return this._locked(() => this._listSessions());
+  }
+
+  findByFile(file) {
+    return this._locked(() => this._findByFile(file));
+  }
+
+  findByKey(key) {
+    return this._locked(() => this._findByKey(key));
+  }
+
+  upsertSession(file, url) {
+    return this._locked(() => this._upsertSession(file, url));
+  }
+
+  queuePrompts(key, payload) {
+    return this._locked(() => this._queuePrompts(key, payload));
+  }
+
+  recordLayoutWarnings(key, payload) {
+    return this._locked(() => this._recordLayoutWarnings(key, payload));
+  }
+
+  takeFeedback(key) {
+    return this._locked(() => this._takeFeedback(key));
+  }
+
+  endSession(key, endedBy = "agent") {
+    return this._locked(() => this._endSession(key, endedBy));
+  }
+
+  addAgentReply(key, text) {
+    return this._locked(() => this._addAgentReply(key, text));
+  }
+
+  async _listSessions() {
     const state = await this.readState();
     return Object.values(state.sessions).sort((a, b) => a.file.localeCompare(b.file));
   }
 
-  async findByFile(file) {
+  async _findByFile(file) {
     const absolute = await canonicalFile(file);
     const state = await this.readState();
     return state.sessions[sessionKey(absolute)] || null;
   }
 
-  async findByKey(key) {
+  async _findByKey(key) {
     const state = await this.readState();
     return state.sessions[key] || null;
   }
 
-  async upsertSession(file, url) {
+  async _upsertSession(file, url) {
     const absolute = await canonicalFile(file);
     const key = sessionKey(absolute);
     const state = await this.readState();
@@ -50,7 +109,7 @@ export class SessionStore {
     return session;
   }
 
-  async queuePrompts(key, payload) {
+  async _queuePrompts(key, payload) {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {
@@ -74,7 +133,7 @@ export class SessionStore {
     return session;
   }
 
-  async recordLayoutWarnings(key, payload) {
+  async _recordLayoutWarnings(key, payload) {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {
@@ -109,7 +168,7 @@ export class SessionStore {
     return { session, changed: warningsChanged, hasWarnings: layoutWarnings.length > 0 };
   }
 
-  async takeFeedback(key) {
+  async _takeFeedback(key) {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {
@@ -152,7 +211,7 @@ export class SessionStore {
   // `endedBy` distinguishes a human ending review from the browser chrome ("user") from an
   // agent explicitly closing the loop via `lavish-axi end` ("agent"). Only a user-initiated end
   // blocks a plain reopen - see `SessionStore` callers in server.js.
-  async endSession(key, endedBy = "agent") {
+  async _endSession(key, endedBy = "agent") {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {
@@ -167,7 +226,7 @@ export class SessionStore {
     return session;
   }
 
-  async addAgentReply(key, text) {
+  async _addAgentReply(key, text) {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {

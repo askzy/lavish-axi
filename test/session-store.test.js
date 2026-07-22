@@ -589,3 +589,41 @@ test("freeform user prompts are stored in session chat history", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("concurrent queue and layout-warning writes do not drop queued feedback", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+
+    // Reproduces the send-message race: a POST /prompts (queued annotation + freeform message)
+    // overlapping a POST /layout-warnings triggered by the same snapshot/render cycle. Before the
+    // store serialized its operations, the layout-warning write read a pre-queue snapshot and, on
+    // an unlucky interleave, clobbered session.prompts back to [] - silently dropping the feedback.
+    await Promise.all([
+      store.queuePrompts(session.key, {
+        domSnapshot: 'uid=1 h1 "Hello"',
+        prompts: [
+          { uid: "1", prompt: "Make this warmer", selector: "h1", tag: "h1", text: "Hello" },
+          { uid: "", prompt: "Also ship it", selector: "", tag: "message", text: "Freeform message" },
+        ],
+      }),
+      store.recordLayoutWarnings(session.key, {
+        layout_warnings: [{ selector: "h1", kind: "overflow", severity: "error", overflowPx: 12, viewportWidth: 390 }],
+      }),
+    ]);
+
+    const delivered = feedbackResult(await store.takeFeedback(session.key));
+    assert.deepEqual(
+      delivered.prompts.map((prompt) => prompt.prompt),
+      ["Make this warmer", "Also ship it"],
+    );
+    assert.equal(delivered.layout_warnings?.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
