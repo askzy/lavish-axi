@@ -467,15 +467,14 @@ function assetWarningSummaries(warnings) {
 // sending the artifact to ht-ml.app's servers. The service is not part of Lavish, needs no
 // account or API key, and returns the share URL plus the secret update_key for
 // managing the page later. Server-independent.
-async function shareCommand(_args) {
-  throw new AxiError(
-    "The `share` command is disabled in this fork.",
-    "VALIDATION_ERROR",
-    [
-      "This fork of lavish-axi (askzy/lavish-axi) removes outbound publishing to ht-ml.app.",
-      "Use `lavish-axi export <html-file>` to produce a portable local HTML file instead.",
-    ],
-  );
+// Exported so test/fork-customizations.test.js can assert directly that it rejects. The CLI
+// runner swallows handler errors into a process exit code, so an end-to-end spawn cannot tell
+// "disabled in this fork" apart from any other validation error.
+export async function shareCommand(_args) {
+  throw new AxiError("The `share` command is disabled in this fork.", "VALIDATION_ERROR", [
+    "This fork of lavish-axi (askzy/lavish-axi) removes outbound publishing to ht-ml.app.",
+    "Use `lavish-axi export <html-file>` to produce a portable local HTML file instead.",
+  ]);
 }
 
 export function createShareOutput({ source, site, warnings, passwordProtected = false }) {
@@ -569,15 +568,12 @@ async function designCommand() {
   return createDesignOutput();
 }
 
-async function setupCommand(_args) {
-  throw new AxiError(
-    "The `setup hooks` command is disabled in this fork.",
-    "VALIDATION_ERROR",
-    [
-      "This fork of lavish-axi (askzy/lavish-axi) removes automated SessionStart hook installation.",
-      "If you want lavish-axi ambient context in your agent, wire it up manually in your agent settings.",
-    ],
-  );
+// Exported for the same reason as shareCommand above.
+export async function setupCommand(_args) {
+  throw new AxiError("The `setup hooks` command is disabled in this fork.", "VALIDATION_ERROR", [
+    "This fork of lavish-axi (askzy/lavish-axi) removes automated SessionStart hook installation.",
+    "If you want lavish-axi ambient context in your agent, wire it up manually in your agent settings.",
+  ]);
 }
 
 export function resolveHookHomeDir(env = process.env, fallback = os.homedir()) {
