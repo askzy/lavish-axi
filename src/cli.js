@@ -228,6 +228,9 @@ async function pollCommand(args) {
   // The indefinite poll looks hung from the agent's side (stdout stays empty until the user
   // acts), so narrate the wait on stderr and leave re-run guidance behind if the agent's
   // harness kills the process anyway. stderr keeps the stdout JSON contract intact.
+  // The one-shot banner is that "not hung" signal and stays unconditional; only the recurring
+  // ticks - one line per minute, unbounded - are gated on an interactive stderr so piped,
+  // merged agent captures do not accumulate them.
   const onPollSignal = (signal) => {
     process.stderr.write(`\n${pollInterruptedText(absolute)}\n`);
     process.exit(signal === "SIGINT" ? 130 : 143);
@@ -239,7 +242,12 @@ async function pollCommand(args) {
     process.on("SIGINT", onPollSignal);
     process.on("SIGTERM", onPollSignal);
   }
-  const waitReporter = timeoutMs ? null : startPollWaitReporter({ file: absolute });
+  const waitReporter = timeoutMs
+    ? null
+    : startPollWaitReporter({
+        file: absolute,
+        narrateTicks: shouldNarratePollWaitTicks({ isTTY: process.stderr.isTTY }),
+      });
   try {
     const response = await fetchJson(`${baseUrl}/api/poll?file=${encodeURIComponent(absolute)}${timeoutQuery}`, {
       retries: 3,
@@ -253,6 +261,14 @@ async function pollCommand(args) {
       process.off("SIGTERM", onPollSignal);
     }
   }
+}
+
+// The recurring per-minute wait ticks are only useful to a human watching a terminal. Agent
+// harnesses capture the process output and merge stdout+stderr into one stream fed back to the
+// model as input tokens, so every tick costs tokens for zero agent value (~2.2k on a 35-minute
+// poll). Gate them on an interactive stderr - vendor-neutral, no harness-specific env checks.
+export function shouldNarratePollWaitTicks({ isTTY }) {
+  return Boolean(isTTY);
 }
 
 export function pollWaitBannerText(file) {
@@ -280,8 +296,10 @@ export function startPollWaitReporter({
     process.stderr.write(line);
   },
   intervalMs = 60_000,
+  narrateTicks = true,
 }) {
   write(`${pollWaitBannerText(file)}\n`);
+  if (!narrateTicks) return { stop: () => {} };
   let elapsedMs = 0;
   const timer = setInterval(() => {
     elapsedMs += intervalMs;

@@ -36,6 +36,7 @@ import {
   shutdownServerOnPort,
   shouldForceRestartForLocalBuild,
   shouldKillProcessOnPort,
+  shouldNarratePollWaitTicks,
   shouldOpenBrowser,
   shouldRestartServer,
   startPollWaitReporter,
@@ -990,6 +991,34 @@ test("poll wait reporter writes a banner immediately and heartbeats on an interv
   const countAfterStop = lines.length;
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(lines.length, countAfterStop, "stops heartbeating after stop()");
+});
+
+test("poll wait reporter still banners without ticks when narration is off", async () => {
+  const lines = [];
+  const reporter = startPollWaitReporter({
+    file: "/tmp/report.html",
+    write: (line) => {
+      lines.push(line);
+    },
+    intervalMs: 5,
+    narrateTicks: false,
+  });
+
+  try {
+    assert.equal(lines.length, 1, "the one-shot not-hung banner is unconditional");
+    assert.match(lines[0], /Long-polling for user feedback/);
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(lines.length, 1, "suppresses the recurring heartbeat lines");
+  } finally {
+    reporter.stop();
+  }
+});
+
+test("shouldNarratePollWaitTicks heartbeats only in an interactive terminal", () => {
+  assert.equal(shouldNarratePollWaitTicks({ isTTY: true }), true);
+  assert.equal(shouldNarratePollWaitTicks({ isTTY: undefined }), false);
+  assert.equal(shouldNarratePollWaitTicks({ isTTY: false }), false);
 });
 
 test("spawned poll announces the wait on stderr and leaves re-run guidance when killed", async () => {
