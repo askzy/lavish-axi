@@ -10,6 +10,9 @@ import test from "node:test";
 
 import { AxiError } from "axi-sdk-js";
 
+process.env.LAVISH_AXI_HOST = "127.0.0.1";
+process.env.LAVISH_AXI_LINK_HOST = "127.0.0.1";
+
 import {
   collapseHomeDirectory,
   computeCopilotCliHookUpdate,
@@ -36,6 +39,7 @@ import {
   shutdownServerOnPort,
   shouldForceRestartForLocalBuild,
   shouldKillProcessOnPort,
+  shouldNarratePollWaitTicks,
   shouldOpenBrowser,
   shouldRestartServer,
   startPollWaitReporter,
@@ -218,7 +222,6 @@ test("design output prints copy-pasteable CDN URLs so agents can opt in to Daisy
   assert.match(output.diagram_tooling.use_when, /hand-built div\/flexbox boxes/);
   assert.match(output.diagram_tooling.mermaid_cdn_snippet, /cdn\.jsdelivr\.net\/npm\/mermaid@\d+\.\d+\.\d+/);
   assert.match(output.diagram_tooling.mermaid_cdn_snippet, /mermaid\.initialize/);
-  assert.match(output.diagram_tooling.mermaid_cdn_snippet, /startOnLoad: true/);
   assert.match(
     output.diagram_tooling.cdn_urls.mermaid,
     /^https:\/\/cdn\.jsdelivr\.net\/npm\/mermaid@\d+\.\d+\.\d+\/dist\/mermaid\.esm\.min\.mjs$/,
@@ -278,6 +281,232 @@ test("diagram playbook names the hand-built flow anti-pattern", () => {
   assert.ok(output.playbook.pitfalls.some((item) => /hand-build boxes-and-arrows/i.test(item)));
   assert.ok(output.playbook.pitfalls.some((item) => /div\/flexbox/i.test(item)));
   assert.ok(output.playbook.pitfalls.some((item) => /does not auto-route edges/i.test(item)));
+});
+
+test("diagram playbook tells agents to keep Mermaid theming in sync with the page theme", () => {
+  const output = createPlaybookOutput(["diagram"]);
+
+  assert.ok(
+    output.playbook.design_rules.some(
+      (item) => /mermaid/i.test(item) && /theme/i.test(item) && /re-render/i.test(item),
+    ),
+    "diagram playbook must tell agents to theme Mermaid to the page and re-render on theme change",
+  );
+});
+
+test("design output emits a theme-aware Mermaid init that re-renders on page-theme change", () => {
+  const snippet = createDesignOutput().diagram_tooling.mermaid_cdn_snippet;
+
+  // The old bug: a single hardcoded Mermaid theme that ignores the page theme.
+  assert.doesNotMatch(snippet, /theme:\s*["']base["']/);
+
+  // It must choose the Mermaid theme from the page's effective light/dark
+  // appearance, covering both a data-theme toggle and the OS preference.
+  assert.match(snippet, /prefers-color-scheme:\s*dark/);
+  assert.match(snippet, /["']dark["']/);
+  assert.match(snippet, /["']default["']/);
+  assert.match(snippet, /backgroundColor/);
+
+  // Mermaid does not restyle an already-rendered SVG, so the snippet must
+  // re-render: it drives rendering itself and reacts to theme changes.
+  assert.match(snippet, /startOnLoad:\s*false/);
+  assert.match(snippet, /mermaid\.run/);
+  assert.match(snippet, /MutationObserver/);
+  assert.match(snippet, /data-theme/);
+  assert.match(snippet, /document\.addEventListener\(["']change["'],\s*queueRender,\s*true\)/);
+  assert.match(snippet, /document\.addEventListener\(\s*["']transitionend["']/);
+  assert.match(snippet, /background-color/);
+  assert.match(snippet, /function compositeRgba/);
+  assert.match(snippet, /colorScheme/);
+  assert.match(snippet, /addEventListener\(["']change["']/);
+});
+
+test("theme-aware Mermaid snippet serializes rapid theme-change renders", async () => {
+  const snippet = createDesignOutput()
+    .diagram_tooling.mermaid_cdn_snippet.replace(/^<script type="module">\n/, "")
+    .replace(/\n<\/script>$/, "")
+    .replace(/^\s*import mermaid from "[^"]+";\n/m, "");
+  let dark = false;
+  let observedThemeMutations = false;
+  const observedThemeTargets = [];
+  const documentListeners = new Map();
+  const initializedThemes = [];
+  const mediaListeners = [];
+  const pendingRenders = [];
+  const loggedRenderErrors = [];
+  let nextRenderError;
+  let activeRenders = 0;
+  let maxActiveRenders = 0;
+  let bodyColor = "white";
+  let rootColor = "white";
+  let rootColorScheme = "normal";
+  const paint = {
+    color: "",
+    clearRect() {},
+    set fillStyle(color) {
+      this.color = color;
+    },
+    fillRect() {},
+    getImageData() {
+      const colors = {
+        black: [0, 0, 0, 255],
+        transparent: [0, 0, 0, 0],
+        white: [255, 255, 255, 255],
+        "white-40": [255, 255, 255, 102],
+      };
+      return { data: colors[this.color] };
+    },
+  };
+  const diagram = {
+    textContent: "flowchart TD\\n  A --> B",
+    removeAttribute() {},
+  };
+  const document = {
+    body: { id: "body" },
+    documentElement: { id: "root" },
+    readyState: "complete",
+    createElement() {
+      return { getContext: () => paint };
+    },
+    querySelectorAll() {
+      return [diagram];
+    },
+    addEventListener(type, callback, capture) {
+      documentListeners.set(type, { callback, capture });
+    },
+  };
+  const darkQuery = {
+    get matches() {
+      return dark;
+    },
+    addEventListener(type, callback) {
+      assert.equal(type, "change");
+      mediaListeners.push(callback);
+    },
+  };
+  const window = {
+    matchMedia() {
+      return darkQuery;
+    },
+    addEventListener() {
+      assert.fail("the snippet should render immediately after document load");
+    },
+  };
+  class TestMutationObserver {
+    constructor() {
+      observedThemeMutations = true;
+    }
+
+    observe(target) {
+      observedThemeTargets.push(target);
+    }
+  }
+  const mermaid = {
+    initialize({ theme }) {
+      initializedThemes.push(theme);
+    },
+    run() {
+      activeRenders += 1;
+      maxActiveRenders = Math.max(maxActiveRenders, activeRenders);
+      if (nextRenderError) {
+        const error = nextRenderError;
+        nextRenderError = undefined;
+        activeRenders -= 1;
+        return Promise.reject(error);
+      }
+      return new Promise((resolve) => {
+        pendingRenders.push(() => {
+          activeRenders -= 1;
+          resolve();
+        });
+      });
+    },
+  };
+  function finishNextRender() {
+    const finish = pendingRenders.shift();
+    if (!finish) throw new Error("expected a pending Mermaid render");
+    finish();
+  }
+
+  new Function("mermaid", "window", "document", "MutationObserver", "getComputedStyle", "console", snippet)(
+    mermaid,
+    window,
+    document,
+    TestMutationObserver,
+    (element) => ({
+      backgroundColor: element === document.body ? bodyColor : rootColor,
+      colorScheme: element === document.documentElement ? rootColorScheme : "normal",
+    }),
+    { error: (...args) => loggedRenderErrors.push(args) },
+  );
+
+  assert.equal(mediaListeners.length, 1);
+  assert.equal(observedThemeMutations, true);
+  assert.deepEqual(observedThemeTargets, [document.documentElement, document.body]);
+  const changeListener = documentListeners.get("change");
+  assert.equal(typeof changeListener?.callback, "function");
+  assert.equal(changeListener?.capture, true);
+  const transitionListener = documentListeners.get("transitionend");
+  assert.equal(typeof transitionListener?.callback, "function");
+  assert.equal(transitionListener?.capture, true);
+  assert.deepEqual(initializedThemes, ["default"]);
+  bodyColor = "white-40";
+  rootColor = "black";
+  transitionListener.callback({ propertyName: "color" });
+  assert.deepEqual(initializedThemes, ["default"]);
+  transitionListener.callback({ propertyName: "background-color" });
+  assert.equal(maxActiveRenders, 1);
+  assert.deepEqual(initializedThemes, ["default"]);
+
+  finishNextRender();
+  await Promise.resolve();
+  assert.deepEqual(initializedThemes, ["default", "dark"]);
+  assert.equal(maxActiveRenders, 1);
+
+  finishNextRender();
+  await Promise.resolve();
+  assert.equal(activeRenders, 0);
+  assert.equal(initializedThemes.filter((entry) => entry === "dark").length, 1);
+
+  bodyColor = "transparent";
+  rootColor = "transparent";
+  rootColorScheme = "light";
+  changeListener.callback();
+  assert.deepEqual(initializedThemes, ["default", "dark", "default"]);
+  finishNextRender();
+  await Promise.resolve();
+
+  rootColorScheme = "dark";
+  transitionListener.callback({ propertyName: "background-color" });
+  assert.deepEqual(initializedThemes, ["default", "dark", "default", "dark"]);
+  finishNextRender();
+  await Promise.resolve();
+
+  const renderError = new Error("invalid Mermaid syntax");
+  nextRenderError = renderError;
+  rootColorScheme = "light";
+  transitionListener.callback({ propertyName: "background-color" });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(loggedRenderErrors, [["Mermaid diagram render failed:", renderError]]);
+
+  changeListener.callback();
+  assert.equal(activeRenders, 1);
+  finishNextRender();
+  await Promise.resolve();
+});
+
+test("Mermaid after evidence embeds the shipped theme-aware snippet", async () => {
+  const evidence = await readFile(new URL("../task-evidence/mermaid-theme/after.html", import.meta.url), "utf8");
+  const start = evidence.indexOf('    <script type="module">');
+  const closingScript = evidence.indexOf("    </script>", start);
+
+  assert.notEqual(start, -1);
+  assert.notEqual(closingScript, -1);
+  assert.equal(
+    evidence.slice(start, closingScript + "    </script>".length).replace(/^ {4}/gm, ""),
+    createDesignOutput().diagram_tooling.mermaid_cdn_snippet,
+  );
 });
 
 test("playbook detail output returns focused Lavish-native guidance", () => {
@@ -990,6 +1219,34 @@ test("poll wait reporter writes a banner immediately and heartbeats on an interv
   const countAfterStop = lines.length;
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(lines.length, countAfterStop, "stops heartbeating after stop()");
+});
+
+test("poll wait reporter still banners without ticks when narration is off", async () => {
+  const lines = [];
+  const reporter = startPollWaitReporter({
+    file: "/tmp/report.html",
+    write: (line) => {
+      lines.push(line);
+    },
+    intervalMs: 5,
+    narrateTicks: false,
+  });
+
+  try {
+    assert.equal(lines.length, 1, "the one-shot not-hung banner is unconditional");
+    assert.match(lines[0], /Long-polling for user feedback/);
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(lines.length, 1, "suppresses the recurring heartbeat lines");
+  } finally {
+    reporter.stop();
+  }
+});
+
+test("shouldNarratePollWaitTicks heartbeats only in an interactive terminal", () => {
+  assert.equal(shouldNarratePollWaitTicks({ isTTY: true }), true);
+  assert.equal(shouldNarratePollWaitTicks({ isTTY: undefined }), false);
+  assert.equal(shouldNarratePollWaitTicks({ isTTY: false }), false);
 });
 
 test("spawned poll announces the wait on stderr and leaves re-run guidance when killed", async () => {
