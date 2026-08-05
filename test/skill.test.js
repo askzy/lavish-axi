@@ -85,7 +85,6 @@ test("createSkillMarkdown requires an observable wake path for every poll", () =
   assert.doesNotMatch(md, /Codex detected/);
 });
 
-
 test("createSkillMarkdown requires opening every matching playbook", () => {
   const md = createSkillMarkdown();
   const playbooksSection = md.slice(md.indexOf("## Playbooks"), md.indexOf("## Commands & rules"));

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { AxiError, installSessionStartHooks, RESERVED_COMMANDS, runAxiCli } from "axi-sdk-js";
+import { AxiError, RESERVED_COMMANDS, runAxiCli } from "axi-sdk-js";
 
 import { createDesignOutput, DESIGN_PRIORITY_RULE, DESIGN_SYSTEM_HINT } from "./design-reference.js";
 import {
@@ -14,7 +14,6 @@ import {
   exportWarningSummaries,
   splitExportWarnings,
 } from "./export-bundle.js";
-import { publishToHtmlApp } from "./html-app.js";
 import { clientHost, defaultPort, ensureStateDir, hostForUrl, serverLogFile, stateFile } from "./paths.js";
 import { findPlaybook, listPlaybooks, playbookIds, PLAYBOOK_ROUTER_HELP } from "./playbooks.js";
 import { resolveDesignAssetPath, serve } from "./server.js";
@@ -487,6 +486,9 @@ function assetWarningSummaries(warnings) {
 // Exported so test/fork-customizations.test.js can assert directly that it rejects. The CLI
 // runner swallows handler errors into a process exit code, so an end-to-end spawn cannot tell
 // "disabled in this fork" apart from any other validation error.
+// The `never` return keeps it assignable to AxiCliCommand: an async function that only throws
+// otherwise infers Promise<void>, which does not satisfy the SDK's AxiRenderable result.
+/** @returns {Promise<never>} */
 export async function shareCommand(_args) {
   throw new AxiError("The `share` command is disabled in this fork.", "VALIDATION_ERROR", [
     "This fork of lavish-axi (askzy/lavish-axi) removes outbound publishing to ht-ml.app.",
@@ -585,7 +587,8 @@ async function designCommand() {
   return createDesignOutput();
 }
 
-// Exported for the same reason as shareCommand above.
+// Exported for the same reason as shareCommand above; `never` for the same typing reason.
+/** @returns {Promise<never>} */
 export async function setupCommand(_args) {
   throw new AxiError("The `setup hooks` command is disabled in this fork.", "VALIDATION_ERROR", [
     "This fork of lavish-axi (askzy/lavish-axi) removes automated SessionStart hook installation.",
@@ -994,11 +997,6 @@ function flagValue(args, flag) {
     if (arg.startsWith(`${flag}=`)) return arg.slice(flag.length + 1) || null;
   }
   return null;
-}
-
-function optionalFlagString(value) {
-  const trimmed = String(value ?? "").trim();
-  return trimmed || undefined;
 }
 
 function isValueFlagToken(arg, flags) {

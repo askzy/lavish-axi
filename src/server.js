@@ -21,13 +21,7 @@ import {
   MODE_TOGGLE_HOTKEY_KEY,
 } from "./artifact-sdk.js";
 import * as mermaidNode from "./mermaid-node.js";
-import {
-  buildSelfContainedHtml,
-  exportFileName,
-  exportWarningSummaries,
-  splitExportWarnings,
-} from "./export-bundle.js";
-import { publishToHtmlApp } from "./html-app.js";
+import { buildSelfContainedHtml, exportFileName, splitExportWarnings } from "./export-bundle.js";
 import { injectLavishSdk } from "./html-transform.js";
 import { bindHost, extraAllowedHosts, hostForUrl, IPV6_LOOPBACK_HOST, linkHost, LOOPBACK_HOST } from "./paths.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
@@ -92,7 +86,7 @@ export async function serve({
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
   let publicPort = port;
 
-  // DNS-rebinding guard. isSameOriginRequest stops classic cross-origin CSRF but
+  // DNS-rebinding guard. An Origin/Referer same-origin check stops classic cross-origin CSRF but
   // NOT DNS rebinding: a page that rebinds its own domain to this loopback port
   // sends that domain in both Origin and Host, so the two still match. The robust
   // defense is a Host-header allowlist - a rebound browser carries the attacker's
@@ -716,31 +710,6 @@ export function isAllowedRequestHost({ host, forwardedHost }, allowedHostnames) 
   const forwarded = forwardedHost === undefined || forwardedHost === null ? "" : String(forwardedHost).trim();
   if (forwarded === "") return true;
   return isAllowedHostHeader(forwarded.split(",").pop(), allowedHostnames);
-}
-
-// Guard state-changing, outward-facing routes (publishing to a third-party host) against CSRF: a
-// browser attaches an Origin/Referer that must match this server's own origin.
-function isSameOriginRequest(req) {
-  const expectedOrigin = `${req.protocol}://${req.get("host")}`;
-  const origin = req.get("origin");
-  if (origin) {
-    return normalizeOrigin(origin) === expectedOrigin;
-  }
-  const referer = req.get("referer");
-  return Boolean(referer) && normalizeOrigin(referer) === expectedOrigin;
-}
-
-function normalizeOrigin(value) {
-  try {
-    return new URL(value).origin;
-  } catch {
-    return "";
-  }
-}
-
-function optionalBodyString(value) {
-  const trimmed = String(value ?? "").trim();
-  return trimmed || undefined;
 }
 
 export function resolveArtifactAsset(root, assetPath) {

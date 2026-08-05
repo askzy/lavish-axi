@@ -69,7 +69,6 @@ function assertObservablePollWakePath(text) {
   assert.match(text, /Do not tell the user the artifact is being monitored until that wake path is live/i);
 }
 
-
 test("CLI version tracks package.json so release-please bumps reach the published binary", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(VERSION, packageJson.version);
