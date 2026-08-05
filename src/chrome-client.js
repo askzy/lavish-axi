@@ -20,10 +20,6 @@ const annotationPills = /** @type {HTMLDivElement} */ (document.getElementById("
 const chatLog = /** @type {HTMLDivElement} */ (document.getElementById("chatLog"));
 const chatInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("chatInput"));
 const sendButton = /** @type {HTMLButtonElement} */ (document.getElementById("send"));
-const sendCaret = /** @type {HTMLButtonElement} */ (document.getElementById("sendCaret"));
-const sendActions = /** @type {HTMLDivElement} */ (document.getElementById("sendActions"));
-const sendMenu = /** @type {HTMLDivElement} */ (document.getElementById("sendMenu"));
-const sendFromMenuButton = /** @type {HTMLButtonElement} */ (document.getElementById("sendFromMenu"));
 const sendAndEndButton = /** @type {HTMLButtonElement} */ (document.getElementById("sendAndEnd"));
 const annotationSwitch = /** @type {HTMLButtonElement} */ (document.getElementById("annotation"));
 const moreWrap = /** @type {HTMLDivElement} */ (document.getElementById("moreWrap"));
@@ -56,7 +52,7 @@ const layoutGateTitle = /** @type {HTMLDivElement} */ (document.getElementById("
 const layoutGateCopy = /** @type {HTMLParagraphElement} */ (document.getElementById("layoutGateCopy"));
 const layoutGateAction = /** @type {HTMLButtonElement} */ (document.getElementById("layoutGateAction"));
 const layoutIssueBanner = /** @type {HTMLDivElement} */ (document.getElementById("layoutIssueBanner"));
-const sendHint = /** @type {HTMLSpanElement} */ (document.getElementById("sendHint"));
+const sendHint = /** @type {HTMLDivElement} */ (document.getElementById("sendHint"));
 const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-artifact-src") || frame.src || "";
 
 const queued = loadQueuedPrompts();
@@ -152,8 +148,7 @@ function render() {
 
 function updateSendState() {
   sendButton.disabled = ended || agentPresence === "working";
-  sendCaret.disabled = ended || agentPresence === "working";
-  sendFromMenuButton.disabled = sendButton.disabled;
+  sendAndEndButton.disabled = sendButton.disabled;
 }
 
 function showSendHint() {
@@ -177,7 +172,6 @@ function setMenuOpen(button, menu, open) {
 
 function closeMenus() {
   setMenuOpen(moreButton, moreMenu, false);
-  setMenuOpen(sendCaret, sendMenu, false);
 }
 
 function toggleMenu(button, menu) {
@@ -319,11 +313,7 @@ function sendQueued(endAfter) {
     render();
   }
   if (!queued.length) {
-    if (endAfter) {
-      endSession();
-    } else {
-      showSendHint();
-    }
+    showSendHint();
     return;
   }
   hideSendHint();
@@ -387,14 +377,19 @@ async function submitQueuedOnce() {
 }
 
 function normalizeLayoutWarningsPayload(value) {
-  return Array.isArray(value) ? value.filter((item) => item && typeof item === "object") : [];
+  return Array.isArray(value)
+    ? value.filter((item) => item && typeof item === "object" && String(item.severity || "").toLowerCase() === "error")
+    : [];
 }
 
 function isErrorLayoutWarning(warning) {
   return String(warning?.severity || "").toLowerCase() === "error";
 }
 
-function setLayoutIssueBanner(visible, text = "This surface may have layout issues. Your agent has been notified.") {
+function setLayoutIssueBanner(
+  visible,
+  text = "This surface has a severe layout failure. Your agent has been notified.",
+) {
   if (!layoutIssueBanner) return;
   layoutIssueBanner.textContent = text;
   layoutIssueBanner.hidden = !visible;
@@ -411,7 +406,7 @@ function setLayoutGateCard(state) {
   if (state === "held") {
     layoutGateTitle.innerHTML = "Fixing a layout issue...";
     layoutGateCopy.textContent =
-      "The real browser found overflow or overlapping content. Your agent has been notified and this will reveal after the next clean reload.";
+      "The browser found inaccessible or unusable content. Your agent has been notified and this will reveal after the next clean reload.";
     return;
   }
 
@@ -434,12 +429,16 @@ function revealLayoutGate({ showBanner = false, bannerText = undefined } = {}) {
 
 function forceRevealLayoutGate(reason) {
   if (!layoutGateEnabled || ended) return;
+  if (reason === "timeout") {
+    // A delayed or unavailable audit is uncertainty, not evidence of a defect.
+    revealLayoutGate();
+    return;
+  }
   if (reason === "manual") layoutGateManuallyBypassed = true;
-  const bannerText =
-    reason === "timeout"
-      ? "This surface may have layout issues. Lavish revealed it after the safety timeout so review is never blocked."
-      : "This surface may have layout issues. You chose to show it before the layout check passed.";
-  revealLayoutGate({ showBanner: true, bannerText });
+  revealLayoutGate({
+    showBanner: true,
+    bannerText: "This surface has a severe layout failure. You chose to show it before the layout check passed.",
+  });
 }
 
 function startLayoutGateCycle() {
@@ -478,6 +477,7 @@ function handleLayoutWarningsForGate(layoutWarnings) {
     return;
   }
 
+  clearLayoutGateTimer();
   setLayoutGateCard("held");
   setLayoutGateActive(true);
 }
@@ -738,9 +738,7 @@ function toggleAnnotationMode() {
 annotationSwitch.onclick = toggleAnnotationMode;
 
 sendButton.onclick = () => sendQueued(false);
-sendFromMenuButton.onclick = () => sendQueued(false);
 sendAndEndButton.onclick = () => sendQueued(true);
-sendCaret.onclick = () => toggleMenu(sendCaret, sendMenu);
 moreButton.onclick = () => toggleMenu(moreButton, moreMenu);
 chatInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
@@ -769,7 +767,6 @@ endButton.onclick = () => {
 document.addEventListener("mousedown", (event) => {
   const target = /** @type {Node} */ (event.target);
   if (!moreMenu.hidden && !moreWrap.contains(target)) setMenuOpen(moreButton, moreMenu, false);
-  if (!sendMenu.hidden && !sendActions.contains(target)) setMenuOpen(sendCaret, sendMenu, false);
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {

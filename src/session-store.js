@@ -174,7 +174,7 @@ export class SessionStore {
     if (!session) {
       return { status: "missing" };
     }
-    // Prompts queued before the session ended (e.g. "Send & end session") must still reach the
+    // Prompts queued before the session ended (a browser send-and-end) must still reach the
     // agent, so deliver them before reporting the ended state; the next poll then sees ended.
     const prompts = session.prompts || [];
     const layoutWarnings = session.layout_warnings || [];
@@ -279,7 +279,20 @@ function normalizePrompt(prompt) {
 }
 
 function layoutWarningKey(warning) {
-  return `${warning.kind}:${warning.selector}`;
+  const viewportWidth = normalizeFiniteNumber(warning.viewportWidth);
+  const viewportClass = viewportWidth <= 640 ? "mobile" : viewportWidth <= 1024 ? "compact" : "desktop";
+  const overflowPx = normalizeFiniteNumber(warning.overflowPx);
+  const magnitude =
+    overflowPx <= 0
+      ? "none"
+      : overflowPx < 24
+        ? "small"
+        : overflowPx < 64
+          ? "medium"
+          : overflowPx < 160
+            ? "large"
+            : "extreme";
+  return `${warning.kind}:${warning.selector}:${warning.axis || ""}:${viewportClass}:${magnitude}`;
 }
 
 // A finding whose key was already delivered to the agent in a prior poll is marked persistent
@@ -288,17 +301,33 @@ function layoutWarningKey(warning) {
 function normalizeLayoutWarnings(layoutWarnings, deliveredKeys = new Set()) {
   if (!Array.isArray(layoutWarnings)) return [];
   return layoutWarnings
-    .filter((warning) => warning && typeof warning === "object" && !Array.isArray(warning))
+    .filter(
+      (warning) =>
+        warning &&
+        typeof warning === "object" &&
+        !Array.isArray(warning) &&
+        String(warning.severity || "").toLowerCase() === "error",
+    )
     .map((warning) => {
       const selector = String(warning.selector || "");
-      const kind = String(warning.kind || "layout-warning");
+      const kind = String(warning.kind || "layout-failure");
+      const axis = warning.axis === "vertical" ? "vertical" : warning.axis === "horizontal" ? "horizontal" : undefined;
       return {
         selector,
         kind,
+        ...(axis ? { axis } : {}),
         overflowPx: normalizeFiniteNumber(warning.overflowPx),
         viewportWidth: normalizeFiniteNumber(warning.viewportWidth),
-        severity: warning.severity === "warning" ? "warning" : "error",
-        persistent: deliveredKeys.has(layoutWarningKey({ kind, selector })),
+        severity: "error",
+        persistent: deliveredKeys.has(
+          layoutWarningKey({
+            kind,
+            selector,
+            axis,
+            overflowPx: warning.overflowPx,
+            viewportWidth: warning.viewportWidth,
+          }),
+        ),
       };
     });
 }

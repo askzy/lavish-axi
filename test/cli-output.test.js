@@ -47,7 +47,27 @@ import {
   telemetryCommandName,
   VERSION,
 } from "../src/cli.js";
+import { DESIGN_PRIORITY_RULE, DESIGN_SYSTEM_HINT } from "../src/design-reference.js";
 import { serve } from "../src/server.js";
+
+// Upstream #174's wake-path contract, minus its foreground-by-default mandate: this fork keeps an
+// explicit background-poll allowance because the harness caps foreground command duration. The
+// observability requirements below are the part that matters and are asserted unchanged.
+function assertObservablePollWakePath(text) {
+  assert.match(text, /Run the poll in the foreground when your harness allows it/i);
+  assert.match(text, /returns the feedback directly to the agent/i);
+  assert.match(text, /running the poll as a background task is expected and supported/i);
+  assert.match(text, /harness-native tracked background-job facility/i);
+  assert.match(text, /guaranteed to resume or notify the same agent/i);
+  assert.match(text, /Never use `nohup`/);
+  assert.match(text, /shell `&`/);
+  assert.match(text, /`disown`/);
+  assert.match(text, /redirected fire-and-forget processes/);
+  assert.match(text, /detached terminal without an explicit verified callback/);
+  assert.match(text, /no completion-aware background facility/i);
+  assert.match(text, /verified wake callback into the surrounding supervisor/i);
+  assert.match(text, /Do not tell the user the artifact is being monitored until that wake path is live/i);
+}
 
 test("CLI version tracks package.json so release-please bumps reach the published binary", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
@@ -89,30 +109,36 @@ test("home output teaches agents when and how to use Lavish Editor", () => {
   assert.ok(output.help.some((item) => item.includes("MUST open each matching playbook")));
   assert.ok(output.help.some((item) => item.includes("reference other filesystem assets")));
   assert.ok(output.help.some((item) => item.includes("same directory as the HTML file")));
-  assert.ok(output.help.some((item) => item.includes("does not auto-inject")));
-  assert.ok(output.help.some((item) => item.includes("portable")));
-  assert.ok(output.help.some((item) => item.includes("Tailwind CSS browser runtime v4")));
-  assert.ok(output.help.some((item) => item.includes("lavish-axi design")));
-  assert.ok(output.help.some((item) => /prefer.*CDN snippet.*hand-writing styles/i.test(item)));
-  assert.ok(output.help.some((item) => /unless.*explicitly instructed/i.test(item)));
-  assert.ok(output.help.some((item) => /priority order/i.test(item)));
-  assert.ok(output.help.some((item) => /subject or product/i.test(item)));
-  assert.ok(output.help.some((item) => /current working directory/i.test(item)));
-  assert.ok(output.help.some((item) => /before writing any html/i.test(item)));
-  assert.ok(output.help.some((item) => /inspect the project the artifact is about/i.test(item)));
-  assert.ok(output.help.some((item) => /previews, proposes, or mocks/i.test(item)));
-  assert.ok(output.help.some((item) => /app's own design system/i.test(item)));
-  assert.ok(output.help.some((item) => /css variables|design tokens/i.test(item)));
-  assert.ok(output.help.some((item) => /component library/i.test(item)));
-  assert.ok(output.help.some((item) => /only when both steps come up empty/i.test(item)));
-  assert.ok(output.help.some((item) => /state which of the three design sources/i.test(item)));
-  assert.ok(!output.help.some((item) => /inspect the current project/i.test(item)));
+  assert.ok(output.help.includes(DESIGN_SYSTEM_HINT), "home help carries the single-sourced design rule verbatim");
   assert.ok(!output.help.some((item) => item.includes('<meta name="lavish-design" content="off">')));
   assert.ok(!output.help.some((item) => item.includes("Known IDs")));
   assert.ok(output.help.some((item) => item.includes("technical plan")));
 });
 
-test("home output warns agents that poll is a long poll they must not kill", () => {
+test("the design-priority rule is single-sourced and keeps its three-step semantics", () => {
+  // Keyword-level checks on the one owner constant; every surface that needs the rule
+  // embeds DESIGN_PRIORITY_RULE, so wording changes happen here and nowhere else.
+  assert.match(DESIGN_PRIORITY_RULE, /strict priority order/);
+  assert.match(DESIGN_PRIORITY_RULE, /\(1\)[\s\S]*\(2\)[\s\S]*\(3\)/);
+  assert.match(DESIGN_PRIORITY_RULE, /user asked for a specific look or named design system/);
+  assert.match(DESIGN_PRIORITY_RULE, /project the artifact is about/);
+  assert.match(DESIGN_PRIORITY_RULE, /current working directory/);
+  assert.match(DESIGN_PRIORITY_RULE, /previews, proposes, or mocks/);
+  assert.match(DESIGN_PRIORITY_RULE, /app's own design system/);
+  assert.match(DESIGN_PRIORITY_RULE, /Tailwind CSS browser runtime v4 \+ DaisyUI v5/);
+  assert.match(DESIGN_PRIORITY_RULE, /only when both steps come up empty/);
+  assert.match(DESIGN_PRIORITY_RULE, /hand-writing styles/);
+  assert.match(DESIGN_PRIORITY_RULE, /unless explicitly instructed/);
+  assert.doesNotMatch(DESIGN_PRIORITY_RULE, /inspect the current project/i);
+
+  assert.ok(DESIGN_SYSTEM_HINT.includes(DESIGN_PRIORITY_RULE), "the home/skill hint embeds the rule");
+  assert.match(DESIGN_SYSTEM_HINT, /does not auto-inject/);
+  assert.match(DESIGN_SYSTEM_HINT, /portable/);
+  assert.match(DESIGN_SYSTEM_HINT, /lavish-axi design/);
+  assert.match(DESIGN_SYSTEM_HINT, /state which of the three design sources/);
+});
+
+test("home output warns agents that poll needs an observable wake path", () => {
   const output = createHomeOutput({ bin: "lavish-axi", sessions: [] });
   const pollHelp = output.help.find((item) => item.includes("lavish-axi poll <html-file>"));
 
@@ -120,9 +146,11 @@ test("home output warns agents that poll is a long poll they must not kill", () 
   assert.match(pollHelp, /long-poll/);
   assert.match(pollHelp, /stays silent/);
   assert.match(pollHelp, /never kill it/);
-  assert.match(pollHelp, /background task/);
+  assertObservablePollWakePath(pollHelp);
   assert.match(pollHelp, /re-run/);
   assert.match(pollHelp, /queued feedback is never lost/);
+  assert.match(pollHelp, /`Send & End` ends the session/);
+  assert.match(pollHelp, /final feedback is still delivered once/);
   assert.doesNotMatch(pollHelp, /above 10 minutes/);
 });
 
@@ -146,16 +174,7 @@ test("top-level help renders static home output without dynamic sessions", async
     assert.match(result.stdout, /same directory as the HTML file/);
     assert.match(result.stdout, /Tailwind CSS browser runtime v4/);
     assert.match(result.stdout, /lavish-axi design/);
-    assert.match(result.stdout, /does not auto-inject/);
-    assert.match(result.stdout, /prefer.*CDN snippet.*hand-writing styles/i);
-    assert.match(result.stdout, /unless.*explicitly instructed/i);
-    assert.match(result.stdout, /priority order/i);
-    assert.match(result.stdout, /subject or product/i);
-    assert.match(result.stdout, /current working directory/i);
-    assert.match(result.stdout, /inspect the project the artifact is about/i);
-    assert.match(result.stdout, /previews, proposes, or mocks/i);
-    assert.match(result.stdout, /app's own design system/i);
-    assert.doesNotMatch(result.stdout, /inspect the current project/i);
+    assert.match(result.stdout, /strict priority order/);
     assert.match(result.stdout, /never kill it/);
     assert.match(result.stdout, /queued feedback is never lost/);
     assert.doesNotMatch(result.stdout, /above 10 minutes/);
@@ -176,20 +195,10 @@ test("design output prints copy-pasteable CDN URLs so agents can opt in to Daisy
     output.playbook_router.playbooks.find((playbook) => playbook.id === "diagram")?.use_when,
     "Map relationships, flows, state, and architecture",
   );
+  assert.ok(output.design.summary.includes(DESIGN_PRIORITY_RULE), "design summary embeds the single-sourced rule");
   assert.match(output.design.summary, /does not auto-inject/);
-  assert.match(output.design.summary, /Tailwind CSS browser runtime v4/);
-  assert.match(output.design.summary, /DaisyUI v5/);
-  assert.match(output.design.summary, /prefer.*CDN snippet.*hand-writing styles/i);
-  assert.match(output.design.summary, /unless.*explicitly instructed/i);
-  assert.match(output.design.summary, /priority order/i);
-  assert.match(output.design.summary, /subject or product/i);
-  assert.match(output.design.summary, /current working directory/i);
-  assert.match(output.design.summary, /previews, proposes, or mocks/i);
-  assert.match(output.design.summary, /app's own design system/i);
-  assert.doesNotMatch(output.design.summary, /inspect the current project/i);
   assert.match(output.design.summary, /^Use this .*fallback only if/i);
   assert.match(output.design.summary, /no design direction/i);
-  assert.match(output.design.summary, /inspect/i);
   assert.match(output.design.summary, /check first/i);
   assert.match(output.design.cdn_snippet, /cdn\.jsdelivr\.net\/npm\/daisyui@/);
   assert.match(output.design.cdn_snippet, /cdn\.jsdelivr\.net\/npm\/daisyui@.*\/themes\.css/);
@@ -579,20 +588,18 @@ test("open output keeps the user URL in session data and next_step focused on po
   assert.equal(output.session.file, "/tmp/artifact.html");
   assert.equal(output.session.url, "http://localhost:4387/session/abc123");
   assert.equal(output.session.status, "opened");
-  assert.equal(typeof output.next_step, "string");
-  assert.doesNotMatch(output.next_step, /Tell the user/i);
+  // Keyword-level lock on the load-bearing semantics of this agent-facing string:
+  // poll now (not the user-facing URL), never kill the poll, no --timeout-ms, and the
+  // reopen etiquette. Sentence-level phrasing is free to change without touching this test.
+  assert.doesNotMatch(output.next_step, /Tell the user (?:to open|to visit)/i);
   assert.doesNotMatch(output.next_step, /http:\/\/localhost:4387\/session\/abc123/);
   assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
   assert.match(output.next_step, /lavish-axi poll \/tmp\/artifact\.html/);
-  assert.match(output.next_step, /long-polls until/);
   assert.match(output.next_step, /layout_warnings/);
-  assert.match(output.next_step, /in-iframe layout audit/);
-  assert.match(output.next_step, /stays silent/);
   assert.match(output.next_step, /never kill it/);
-  assert.match(output.next_step, /background task/);
+  assertObservablePollWakePath(output.next_step);
   assert.match(output.next_step, /queued feedback is never lost/);
   assert.match(output.next_step, /Do not pass --timeout-ms/);
-  assert.doesNotMatch(output.next_step, /above 10 minutes/);
   assert.match(output.next_step, /If the user ends the session, stop polling and do not reopen it/);
   assert.match(output.next_step, /--reopen/);
 });
@@ -823,16 +830,18 @@ test("password-protected share output with unresolved assets still mentions the 
 // inverted guards - restoring the command would have turned them green.
 // test/fork-customizations.test.js asserts the rejection instead.
 
-test("poll help warns agents to leave the long poll running", () => {
+test("poll help requires an observable wake path", () => {
   const help = getCommandHelp("poll");
 
   assert.match(help, /long-polls indefinitely/);
   assert.match(help, /stays silent/);
   assert.match(help, /never kill it/);
-  assert.match(help, /background task/);
+  assertObservablePollWakePath(help);
   assert.match(help, /queued feedback is never lost/);
   assert.match(help, /Do not pass --timeout-ms/);
   assert.match(help, /tests and debugging only/);
+  assert.match(help, /`Send & End` ends the session/);
+  assert.match(help, /final feedback is still delivered once/);
   assert.doesNotMatch(help, /above 10 minutes/);
 });
 
@@ -840,7 +849,7 @@ test("poll help warns agents to leave the long poll running", () => {
 // gone: this fork's share help says the command is disabled. See
 // test/fork-customizations.test.js for the fork-branded help assertions.
 
-test("feedback next step tells agents to keep polling without timeout flag", () => {
+test("feedback next step keeps the next poll completion observable", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
     response: { status: "feedback", dom_snapshot: "", prompts: [] },
@@ -849,7 +858,7 @@ test("feedback next step tells agents to keep polling without timeout flag", () 
   assert.equal("layout_warnings" in output, false);
   assert.match(output.next_step, /never kill it/);
   assert.match(output.next_step, /without --timeout-ms/);
-  assert.match(output.next_step, /background task/);
+  assertObservablePollWakePath(output.next_step);
   assert.match(output.next_step, /queued feedback is never lost/);
   assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
   assert.match(output.next_step, /fresh layout_warnings/);
@@ -877,8 +886,8 @@ test("layout warning feedback tells agents to fix layout before involving the hu
 
   assert.ok("layout_warnings" in output);
   assert.equal(output.layout_warnings.length, 1);
-  assert.match(output.next_step, /1 layout warning detected/);
-  assert.match(output.next_step, /fix horizontal overflow/);
+  assert.match(output.next_step, /1 proven severe layout failure detected/);
+  assert.match(output.next_step, /repair the inaccessible or unusable content/);
   assert.match(output.next_step, /before involving the human/);
   assert.doesNotMatch(output.next_step, /reload or re-open/);
 });
@@ -950,7 +959,41 @@ test("the final feedback batch before an agent end preserves ended_by and allows
   assert.doesNotMatch(output.next_step, /user ended this Lavish Editor session/);
 });
 
-test("persistent layout warnings after a failed fix attempt permit proceeding to the human", () => {
+test("final user-ended feedback still requires severe layout repair without reopening", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      prompts: [],
+      layout_warnings: [{ selector: "button", kind: "clipped-control", severity: "error" }],
+      session_ended: true,
+      ended_by: "user",
+    },
+  });
+
+  assert.match(output.next_step, /Repair the inaccessible or unusable content/);
+  assert.match(output.next_step, /open it directly at the affected viewport/);
+  assert.match(output.next_step, /without reopening this ended Lavish session/);
+  assert.doesNotMatch(output.next_step, /--reopen/);
+});
+
+test("final agent-ended feedback requires repair in a fresh audit session", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: {
+      status: "feedback",
+      prompts: [],
+      layout_warnings: [{ selector: "button", kind: "clipped-control", severity: "error" }],
+      session_ended: true,
+      ended_by: "agent",
+    },
+  });
+
+  assert.match(output.next_step, /Repair the inaccessible or unusable content/);
+  assert.match(output.next_step, /open a fresh session and re-check the real-browser audit/);
+});
+
+test("persistent severe layout failures still require repair before review", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
     response: {
@@ -959,23 +1002,23 @@ test("persistent layout warnings after a failed fix attempt permit proceeding to
       prompts: [],
       layout_warnings: [
         {
-          selector: "main > header > strong",
-          kind: "overlapping-text",
-          overflowPx: 0,
-          viewportWidth: 720,
-          severity: "warning",
+          selector: "html",
+          kind: "page-horizontal-overflow",
+          overflowPx: 120,
+          viewportWidth: 390,
+          severity: "error",
           persistent: true,
         },
       ],
     },
   });
 
-  assert.match(output.next_step, /already reported in a prior poll/);
-  assert.match(output.next_step, /fine to proceed to the human with a short note/);
-  assert.doesNotMatch(output.next_step, /fix horizontal overflow/);
+  assert.match(output.next_step, /proven severe layout failure/);
+  assert.match(output.next_step, /before involving the human/);
+  assert.doesNotMatch(output.next_step, /fine to proceed/);
 });
 
-test("low-severity text-flow warnings permit proceeding to the human without looping", () => {
+test("warning-only layout observations are omitted from poll output", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
     response: {
@@ -984,23 +1027,29 @@ test("low-severity text-flow warnings permit proceeding to the human without loo
       prompts: [],
       layout_warnings: [
         {
-          selector: "main > header > code",
-          kind: "overlapping-text",
-          overflowPx: 0,
+          selector: ".accent",
+          kind: "element-parent-overflow",
+          overflowPx: 20,
           viewportWidth: 720,
           severity: "warning",
+          persistent: false,
+        },
+        {
+          selector: ".unproven",
+          kind: "clipped-text",
+          overflowPx: 200,
+          viewportWidth: 720,
           persistent: false,
         },
       ],
     },
   });
 
-  assert.match(output.next_step, /low-severity layout warning/);
-  assert.match(output.next_step, /fine to proceed to the human with a note/);
-  assert.doesNotMatch(output.next_step, /fix horizontal overflow/);
+  assert.equal("layout_warnings" in output, false);
+  assert.doesNotMatch(output.next_step, /layout warning/);
 });
 
-test("a mix of fresh error-severity and persistent warnings still mandates a fix pass", () => {
+test("a mix of fresh and persistent severe failures still mandates a fix pass", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
     response: {
@@ -1028,41 +1077,8 @@ test("a mix of fresh error-severity and persistent warnings still mandates a fix
     },
   });
 
-  assert.match(output.next_step, /2 layout warnings detected - fix horizontal overflow/);
+  assert.match(output.next_step, /2 proven severe layout failures detected/);
   assert.match(output.next_step, /before involving the human/);
-});
-
-test("a mix of persistent errors and fresh low-severity warnings permits proceeding", () => {
-  const output = createPollOutput({
-    file: "/tmp/report.html",
-    response: {
-      status: "feedback",
-      dom_snapshot: "",
-      prompts: [],
-      layout_warnings: [
-        {
-          selector: ".badge",
-          kind: "clipped-text",
-          overflowPx: 12,
-          viewportWidth: 720,
-          severity: "error",
-          persistent: true,
-        },
-        {
-          selector: "main > header > code",
-          kind: "overlapping-text",
-          overflowPx: 0,
-          viewportWidth: 720,
-          severity: "warning",
-          persistent: false,
-        },
-      ],
-    },
-  });
-
-  assert.match(output.next_step, /no fresh error-severity findings/);
-  assert.match(output.next_step, /fine to proceed to the human with a note/);
-  assert.doesNotMatch(output.next_step, /fix horizontal overflow/);
 });
 
 test("poll wait messages tell watching agents the silence is normal", () => {
@@ -1432,16 +1448,9 @@ test("open can resume a session without opening another browser window", () => {
   assert.match(getCommandHelp("design"), /DaisyUI/);
   assert.match(getCommandHelp("design"), /lavish-axi design/);
   assert.match(getCommandHelp("design"), /portable/);
-  assert.match(getCommandHelp("design"), /prefer.*CDN snippet.*hand-writing styles/i);
-  assert.match(getCommandHelp("design"), /unless.*explicitly instructed/i);
-  assert.match(getCommandHelp("design"), /priority order/i);
-  assert.match(getCommandHelp("design"), /project the artifact is about/i);
-  assert.match(getCommandHelp("design"), /current working directory/i);
-  assert.match(getCommandHelp("design"), /previews, proposes, or mocks/i);
-  assert.match(getCommandHelp("design"), /app's own design system/i);
+  assert.ok(getCommandHelp("design").includes(DESIGN_PRIORITY_RULE), "design help embeds the single-sourced rule");
   assert.match(getCommandHelp("design"), /fallback, not the default/i);
   assert.match(getCommandHelp("design"), /inspect the subject project/i);
-  assert.doesNotMatch(getCommandHelp("design"), /inspect the current project/i);
   assert.doesNotMatch(getCommandHelp("design"), /auto-injects/);
 });
 

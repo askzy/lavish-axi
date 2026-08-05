@@ -613,7 +613,7 @@ test("chrome disables sending only while working or ended", async () => {
   assert.match(js, /let agentPresence = "waiting"/);
   assert.match(js, /function updateSendState\(\)/);
   assert.match(js, /sendButton\.disabled = ended \|\| agentPresence === "working"/);
-  assert.match(js, /sendCaret\.disabled = ended \|\| agentPresence === "working"/);
+  assert.match(js, /sendAndEndButton\.disabled = sendButton\.disabled/);
   assert.doesNotMatch(js, /hasContent/);
 });
 
@@ -622,23 +622,28 @@ test("sending with an empty composer nudges instead of blocking", async () => {
   const js = await chromeClientSource();
   const css = await chromeCssSource();
 
-  assert.match(html, /class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.</);
+  assert.match(html, /class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div>/);
   assert.match(js, /function showSendHint\(\)/);
   assert.match(js, /sendHint\.hidden = false/);
   assert.match(js, /chatInput\.focus\(\)/);
   assert.match(css, /\.send-hint\{/);
 });
 
-test("composer send is a split button with a send-and-end option", async () => {
+test("composer offers two always-visible top-level send actions", async () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
   const css = await chromeCssSource();
 
-  assert.match(html, /class="button send-main" id="send">Send to Agent</);
-  assert.match(html, /class="button send-caret" id="sendCaret"/);
-  assert.match(html, /class="menu send-menu" id="sendMenu" hidden/);
-  assert.match(html, /id="sendAndEnd"[^<]*>.*Send &amp; end session/);
-  assert.match(css, /\.send-main\{[^}]*border-radius:var\(--radius-md\) 0 0 var\(--radius-md\)/);
-  assert.match(css, /\.send-caret\{[^}]*border-left:1px solid rgba\(23,19,10,.22\)/);
+  assert.match(html, /class="button" id="send">Send to Agent</);
+  assert.match(html, /class="button button-danger" id="sendAndEnd"[^<]*>.*Send &amp; End</);
+  assert.match(
+    html,
+    /<div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">.*<button class="button" id="send">Send to Agent<\/button><\/div>/,
+  );
+  assert.doesNotMatch(html, /id="sendCaret"/);
+  assert.doesNotMatch(html, /id="sendMenu"/);
+  assert.doesNotMatch(html, /id="sendFromMenu"/);
+  assert.match(css, /\.button-danger\{[^}]*color:var\(--danger\)/);
+  assert.match(css, /\.actions\{[^}]*min-width:0/);
 });
 
 test("send and end submits queued prompts before ending the session", async () => {
@@ -758,37 +763,54 @@ test("hot reload resets iframe src instead of crossing sandbox location", async 
   assert.match(js, /frame\.src\s*=\s*artifactSrc \|\| frame\.src/);
 });
 
-test("artifact SDK audits layout after fonts and ResizeObserver settle", () => {
+test("artifact SDK reports only stable severe layout failures after fonts, resize, and animations settle", () => {
   const js = createSdkJs("abc");
 
   assert.match(js, /document\.fonts\?\.ready/);
   assert.match(js, /new ResizeObserver\(scheduleFinish\)/);
+  assert.match(js, /document\.getAnimations/);
+  assert.match(js, /activeAnimationTargets/);
+  assert.match(js, /isAnimationAssociatedWithElement/);
+  assert.match(js, /findStableLayoutFindings/);
   assert.match(js, /type:\s*["']lavish:layoutWarnings["']/);
-  assert.match(js, /layout_warnings/);
   assert.match(js, /page-horizontal-overflow/);
-  assert.match(js, /element-scroll-overflow/);
-  assert.match(js, /element-parent-overflow/);
   assert.match(js, /clipped-text/);
   assert.match(js, /overlapping-text/);
+  assert.doesNotMatch(js, /element-scroll-overflow/);
+  assert.doesNotMatch(js, /element-parent-overflow/);
 });
 
-test("artifact SDK dedups cascading visible-overflow spills to the innermost element", () => {
+test("artifact SDK verifies severe clipping from direct rendered text fragments", () => {
   const js = createSdkJs("abc");
 
-  assert.match(js, /function resolveSpillCandidates/);
-  assert.match(js, /function resolveVisibleSpillCandidates/);
-  assert.match(js, /spillBottom/);
-  assert.match(js, /candidate\.el\.contains\(other\.el\)/);
+  assert.match(js, /function textFragmentsForAudit/);
+  assert.match(js, /document\.createRange\(\)/);
+  assert.match(js, /range\.getClientRects\(\)/);
+  assert.match(js, /classifySevereTextOverflow/);
+  assert.match(js, /isSemanticTextBoundary/);
+  assert.match(js, /isStandardVisuallyHidden/);
+  assert.match(js, /isIntentionalTextTruncation/);
+  assert.match(js, /clippingBoundariesFor/);
+  assert.match(js, /auditRequiredControlBounds/);
+  assert.match(js, /viewport-unreachable-control/);
+  assert.match(js, /auditUnreachableLeftText/);
+  assert.match(js, /viewport-unreachable-content/);
+  assert.match(js, /hasStandardVisuallyHiddenAncestor/);
+  assert.match(js, /rootVerticalScrollLocked/);
+  assert.match(js, /hasReachableVerticalScrollerAncestor/);
 });
 
-test("artifact SDK uses per-fragment rects, not the bounding box, for overlap detection", () => {
+test("artifact SDK reports only near-total occlusion by an opaque sibling", () => {
   const js = createSdkJs("abc");
 
-  assert.match(js, /function elementLineFragments/);
-  assert.match(js, /el\.getClientRects\(\)/);
-  assert.match(js, /fragmentsSignificantlyOverlap/);
-  assert.match(js, /function rectAreaOf\(rect\)/);
-  assert.match(js, /function intersectionAreaOf\(a, b\)/);
+  assert.match(js, /function opaqueSiblingBlocker/);
+  assert.match(js, /backgroundIsOpaque/);
+  assert.match(js, /filter\(\(el\) => !isExcludedLayoutAuditElement\(el\)\)/);
+  assert.match(js, /hasStandardVisuallyHiddenAncestor/);
+  assert.match(js, /hasVisualMaskAncestor/);
+  assert.match(js, /isDiagramLayoutElement/);
+  assert.match(js, /isNearTotalOcclusion/);
+  assert.match(js, /minRatio = 0\.9/);
 });
 
 test("artifact SDK reports its scroll position and restores it on request", () => {
@@ -1328,6 +1350,47 @@ test("layout warnings wake the same long-poll feedback channel as human prompts"
         },
       ],
     });
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("warning-only layout observations do not wake the long-poll feedback channel", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+
+    const response = await fetch(`${base}/api/${key}/layout-warnings`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        layout_warnings: [
+          {
+            selector: ".accent",
+            kind: "element-parent-overflow",
+            overflowPx: 20,
+            viewportWidth: 720,
+            severity: "warning",
+          },
+        ],
+      }),
+    });
+
+    assert.deepEqual(await response.json(), { status: "recorded", layout_warnings: 0 });
+    const poll = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=25`).then((res) =>
+      res.json(),
+    );
+    assert.deepEqual(poll, { status: "waiting" });
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
