@@ -109,21 +109,30 @@ Run `lavish-axi server --verbose` (or set `LAVISH_AXI_DEBUG=1`) to log session a
 ### Export (local-asset inlining)
 
 `src/export-bundle.js` (`buildSelfContainedHtml`) inlines only an artifact's **local** assets: local stylesheets/classic scripts become inline `<style>`/`<script>`, and local images/fonts/icons, confined fetchable `file://` refs, and CSS `url(...)`/`@import` become data URIs (recursively, resolved relative to each stylesheet).
-Remote references are deliberately left as links; the user-facing contract, including the size-cap env vars and their defaults, lives in README's Export and sharing bullet.
+Remote references are deliberately left as links; the user-facing contract, including the size-cap env vars and their defaults, lives in README's Export bullet.
 The transform makes **no outbound requests** (no fetching, no SSRF); its only security surface is local file reading, which is confined to the artifact directory both lexically (`confineDir`) and by **real-path/symlink resolution** in the default `readLocalFile` (`guardedRead`), so a symlink inside the directory can't exfiltrate an outside file (e.g. `~/.ssh/id_rsa`) into a shared bundle.
-Absolute `file://` paths in non-inlined regions are redacted to `about:blank` so local paths do not leak into exports or hosted shares; the injected Lavish SDK is stripped; in-document fragment refs (`#a`, encoded `%23a`) are left alone; and inlined `</script>`/`</style>` are escaped so they can't break out.
+Absolute `file://` paths in non-inlined regions are redacted to `about:blank` so local paths do not leak into an export the user passes around; the injected Lavish SDK is stripped; in-document fragment refs (`#a`, encoded `%23a`) are left alone; and inlined `</script>`/`</style>` are escaped so they can't break out.
 The transform records `warnings` rather than failing, split into unresolved local assets (such as `load-failed`, `outside-root`, `too-large`, or unsupported local references left external) and notices (such as `csp-meta` or `file-url-redacted`).
 It is dependency-injectable (`readLocalFile`, `resolveAbsolute`, `confineDir`, size caps) so it is testable without disk; the server passes `resolveAbsolute: resolveDesignAssetPath` to inline legacy `/design/*` references from the packaged assets.
 The chrome's **Export standalone HTML** overflow-menu item `GET`s `/api/:key/export`; the CLI exposes the same transform as `lavish-axi export`, server-independently.
 Lavish itself sets **no** `Content-Security-Policy` on any response (the sandboxed iframe relies on the `sandbox` attribute, not CSP), but author-set CSP meta tags are preserved and reported as export notices because they may still block exported inline assets.
 
-### Hosted sharing (ht-ml.app)
+### Hosted sharing (ht-ml.app) - removed in this fork
 
-`src/html-app.js` (`publishToHtmlApp`) publishes the local-inlined HTML to ht-ml.app with `POST {LAVISH_AXI_HTML_APP_API_URL or https://api.ht-ml.app}/v1/sites` as `{ html_content, password? }`.
-Creating a site needs no account or API key; the response's secret `update_key` is returned once and is the only credential, and the optional bearer token (`LAVISH_AXI_HTML_APP_TOKEN` / `--token`) is sent when set but never required.
-The user-facing contract - third-party disclosure, public by default, private with a password - lives in README's Export and sharing bullet and the runtime share output.
-This fork disables publishing: `/api/:key/share` returns **410**, the `share` command and the chrome's **Publish link** button reject, and the upstream same-origin guard on that route is gone with it (nothing state-changing and outward-facing is left to protect). `src/html-app.js` and `createShareOutput` are still present but unreachable from the CLI.
-ht-ml.app serves hosted pages with no CSP and no sandbox header, so remote CDN/font references load over the viewer's network; hosted shares never include the annotation SDK.
+Upstream publishes the local-inlined HTML to ht-ml.app, a third-party host that is not part of Lavish. **This fork does not publish anywhere, and there is no longer any code here that could.**
+
+Deleted outright: `src/html-app.js` (the ht-ml.app HTTP client), `createShareOutput` in `src/cli.js`, the chrome's **Publish link** overflow-menu item and share dialog markup in `src/server.js`, the `openShareDialog`/`closeShareDialog`/`publishShare` handlers and their listener wiring in `src/chrome-client.js`, and the `.share-*` rules in `src/chrome.css`. Do not restore any of it when replaying upstream.
+
+Kept, deliberately, as rejections rather than deletions - a rejection tells an agent the feature is _deliberately gone_, where a 404 or "unknown command" reads as a broken build:
+
+- `lavish-axi share` throws `AxiError` / `VALIDATION_ERROR`, pointing at `lavish-axi export`.
+- `lavish-axi setup hooks` throws the same way.
+- `POST /api/:key/share` answers **410** unconditionally.
+
+Two traps when merging upstream here:
+
+- **The chrome bar template line is a crash surface.** `src/chrome-client.js` resolves chrome elements into top-level `const`s and assigns handlers at module scope, so a restored `document.getElementById("shareArtifact")` reference without the matching button throws during initialisation and kills the **entire** chrome script - annotation, the feedback loop, everything. Markup and client code must move together. `test/fork-customizations.test.js` asserts absence across the rendered chrome, `chrome-client.js`, and `chrome.css` for exactly this reason.
+- **`isSameOriginRequest` / `normalizeOrigin` in `src/server.js` are NOT dead.** Upstream added them for the publish route, but `POST /api/:key/chrome-loads/begin` (#210) needs the same CSRF guard. A previous sync wave deleted them as dead code and the next wave had to restore them. Leave them alone.
 
 ### AXI integration
 
