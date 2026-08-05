@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -48,12 +48,6 @@ import {
   VERSION,
 } from "../src/cli.js";
 import { serve } from "../src/server.js";
-
-function setupHooksEnv(homeDir, stateDir) {
-  // eslint-disable-next-line no-unused-vars
-  const { COPILOT_HOME, ...env } = process.env;
-  return { ...env, HOME: homeDir, LAVISH_AXI_STATE_DIR: stateDir };
-}
 
 test("CLI version tracks package.json so release-please bumps reach the published binary", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
@@ -824,100 +818,10 @@ test("password-protected share output with unresolved assets still mentions the 
   assert.doesNotMatch(output.next_step, /anyone with the link can view/);
 });
 
-test("share command publishes the artifact to ht-ml.app and returns the public url", async () => {
-  const dir = await mkdtemp(`${os.tmpdir()}/lavish-axi-share-test-`);
-  const artifact = `${dir}/report.html`;
-  await writeFile(`${dir}/theme.css`, ".btn{color:teal}", "utf8");
-  await writeFile(
-    artifact,
-    '<!doctype html><html><head><link rel="stylesheet" href="theme.css"></head><body><h1>Hi</h1></body></html>',
-    "utf8",
-  );
-
-  const requests = [];
-  const htmlApp = await startFakeHtmlApp(requests);
-  try {
-    // Use async spawn (not spawnSync): the child publishes to the fake ht-ml.app server hosted
-    // on this process's event loop, which spawnSync would block, deadlocking the request.
-    const child = spawn(
-      process.execPath,
-      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "share", "--password", "pw", artifact],
-      {
-        cwd: fileURLToPath(new URL("..", import.meta.url)),
-        env: {
-          ...process.env,
-          LAVISH_AXI_STATE_DIR: dir,
-          LAVISH_AXI_TELEMETRY: "0",
-          LAVISH_AXI_HTML_APP_API_URL: `http://127.0.0.1:${htmlApp.port}`,
-        },
-      },
-    );
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    const code = await new Promise((resolve) => child.on("close", resolve));
-
-    assert.equal(code, 0, stderr);
-    assert.match(stdout, /abc123\.ht-ml\.app/);
-    assert.match(stdout, /PASSWORD-PROTECTED/);
-    assert.match(stdout, /viewers also need the password/);
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].url, "/v1/sites");
-    assert.match(requests[0].body.html_content, /<style>\.btn\{color:teal\}<\/style>/);
-    assert.equal(requests[0].body.password, "pw");
-  } finally {
-    await htmlApp.close();
-    await rm(dir, { force: true, recursive: true });
-  }
-});
-
-test("share command treats a whitespace-only password as public", async () => {
-  const dir = await mkdtemp(`${os.tmpdir()}/lavish-axi-share-test-`);
-  const artifact = `${dir}/report.html`;
-  await writeFile(artifact, "<!doctype html><html><body><h1>Hi</h1></body></html>", "utf8");
-
-  const requests = [];
-  const htmlApp = await startFakeHtmlApp(requests);
-  try {
-    const child = spawn(
-      process.execPath,
-      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "share", "--password", "   ", artifact],
-      {
-        cwd: fileURLToPath(new URL("..", import.meta.url)),
-        env: {
-          ...process.env,
-          LAVISH_AXI_STATE_DIR: dir,
-          LAVISH_AXI_TELEMETRY: "0",
-          LAVISH_AXI_HTML_APP_API_URL: `http://127.0.0.1:${htmlApp.port}`,
-        },
-      },
-    );
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    const code = await new Promise((resolve) => child.on("close", resolve));
-
-    assert.equal(code, 0, stderr);
-    assert.match(stdout, /PUBLIC/);
-    assert.match(stdout, /anyone with the link can view/);
-    assert.doesNotMatch(stdout, /PASSWORD-PROTECTED/);
-    assert.equal(requests.length, 1);
-    assert.equal("password" in requests[0].body, false);
-  } finally {
-    await htmlApp.close();
-    await rm(dir, { force: true, recursive: true });
-  }
-});
+// The two upstream tests that drove `lavish-axi share` end to end against a fake ht-ml.app are
+// gone: the command is disabled in this fork. They were failing against fork HEAD, and they were
+// inverted guards - restoring the command would have turned them green.
+// test/fork-customizations.test.js asserts the rejection instead.
 
 test("poll help warns agents to leave the long poll running", () => {
   const help = getCommandHelp("poll");
@@ -932,22 +836,9 @@ test("poll help warns agents to leave the long poll running", () => {
   assert.doesNotMatch(help, /above 10 minutes/);
 });
 
-test("share help distinguishes public default from password-protected shares", () => {
-  const help = getCommandHelp("share");
-  const home = createHomeOutput({ bin: "lavish-axi", sessions: [] });
-  const homeShareHelp = home.help.find((item) => item.includes("lavish-axi share <html-file>"));
-
-  assert.match(help, /PUBLIC by default/);
-  assert.match(help, /Pass --password to publish a PRIVATE password-protected page/);
-  assert.match(help, /viewers must supply the password to view/);
-  assert.match(help, /not blocked by CSP on ht-ml\.app/);
-  assert.match(help, /load over the viewer's network/);
-  assert.doesNotMatch(help, /EVERYTHING PUBLISHED IS PUBLIC/);
-  assert.doesNotMatch(help, /load fine/);
-  assert.match(homeShareHelp, /PUBLIC by default/);
-  assert.match(homeShareHelp, /Pass --password to publish a PRIVATE password-protected page/);
-  assert.doesNotMatch(homeShareHelp, /Everything published is public/);
-});
+// The upstream test that asserted `share --help` explains public-vs-password-protected shares is
+// gone: this fork's share help says the command is disabled. See
+// test/fork-customizations.test.js for the fork-branded help assertions.
 
 test("feedback next step tells agents to keep polling without timeout flag", () => {
   const output = createPollOutput({
@@ -1388,65 +1279,11 @@ test("Copilot CLI ambient context script wraps lavish output as hook JSON", asyn
   }
 });
 
-test("setup hooks installs agent session hooks explicitly", async () => {
-  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-setup-state-`);
-  const homeDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-setup-home-`);
-  try {
-    const result = spawnSync(
-      process.execPath,
-      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "setup", "hooks"],
-      {
-        cwd: fileURLToPath(new URL("..", import.meta.url)),
-        encoding: "utf8",
-        env: setupHooksEnv(homeDir, stateDir),
-      },
-    );
-
-    assert.equal(result.status, 0, result.stderr || result.stdout);
-    assert.match(result.stdout, /hooks:/);
-    assert.match(result.stdout, /status: installed/);
-    assert.match(result.stdout, /GitHub Copilot CLI/);
-    assert.match(result.stdout, /Restart your agent session/);
-    assert.ok(existsSync(`${homeDir}/.claude/settings.json`));
-    assert.ok(existsSync(`${homeDir}/.copilot/hooks/lavish-axi.json`));
-
-    const copilotHook = JSON.parse(await readFile(`${homeDir}/.copilot/hooks/lavish-axi.json`, "utf8"));
-    assert.equal(copilotHook.version, 1);
-    assert.equal(copilotHook.hooks.sessionStart.length, 1);
-    assert.match(copilotHook.hooks.sessionStart[0].bash, /additionalContext/);
-    assert.match(copilotHook.hooks.sessionStart[0].powershell, /additionalContext/);
-  } finally {
-    await rm(stateDir, { force: true, recursive: true });
-    await rm(homeDir, { force: true, recursive: true });
-  }
-});
-
-test("setup hooks exits with an error when hook installation fails", async () => {
-  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-setup-fail-state-`);
-  const homeDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-setup-fail-home-`);
-  try {
-    await mkdir(`${homeDir}/.claude`, { recursive: true });
-    await writeFile(`${homeDir}/.claude/settings.json`, "{ invalid json", "utf8");
-
-    const result = spawnSync(
-      process.execPath,
-      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "setup", "hooks"],
-      {
-        cwd: fileURLToPath(new URL("..", import.meta.url)),
-        encoding: "utf8",
-        env: setupHooksEnv(homeDir, stateDir),
-      },
-    );
-
-    const output = `${result.stdout}\n${result.stderr}`;
-    assert.notEqual(result.status, 0, result.stdout);
-    assert.match(output, /hook/i);
-    assert.doesNotMatch(result.stdout, /status: installed/);
-  } finally {
-    await rm(stateDir, { force: true, recursive: true });
-    await rm(homeDir, { force: true, recursive: true });
-  }
-});
+// The two upstream `setup hooks` tests are gone: the command is disabled in this fork. The first
+// was failing against fork HEAD and was an inverted guard. The second ("exits with an error when
+// hook installation fails") passed vacuously - the disabled handler also exits non-zero and also
+// mentions "hook", so it asserted nothing. test/fork-customizations.test.js asserts the rejection
+// and that no hook files are written.
 
 test("telemetry command names are anonymous and do not include file paths", () => {
   assert.equal(telemetryCommandName(["report.html"]), "open");
@@ -1718,31 +1555,3 @@ test("stop command reports when no server is running", async () => {
     await rm(dir, { force: true, recursive: true });
   }
 });
-
-async function startFakeHtmlApp(requests) {
-  const server = createServer((req, res) => {
-    let raw = "";
-    req.setEncoding("utf8");
-    req.on("data", (chunk) => {
-      raw += chunk;
-    });
-    req.on("end", () => {
-      requests.push({ method: req.method, url: req.url, body: raw ? JSON.parse(raw) : null });
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          site_id: "abc123",
-          url: "https://abc123.ht-ml.app/",
-          update_key: "uk_secret",
-          status: "active",
-        }),
-      );
-    });
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-  const address = server.address();
-  return {
-    port: typeof address === "object" && address ? address.port : 0,
-    close: () => new Promise((resolve) => server.close(() => resolve())),
-  };
-}
