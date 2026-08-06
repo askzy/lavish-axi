@@ -142,6 +142,8 @@ Two traps when merging upstream here:
 
 The only difference from the committed skill is the invocation: `createSkillMarkdown({ invocation })` renders `node <repo>/dist/cli.mjs ...` plus a two-sentence fork note. `npx -y lavish-axi` in this flavor would fetch upstream's package from npm and bypass the fork entirely - sharing re-enabled, no guards - with nothing about the session looking wrong, which is what `test/skill-local.test.js` guards. `scripts/build-skill.js` derives the absolute path from its own location: never hardcode a checkout path in source, and keep the output under gitignored `dist/`.
 
+Node realpaths that location, which on this machine means a 130-character path through `Library/CloudStorage`, repeated 17 times in a file every session loads (about 700 characters of context). `shortestEquivalentPath` trades it for the shortest candidate whose `realpath` matches the derived root - the shell's unresolved `PWD` when the build is run from the checkout - and falls back to the realpath when none qualifies. Any candidate added there must be `realpath`-verified, never string-guessed: an unverified shortcut points every agent at a path that may not exist, which is strictly worse than a long path that works.
+
 ### AXI integration
 
 The CLI is built on `axi-sdk-js` (`runAxiCli`).

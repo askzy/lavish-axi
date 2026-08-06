@@ -11,13 +11,18 @@
 // and restore the npx invocation in one move.
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { NPX_INVOCATION, createSkillMarkdown, localInvocation } from "../src/skill.js";
+import { NPX_INVOCATION, createSkillMarkdown, localInvocation, shortestEquivalentPath } from "../src/skill.js";
 
-const LOCAL_INVOCATION = localInvocation(fileURLToPath(new URL("..", import.meta.url)));
+// Derived from this file's own location, then shortened exactly the way the build script does.
+const DERIVED_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const LOCAL_INVOCATION = localInvocation(shortestEquivalentPath(DERIVED_ROOT));
 
 function occurrences(text, needle) {
   return text.split(needle).length - 1;
@@ -45,6 +50,44 @@ test("local flavor invokes this checkout's built CLI everywhere the npx flavor i
     occurrences(npx, NPX_INVOCATION),
     "some invocation sites were not rewritten - a partially converted skill sends part of the work to upstream",
   );
+});
+
+test("the emitted path names this checkout, however it was shortened", () => {
+  // The equivalence is the whole guarantee - asserting a literal path would put a machine path back
+  // into the repo, which is the mistake this work exists to undo.
+  const emitted = LOCAL_INVOCATION.slice("node ".length);
+  const emittedRoot = path.dirname(path.dirname(emitted));
+
+  assert.ok(path.isAbsolute(emitted), "the emitted invocation is not an absolute path");
+  assert.equal(path.basename(emitted), "cli.mjs");
+  assert.equal(realpathSync(emittedRoot), realpathSync(DERIVED_ROOT), "the emitted path is not this checkout");
+  assert.ok(emittedRoot.length <= realpathSync(DERIVED_ROOT).length, "shortening made the path longer");
+});
+
+test("shortestEquivalentPath takes a shorter verified path and nothing else", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "lavish-skill-local-"));
+  const root = path.join(dir, "a-checkout-with-a-deliberately-long-name");
+  const link = path.join(dir, "s");
+  const sibling = path.join(dir, "elsewhere");
+  await mkdir(root);
+  await mkdir(sibling);
+  await symlink(root, link);
+
+  try {
+    assert.equal(shortestEquivalentPath(root, [link]), link, "a shorter verified path was not taken");
+    assert.equal(shortestEquivalentPath(root, [`${link}/`]), link, "candidates are not normalised");
+
+    // Everything unverifiable falls back to the realpath, even when it is shorter: a sibling
+    // directory, a path that does not exist, a relative path, and no candidate at all.
+    const fallback = realpathSync(root);
+    assert.ok(sibling.length < fallback.length, "the sibling must be short enough to be tempting");
+    assert.equal(shortestEquivalentPath(root, [sibling]), fallback, "an unrelated directory was accepted");
+    assert.equal(shortestEquivalentPath(root, [path.join(dir, "x")]), fallback, "a missing path was accepted");
+    assert.equal(shortestEquivalentPath(root, ["s"]), fallback, "a relative path was accepted");
+    assert.equal(shortestEquivalentPath(root, [undefined]), fallback);
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
 });
 
 test("local flavor carries the fork note", () => {

@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import path from "node:path";
 
 import { POLL_SEND_AND_END_RULE, POLL_WAKE_PATH_RULES, createHomeOutput } from "./cli.js";
@@ -23,6 +24,49 @@ export const NPX_INVOCATION = "npx -y lavish-axi";
  */
 export function localInvocation(repoRoot) {
   return `node ${path.join(repoRoot, "dist", "cli.mjs")}`;
+}
+
+/**
+ * Pick the shortest path that is provably the same directory as `derivedRoot`.
+ *
+ * Node realpaths `import.meta.url`, so a derived root can be far longer than the path a human uses
+ * for the same checkout - a symlinked `~/Work` into Dropbox's `CloudStorage` directory turns 39
+ * characters into 130. The local skill repeats its invocation more than a dozen times and loads
+ * into every session, so the difference is real context. It is only worth taking when the shorter
+ * form is verified rather than string-guessed: an unverified shortcut points every agent at a path
+ * that may not exist, which is worse than a long path that works. So each candidate must realpath
+ * to the same directory, and the realpath is the fallback when none qualifies.
+ *
+ * `PWD` is the useful candidate because a shell sets it unresolved, so it holds the short form when
+ * the build is run from the checkout. `INIT_CWD` (npm's own cwd) is usually already resolved and
+ * simply loses on length, but it costs nothing to offer.
+ *
+ * @param {string} derivedRoot absolute path derived from the caller's own location
+ * @param {(string | undefined)[]} [candidates] unresolved alternatives to try, shortest wins
+ * @returns {string} the shortest verified candidate, else `derivedRoot` realpathed
+ */
+export function shortestEquivalentPath(derivedRoot, candidates = [process.env.PWD, process.env.INIT_CWD]) {
+  const target = realpathSync(derivedRoot);
+  let best = target;
+
+  for (const candidate of candidates) {
+    if (!candidate || !path.isAbsolute(candidate)) {
+      continue;
+    }
+    const normalized = path.resolve(candidate);
+    if (normalized.length >= best.length) {
+      continue;
+    }
+    try {
+      if (realpathSync(normalized) === target) {
+        best = normalized;
+      }
+    } catch {
+      // a candidate that does not resolve is not a candidate
+    }
+  }
+
+  return best;
 }
 
 function bullets(items) {
