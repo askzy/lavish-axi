@@ -186,3 +186,10 @@ No need to explicitly document the telemetry behaviors.
 - The layout-warning inbox's rules are the product contract, not implementation detail - `src/layout-warnings.js` and `test/layout-warnings.test.js` are the authority, and the lifecycle is also restated for users in README and for agents in the poll guidance. Two invariants are easy to break by accident:
   - Nothing may clear a warning except a newer artifact revision plus a **complete** pass at the **same viewport class** that no longer detects it. Not a closed drawer, a checked box, a queued or delivered prompt, an agent reply, a reload in flight, a temporarily absent element, another viewport passing, or a failed diagnostic run.
   - Adding a route or UI action that emits `feedback` for a detection makes the whole feature regress to the auto-repair churn it replaced. Only user actions (`/api/:key/prompts`) and the narrow fatal path may emit it.
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.
