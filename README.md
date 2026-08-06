@@ -220,3 +220,10 @@ pnpm run lint           # Run ESLint
 pnpm run format:check   # Check Prettier formatting
 pnpm run typecheck      # Run TypeScript checkJs validation
 ```
+
+The real-browser chrome-load guard is opt-in and skips without its flag. Run it after touching the chrome markup or `src/chrome-client.js`: `pnpm test` on its own cannot catch a chrome script that dies during initialisation, and AGENTS.md has the rationale.
+
+```sh
+# Needs any installed Google Chrome or Chromium; override with LAVISH_AXI_CHROME_BINARY.
+LAVISH_AXI_BROWSER_E2E=1 node --test test/chrome-load-browser.test.js
+```
