@@ -15,7 +15,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "node scripts/build.js",
+    "build": "node scripts/build.js && node scripts/build-skill.js --local",
     "build:skill": "node scripts/build-skill.js",
     "check": "npm run build && npm run lint && npm run format:check && npm run typecheck && npm test && node scripts/build-skill.js --check",
     "start": "node dist/cli.mjs",
