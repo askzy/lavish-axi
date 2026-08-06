@@ -26,3 +26,4 @@ jobs:
       - run: pnpm run typecheck
       - run: pnpm test
       - run: pnpm run build
+      - run: node scripts/build-skill.js --check
