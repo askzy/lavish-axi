@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  # Manual trigger, so verifying CI costs a button press rather than a push.
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
