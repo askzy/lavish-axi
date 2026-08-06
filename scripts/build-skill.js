@@ -3,16 +3,16 @@
 //
 //   node scripts/build-skill.js          # write the file
 //   node scripts/build-skill.js --check  # fail (exit 1) if the committed file is stale
+//   node scripts/build-skill.js --local  # write the gitignored dist/skill-local/SKILL.md
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-import { createSkillMarkdown } from "../src/skill.js";
+import { createSkillMarkdown, localInvocation } from "../src/skill.js";
 
 const target = new URL("../skills/lavish/SKILL.md", import.meta.url);
-const expected = createSkillMarkdown();
-const check = process.argv.includes("--check");
 
-if (check) {
+if (process.argv.includes("--check")) {
+  const expected = createSkillMarkdown();
   let actual = null;
   try {
     actual = await readFile(target, "utf8");
@@ -24,8 +24,20 @@ if (check) {
     process.exit(1);
   }
   console.log("skills/lavish/SKILL.md is up to date.");
+} else if (process.argv.includes("--local")) {
+  // The same source rendered with absolute `node <repo>/dist/cli.mjs` invocations, so this
+  // checkout can be symlinked in as ~/.claude/skills/lavish (a Claude Code skill is a directory
+  // named after the skill) instead of hand-adapted into a copy that goes stale on every merge.
+  // The path comes from this script's own location, so no absolute path is ever committed, and it
+  // lands under the gitignored dist/ because it is machine-specific build output.
+  const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+  const localTarget = new URL("../dist/skill-local/SKILL.md", import.meta.url);
+
+  await mkdir(new URL("../dist/skill-local/", import.meta.url), { recursive: true });
+  await writeFile(localTarget, createSkillMarkdown({ invocation: localInvocation(repoRoot) }));
+  console.log(`Wrote ${fileURLToPath(localTarget)}`);
 } else {
   await mkdir(new URL("../skills/lavish/", import.meta.url), { recursive: true });
-  await writeFile(target, expected);
+  await writeFile(target, createSkillMarkdown());
   console.log(`Wrote ${fileURLToPath(target)}`);
 }

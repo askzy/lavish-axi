@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import { POLL_SEND_AND_END_RULE, POLL_WAKE_PATH_RULES, createHomeOutput } from "./cli.js";
 import { PLAYBOOK_ROUTER_HELP } from "./playbooks.js";
 
@@ -8,6 +10,21 @@ export const SKILL_DESCRIPTION =
   "annotate and send feedback on, using the lavish-axi CLI. Use when about to give a plan, " +
   "comparison, diagram, table, code diff, report, or anything easier to grasp visually than as prose.";
 
+// How the published skill tells agents to invoke the CLI: no global install, no prompt.
+export const NPX_INVOCATION = "npx -y lavish-axi";
+
+/**
+ * Invocation for a checkout of this fork, which must never route through npm: `npx -y lavish-axi`
+ * resolves to upstream's published package, bypassing the fork's disabled sharing and its guards.
+ * The caller derives `repoRoot` from its own location so no absolute path is ever committed.
+ *
+ * @param {string} repoRoot absolute path to the repository root
+ * @returns {string} e.g. `node /path/to/lavish-axi/dist/cli.mjs`
+ */
+export function localInvocation(repoRoot) {
+  return `node ${path.join(repoRoot, "dist", "cli.mjs")}`;
+}
+
 function bullets(items) {
   return items.map((item) => `- ${item}`).join("\n");
 }
@@ -16,8 +33,15 @@ function playbookList(playbooks) {
   return playbooks.map((p) => `- \`${p.id}\` - ${p.use_when}`).join("\n");
 }
 
-function skillCommandText(text) {
-  return text.replaceAll("`lavish-axi", "`npx -y lavish-axi");
+function installNote(invocation) {
+  if (invocation === NPX_INVOCATION) {
+    return `You do not need lavish-axi installed globally - invoke it with \`${invocation} <html-file>\`.`;
+  }
+  return (
+    "This install is the local fork (askzy/lavish-axi), which has the `share` and `setup hooks` subcommands disabled. " +
+    `Always invoke it as \`${invocation} <html-file>\` - never \`npx lavish-axi\`, which would fetch the upstream ` +
+    "package and bypass the fork."
+  );
 }
 
 /**
@@ -25,10 +49,15 @@ function skillCommandText(text) {
  * `lavish-axi` prints with no arguments (minus live session state), while the
  * frontmatter adds discovery metadata for Agent Skills and Hermes Agent.
  *
+ * @param {object} [options]
+ * @param {string} [options.invocation] how the skill tells agents to invoke the CLI. Defaults to
+ *   the published `npx -y lavish-axi`; pass `localInvocation(repoRoot)` for the checkout-local
+ *   flavor, which swaps the install line for the fork note.
  * @returns {string} full SKILL.md contents including YAML frontmatter
  */
-export function createSkillMarkdown() {
+export function createSkillMarkdown({ invocation = NPX_INVOCATION } = {}) {
   const home = createHomeOutput({ bin: "lavish-axi", sessions: [], includeSessions: false });
+  const skillCommandText = (text) => text.replaceAll("`lavish-axi", `\`${invocation}`);
 
   return `---
 name: lavish
@@ -45,8 +74,8 @@ metadata:
 
 ${skillCommandText(home.description)}
 
-You do not need lavish-axi installed globally - invoke it with \`npx -y lavish-axi <html-file>\`.
-If lavish-axi output shows a follow-up command starting with \`lavish-axi\`, run it as \`npx -y lavish-axi ...\` instead.
+${installNote(invocation)}
+If lavish-axi output shows a follow-up command starting with \`lavish-axi\`, run it as \`${invocation} ...\` instead.
 
 ## Request
 
@@ -62,8 +91,8 @@ ${home.help[home.help.length - 1]}
 ## Workflow
 
 1. Create the HTML artifact (default location \`.lavish/<name>.html\` in the working directory).
-2. Run \`npx -y lavish-axi <html-file>\` to open or resume a review session in the browser.
-3. Run \`npx -y lavish-axi poll <html-file>\` to long-poll for the user's annotations and queued prompts.
+2. Run \`${invocation} <html-file>\` to open or resume a review session in the browser.
+3. Run \`${invocation} poll <html-file>\` to long-poll for the user's annotations and queued prompts.
    On the first poll, prefer \`--agent-reply "<one-line summary of what you built and what to review first>"\` so the conversation panel opens with context.
    Browser-detected layout issues are filed passively in the user's Layout issues inbox and arrive as an ordinary \`layout-warnings\` prompt only when the user selects and queues them. Never edit an issue the user has not queued. The only response that arrives without user action is \`artifact_failures\`, when the review surface itself is unusable.
    The poll stays silent until the user acts or a fatal artifact failure makes the review surface unusable - leave it running, never kill it.
@@ -71,7 +100,7 @@ ${home.help[home.help.length - 1]}
 ${POLL_WAKE_PATH_RULES.map((rule) => `   ${skillCommandText(rule)}`).join("\n")}
 4. If poll returns feedback, apply the user's prompts. A \`layout-warnings\` prompt is an explicit repair request; apply every listed fix in one pass before saving, and let Lavish re-check it after a newer artifact load.
 5. Apply human feedback, then poll again with \`--agent-reply "<message>"\` to reply in the browser and keep the loop going under the same foreground-or-verified-wake-path rule.
-6. Run \`npx -y lavish-axi end <html-file>\` when the review is finished.
+6. Run \`${invocation} end <html-file>\` when the review is finished.
 7. ${POLL_SEND_AND_END_RULE} Deliver any remaining updates directly in this conversation.
 
 ## Visual guidance
@@ -80,9 +109,9 @@ ${bullets(home.visual_guidance)}
 
 ## Playbooks
 
-Run \`npx -y lavish-axi playbook <id>\` for focused, detailed guidance on any of these.
+Run \`${invocation} playbook <id>\` for focused, detailed guidance on any of these.
 ${PLAYBOOK_ROUTER_HELP}
-For flows, architecture, state, or sequence diagrams, do not hand-build boxes-and-arrows from div/flexbox; open the diagram playbook and use the theme-aware Mermaid snippet from \`npx -y lavish-axi design\` unless SVG is needed for richly annotated nodes.
+For flows, architecture, state, or sequence diagrams, do not hand-build boxes-and-arrows from div/flexbox; open the diagram playbook and use the theme-aware Mermaid snippet from \`${invocation} design\` unless SVG is needed for richly annotated nodes.
 
 ${playbookList(home.playbooks)}
 
