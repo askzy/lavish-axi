@@ -207,6 +207,7 @@ export const PLAYBOOKS = [
       "Do not queue one prompt per radio change, checkbox toggle, dropdown change, or choice-button click when the user can still change their mind.",
       "Do not create controls whose queued prompt is unclear or too vague to execute.",
       "Do not hide the difference between selected locally and queued for the agent.",
+      "Do not read or write `localStorage` or `sessionStorage` unguarded - the artifact iframe's opaque origin makes them throw, which kills the rest of that `<script>` block and leaves every control below it dead on a page that still renders.",
       "Do not require interaction for content the user only needs to read.",
     ],
     lavish_notes: [
