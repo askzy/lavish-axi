@@ -33,7 +33,7 @@ That loses the thing HTML is best at: interactivity.
 
 Lavish Editor opens agent-generated HTML files in a local browser, lets you pinpoint elements, selected text, or Mermaid diagram nodes and send feedback to the agent to address.
 
-- **Local-first** - Review local HTML artifacts with a local CLI and no cloud dependency at all. This fork removes upstream's hosted sharing entirely, so nothing here uploads an artifact anywhere; `lavish-axi export` writes a portable local file instead.
+- **Local-first** - Review local HTML artifacts with a local CLI and no cloud dependency in the core feedback loop.
 - **Human-AI collaboration** - Annotate elements, selected text ranges, and Mermaid diagram nodes, and send messages to the agent without leaving Lavish Editor.
 - **Battery included** - Lavish Editor teaches your agent good visualization for common use cases such as product or technical plans, design explorations and more out of the box.
 
@@ -83,16 +83,11 @@ Use `npx lavish-axi` to write a product or technical plan for what we discussed.
 ### Session hook
 
 Want Lavish's ambient context - including your live open sessions - fed into every agent session instead of loading on demand?
-Install the CLI globally and opt into the hook:
-
-```sh
-npm install -g lavish-axi
-lavish-axi setup hooks
-```
-
-This installs a `SessionStart` hook for **Claude Code**, **Codex**, **OpenCode**, and **GitHub Copilot CLI** that surfaces open sessions, visualization playbooks, and usage guidance at the start of each session.
+Put the CLI on your `PATH` (see [From source](#from-source)), then add a `SessionStart` hook in your agent's own settings that runs `lavish-axi` with no arguments: that prints open sessions, visualization playbooks, and usage guidance for the agent to pick up.
 Unlike the skill, the hook also shows your live open sessions, so a fresh agent session can resume an in-flight review.
-**Restart your agent session after running this** so the new hook takes effect.
+**Restart your agent session after adding the hook** so it takes effect.
+
+Upstream ships `lavish-axi setup hooks` to write that hook into **Claude Code**, **Codex**, **OpenCode**, and **GitHub Copilot CLI** for you. It is disabled in this fork and rejects with a validation error rather than editing your agent settings, so wire the hook up by hand.
 
 ### From source
 
@@ -154,7 +149,6 @@ pnpm link
   Bundling never fetches remote URLs, Lavish itself does not set a CSP, local reads stay confined and size-capped, and absolute `file://` paths outside safe inlined asset references are redacted before output.
   Per-asset and per-bundle inline caps default to 10 MB and 25 MB, overridable with `LAVISH_AXI_EXPORT_MAX_ASSET_BYTES` and `LAVISH_AXI_EXPORT_MAX_BUNDLE_BYTES`.
   Unresolved local assets or export notices such as author-set CSP meta tags and redacted file URLs are surfaced in command or browser output.
-  Export is the only way out of Lavish in this fork. Upstream's hosted publishing to the third-party ht-ml.app service is removed: the browser's **Publish link** button and share dialog are deleted from the chrome entirely, `lavish-axi share` rejects with a validation error, and `POST /api/:key/share` answers 410.
 - **Live reload** - Lavish watches the HTML artifact file by default and preserves review context across reloads: the artifact iframe scroll position, an open annotation card's unsent text, and answers to `data-lavish-question` controls (application-owned form state is left alone). While a queued layout-issue batch is outstanding, closely spaced saves coalesce so one batch of fixes costs one refresh. To also reload on sibling asset changes, add `data-lavish-live-reload-root` to the root element or `<meta name="lavish-live-reload" content="root">`.
 - **Feedback controls** - Native controls (radios, checkboxes, inputs, selects, buttons, labels, disclosure summaries, contenteditable) are interactive automatically, so they do not need `data-lavish-action`.
   For reversible choices, let option clicks update local state, then queue exactly one final answer from a per-question submit or Queue answer button with `window.lavish.queuePrompt()`.
@@ -190,11 +184,11 @@ pnpm link
 | `lavish-axi poll <html-file>`   | Long-poll until the user sends feedback or ends the session; detected layout issues wait in the user's Layout issues inbox and arrive only when queued. Leave no-timeout polls running, or re-run them if interrupted. On `status: ended`, stop polling and do not reopen uninvited. |
 | `lavish-axi end <html-file>`    | End a session as the agent; unlike a user-initiated end from the browser, this still allows a plain reopen later.                                                                                                                                                                    |
 | `lavish-axi export <html-file>` | Write a portable copy of the artifact: one HTML file with its local assets inlined, so it opens with no server and no sibling files. Remote CDN/font references are left as links.                                                                                                   |
-| `lavish-axi share <html-file>`  | **Disabled in this fork.** Rejects with a validation error instead of publishing anywhere; use `lavish-axi export` for a portable local file. The subcommand is kept so an agent that knows upstream's CLI learns the feature is deliberately gone rather than broken.               |
+| `lavish-axi share <html-file>`  | **Disabled in this fork.** Rejects with a validation error instead of publishing anywhere; use `lavish-axi export` for a portable local file.                                                                                                                                        |
 | `lavish-axi stop`               | Shut down the background server.                                                                                                                                                                                                                                                     |
 | `lavish-axi playbook [id]`      | List focused artifact guidance or show one playbook; agents must open each matching playbook before writing HTML.                                                                                                                                                                    |
 | `lavish-axi design`             | Show agent-facing design guidance, including optional CDN and Mermaid snippets.                                                                                                                                                                                                      |
-| `lavish-axi setup hooks`        | Install or repair optional SessionStart hooks for Claude Code, Codex, OpenCode, and GitHub Copilot CLI; restart the agent session afterward.                                                                                                                                         |
+| `lavish-axi setup hooks`        | **Disabled in this fork.** Rejects with a validation error instead of writing agent hooks; add the `SessionStart` hook by hand (see [Session hook](#session-hook)).                                                                                                                  |
 | `lavish-axi server`             | Run the local Lavish Editor server.                                                                                                                                                                                                                                                  |
 
 Known playbook IDs: `diagram`, `table`, `comparison`, `plan`, `code`, `input`, `slides`.
