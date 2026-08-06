@@ -43,7 +43,13 @@ test("local flavor invokes this checkout's built CLI everywhere the npx flavor i
   const local = createSkillMarkdown({ invocation: LOCAL_INVOCATION });
   const npx = createSkillMarkdown();
 
-  assert.match(LOCAL_INVOCATION, /^node \/.*\/dist\/cli\.mjs$/, "the local invocation is an absolute node call");
+  // Assert the shape with `path`, not a regex: on Windows this is `node D:\...\dist\cli.mjs`,
+  // which a Unix-shaped pattern rejects even though the invocation is correct.
+  const script = LOCAL_INVOCATION.replace(/^node /, "");
+  assert.notEqual(script, LOCAL_INVOCATION, "the local invocation runs node");
+  assert.ok(path.isAbsolute(script), "the local invocation names an absolute path");
+  assert.equal(path.basename(script), "cli.mjs");
+  assert.equal(path.basename(path.dirname(script)), "dist");
   assert.ok(local.includes(`\`${LOCAL_INVOCATION} <html-file>\``), "the local skill opens sessions via this checkout");
   assert.equal(
     occurrences(local, LOCAL_INVOCATION),

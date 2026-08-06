@@ -14,6 +14,8 @@ pnpm run format:check   # Prettier check
 pnpm run typecheck      # tsc --noEmit (checkJs mode)
 ```
 
+Install with `corepack pnpm install --frozen-lockfile`, never `npm install`. `npm` ignores `pnpm-lock.yaml` and resolves the `^` ranges to newer versions, which makes `format:check` pass locally on formatting the pinned Prettier rejects in CI.
+
 Run a single test file: `node --test test/server.test.js`.
 Filter by test name: `node --test --test-name-pattern "createOpenOutput" test/cli-output.test.js`.
 Run the opt-in real-browser suites: `LAVISH_AXI_BROWSER_E2E=1 node --test test/layout-audit-browser.test.js test/layout-warning-inbox.browser.test.js` (requires `chrome-devtools-axi`).
