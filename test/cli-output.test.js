@@ -25,7 +25,6 @@ import {
   createPollOutput,
   createPlaybookOutput,
   createServerSpawnOptions,
-  createShareOutput,
   createUserEndedOpenOutput,
   fetchJson,
   getCommandHelp,
@@ -739,97 +738,15 @@ test("export command treats --out value as an option operand, not the source fil
   }
 });
 
-test("share output reports the public url and the secret update key", () => {
-  const output = createShareOutput({
-    source: "/tmp/report.html",
-    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
-    warnings: [],
-  });
-
-  assert.equal(output.share.source, "/tmp/report.html");
-  assert.equal(output.share.url, "https://x.ht-ml.app/");
-  assert.equal(output.share.update_key, "uk_secret");
-  assert.equal(output.share.public, true);
-  assert.equal(output.share.visibility, "public");
-  assert.match(output.next_step, /PUBLIC/);
-  assert.match(output.next_step, /update_key/);
-  assert.match(output.next_step, /x\.ht-ml\.app/);
-  assert.match(output.next_step, /ht-ml\.app \(https:\/\/ht-ml\.app\), a third-party host not part of Lavish/);
-});
-
-test("password-protected share output tells viewers they also need the password", () => {
-  const output = createShareOutput({
-    source: "/tmp/report.html",
-    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
-    warnings: [],
-    passwordProtected: true,
-  });
-
-  assert.equal(output.share.password_protected, true);
-  assert.equal(output.share.public, false);
-  assert.equal(output.share.visibility, "private");
-  assert.match(output.next_step, /PASSWORD-PROTECTED/);
-  assert.match(output.next_step, /viewers also need the password/);
-  assert.match(output.next_step, /ht-ml\.app \(https:\/\/ht-ml\.app\), a third-party host not part of Lavish/);
-  assert.doesNotMatch(output.next_step, /anyone with the link can view/);
-});
-
-test("share output surfaces local assets that could not be inlined", () => {
-  const output = createShareOutput({
-    source: "/tmp/report.html",
-    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
-    warnings: [{ kind: "load-failed", ref: "./missing.png" }],
-  });
-
-  assert.equal(output.share.unresolved_local_assets, 1);
-  assert.deepEqual(output.unresolved_local_assets, [{ kind: "load-failed", ref: "./missing.png" }]);
-  assert.match(output.next_step, /LOCAL assets could not be inlined/);
-  assert.match(output.next_step, /ht-ml\.app \(https:\/\/ht-ml\.app\), a third-party host not part of Lavish/);
-  assert.doesNotMatch(output.next_step, /share this URL/);
-});
-
-test("share output separates unresolved assets from notices", () => {
-  const output = createShareOutput({
-    source: "/tmp/report.html",
-    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
-    warnings: [
-      { kind: "module-external", ref: "./main.js" },
-      { kind: "file-url-redacted", ref: "file:///Users/kun/secret.png" },
-      { kind: "csp-meta", ref: "script-src 'self'" },
-    ],
-  });
-
-  assert.equal(output.share.unresolved_local_assets, 1);
-  assert.equal(output.share.notices, 2);
-  assert.deepEqual(output.unresolved_local_assets, [{ kind: "module-external", ref: "./main.js" }]);
-  assert.deepEqual(output.notices, [
-    { kind: "file-url-redacted", ref: "file:///Users/kun/secret.png" },
-    { kind: "csp-meta", ref: "script-src 'self'" },
-  ]);
-  assert.equal(output.warnings.length, 3);
-  assert.match(output.next_step, /Export notices are available in notices/);
-});
-
-test("password-protected share output with unresolved assets still mentions the password", () => {
-  const output = createShareOutput({
-    source: "/tmp/report.html",
-    site: { url: "https://x.ht-ml.app/", site_id: "x", update_key: "uk_secret", status: "active" },
-    warnings: [{ kind: "load-failed", ref: "./missing.png" }],
-    passwordProtected: true,
-  });
-
-  assert.equal(output.share.public, false);
-  assert.equal(output.share.visibility, "private");
-  assert.match(output.next_step, /PASSWORD-PROTECTED/);
-  assert.match(output.next_step, /viewers also need the password/);
-  assert.match(output.next_step, /ht-ml\.app \(https:\/\/ht-ml\.app\), a third-party host not part of Lavish/);
-  assert.doesNotMatch(output.next_step, /anyone with the link can view/);
-});
-
 // The two upstream tests that drove `lavish-axi share` end to end against a fake ht-ml.app are
 // gone: the command is disabled in this fork. They were failing against fork HEAD, and they were
 // inverted guards - restoring the command would have turned them green.
 // test/fork-customizations.test.js asserts the rejection instead.
+//
+// The five upstream tests that exercised createShareOutput are gone too. They passed against fork
+// HEAD only because they called the builder directly, behind the disabled `shareCommand` that
+// could never reach it - live tests pinning the shape of dead code. The builder is deleted, so
+// they went with it.
 
 test("poll help requires an observable wake path", () => {
   const help = getCommandHelp("poll");

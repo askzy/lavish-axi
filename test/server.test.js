@@ -521,40 +521,6 @@ test("overflow menu offers a standalone HTML export that downloads a portable fi
   assert.match(js, /exportArtifactButton\.onclick = exportArtifact/);
 });
 
-test("overflow menu offers publishing an ht-ml.app link via a share dialog", async () => {
-  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
-  const js = await chromeClientSource();
-  const css = await chromeCssSource();
-
-  assert.match(html, /id="shareArtifact"[^<]*>.*Publish link/);
-  assert.match(html, /id="shareDialog"/);
-  assert.match(
-    html,
-    /Publish to <a class="share-link" href="https:\/\/ht-ml\.app" target="_blank" rel="noopener noreferrer">ht-ml\.app<\/a>/,
-  );
-  assert.match(html, /third-party hosting service, not part of Lavish/);
-  assert.match(html, /id="sharePassword"/);
-  assert.match(html, /id="shareUpdateKey"/);
-  assert.match(html, /Without a password, the page is PUBLIC/);
-  assert.match(html, /With a password, the page is PRIVATE/);
-  assert.doesNotMatch(html, /Everything published is public/);
-  assert.doesNotMatch(html, /Get a public link/);
-  assert.match(css, /\.share-overlay/);
-  assert.match(css, /\.share-overlay\{[^}]*z-index:80;/);
-  assert.match(css, /\.share-card/);
-  assert.match(css, /\.share-link/);
-  assert.match(css, /box-shadow:var\(--shadow-floating\)/);
-  // The codebase has no global [hidden] rule, so display-setting overlays need explicit
-  // [hidden] rules or they show through before they should (e.g. the result block).
-  assert.match(css, /\.share-overlay\[hidden\]\{display:none;?\}/);
-  assert.match(css, /\.share-result\[hidden\]\{display:none;?\}/);
-  assert.match(js, /const shareArtifactButton/);
-  assert.match(js, /async function publishShare/);
-  assert.match(js, /fetch\("\/api\/" \+ key \+ "\/share"/);
-  assert.match(js, /shareUrlInput\.value = data\.url/);
-  assert.match(js, /shareUpdateKeyInput\.value = data\.update_key/);
-});
-
 test("copy DOM snapshot requests a fresh snapshot and copies it to the clipboard", async () => {
   const js = await chromeClientSource();
 
@@ -2394,6 +2360,10 @@ test("GET /api/:key/export returns 404 for an unknown session", async () => {
 // its same-origin gate returns 403) are gone: this fork answers 410 unconditionally. They were
 // failing against fork HEAD, and worse, they were inverted guards - restoring the endpoint would
 // have turned them green. test/fork-customizations.test.js asserts the 410 instead.
+//
+// The upstream test that asserted the overflow menu renders a Publish link and a share dialog is
+// gone for the same reason: this fork no longer emits that markup at all, so the assertion could
+// only pass by restoring the UI. fork-customizations.test.js asserts its absence instead.
 
 test("POST /shutdown stops the listener so the client can spawn a fresh server", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));

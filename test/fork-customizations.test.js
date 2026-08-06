@@ -1,11 +1,17 @@
 // Regression guards for the deliberate divergences in this fork (askzy/lavish-axi).
 //
 // The fork disables upstream's outbound-sharing surface: the `share` command, the
-// `setup hooks` command, the `POST /api/:key/share` endpoint, the browser chrome's
-// "Publish link" menu item, and every agent-facing mention of ht-ml.app. A cumulative
-// replay of upstream commits onto this fork with file-level conflict resolution silently
-// restored all of it, so these assertions exist to turn that silent revert into a loud
-// test failure.
+// `setup hooks` command, the `POST /api/:key/share` endpoint, and every agent-facing mention of
+// ht-ml.app. A cumulative replay of upstream commits onto this fork with file-level conflict
+// resolution silently restored all of it, so these assertions exist to turn that silent revert
+// into a loud test failure.
+//
+// The browser chrome's "Publish link" menu item and share dialog are a step further: they are
+// deleted outright, not disabled, along with the chrome client code and CSS behind them and the
+// ht-ml.app HTTP client. Deleted markup cannot be un-hidden by an upstream rewrite of the chrome
+// bar line, which is why the first guard below asserts absence rather than a hidden attribute.
+// The three subcommand/endpoint rejections stay, because a rejection is a message to an agent:
+// "deliberately gone", not "broken".
 //
 // This lives in its own file on purpose. Upstream owns test/server.test.js and
 // test/cli-output.test.js, so a file-level "take upstream" resolution there would delete
@@ -17,7 +23,7 @@
 
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -38,6 +44,9 @@ const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 // Records every request an ht-ml.app publish attempt would make, so a restored upstream code
 // path is caught by the recorder even if it somehow still produced an acceptable status.
+// This fork has deleted src/html-app.js, so nothing reads LAVISH_AXI_HTML_APP_API_URL today and
+// the recorder is dormant. It stays wired up because restoring the client is exactly the revert
+// being guarded against, and a restored client honours that env var again.
 async function startHtmlAppRecorder(requests) {
   const server = createServer((req, res) => {
     req.resume();
@@ -63,13 +72,40 @@ function restoreEnv(name, value) {
   }
 }
 
-test("fork: the chrome overflow menu's Publish link button is not reachable", () => {
+// The fork used to ship the Publish button with `hidden style="display:none"` and this guard
+// asserted those attributes were still there. That was the weaker form twice over: a hidden
+// element can be un-hidden by any upstream rewrite of the chrome bar line (three separate commits
+// rewrote it in one sync), and the guard itself would have gone green on a restored-but-hidden
+// button. The markup is deleted now, so the assertion is absence.
+//
+// All three surfaces are checked, not just the markup. Deleting the button alone would leave
+// chrome-client.js doing `document.getElementById("shareArtifact")` on a top-level const and then
+// assigning .onclick to null - which throws and kills the entire chrome script, taking annotation
+// and the feedback loop with it. A restored client-side reference is therefore worse than a
+// restored button, and it is what the second assertion block exists to catch.
+test("fork: the chrome ships no Publish link button, share dialog, or client-side share code", async () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
-  const button = html.match(/<button[^>]*id="shareArtifact"[^>]*>/)?.[0];
 
-  assert.ok(button, "expected a #shareArtifact button in the chrome bar - if upstream dropped it, drop this guard");
-  assert.match(button, /(^|\s)hidden(\s|>|$)/, "the fork's `hidden` attribute is gone from #shareArtifact");
-  assert.match(button, /display:\s*none/, "the fork's inline display:none is gone from #shareArtifact");
+  assert.doesNotMatch(html, /id="shareArtifact"/, "the chrome bar renders a #shareArtifact button again");
+  assert.doesNotMatch(html, /id="shareDialog"/, "the chrome renders the share dialog again");
+  assert.doesNotMatch(html, /Publish link/, "the overflow menu advertises a Publish link again");
+  assert.doesNotMatch(html, /ht-ml\.app/, "the rendered chrome mentions ht-ml.app again");
+
+  // A surviving reference here is the null-dereference that kills the whole chrome script.
+  const chromeClient = await readFile(path.join(REPO_ROOT, "src/chrome-client.js"), "utf8");
+  assert.doesNotMatch(
+    chromeClient,
+    /shareArtifact|shareDialog|shareForm|publishShare/,
+    [
+      "src/chrome-client.js references the removed share UI again.",
+      "getElementById returns null for it, so the top-level assignment throws and the entire chrome",
+      "script dies - annotation and the feedback loop included. Remove the reference, do not re-add",
+      "the markup.",
+    ].join(" "),
+  );
+
+  const chromeCss = await readFile(path.join(REPO_ROOT, "src/chrome.css"), "utf8");
+  assert.doesNotMatch(chromeCss, /\.share-/, "src/chrome.css styles the removed share UI again");
 });
 
 test("fork: agent-facing help never advertises ht-ml.app or the share command", () => {

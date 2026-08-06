@@ -478,15 +478,10 @@ export function createExportOutput({ source, output, html, warnings }) {
   return result;
 }
 
-function assetWarningSummaries(warnings) {
-  return exportWarningSummaries(warnings);
-}
-
-// Publish the artifact as a visitable page on third-party ht-ml.app. Builds the same local-inlined
-// HTML as `export` (remote refs left as links), then POSTs it to ht-ml.app's `/v1/sites` API,
-// sending the artifact to ht-ml.app's servers. The service is not part of Lavish, needs no
-// account or API key, and returns the share URL plus the secret update_key for
-// managing the page later. Server-independent.
+// Upstream's `share` published the artifact to third-party ht-ml.app. This fork removes outbound
+// publishing entirely - the ht-ml.app client, the browser Publish button, and the share output
+// builder are all gone - but the subcommand itself stays and rejects, so an agent that knows the
+// upstream CLI is told the feature is deliberately absent instead of getting "unknown command".
 // Exported so test/fork-customizations.test.js can assert directly that it rejects. The CLI
 // runner swallows handler errors into a process exit code, so an end-to-end spawn cannot tell
 // "disabled in this fork" apart from any other validation error.
@@ -498,53 +493,6 @@ export async function shareCommand(_args) {
     "This fork of lavish-axi (askzy/lavish-axi) removes outbound publishing to ht-ml.app.",
     "Use `lavish-axi export <html-file>` to produce a portable local HTML file instead.",
   ]);
-}
-
-export function createShareOutput({ source, site, warnings, passwordProtected = false }) {
-  const allWarnings = Array.isArray(warnings) ? warnings : [];
-  const { unresolved, notices } = splitExportWarnings(allWarnings);
-  const isPasswordProtected = Boolean(passwordProtected);
-  const result = {
-    share: {
-      source,
-      url: site.url,
-      site_id: site.site_id,
-      update_key: site.update_key,
-      status: site.status || "active",
-      public: !isPasswordProtected,
-      visibility: isPasswordProtected ? "private" : "public",
-      password_protected: isPasswordProtected,
-      unresolved_local_assets: unresolved.length,
-      notices: notices.length,
-    },
-  };
-  const passwordNote = isPasswordProtected ? " This page is PASSWORD-PROTECTED; viewers also need the password." : "";
-  if (allWarnings.length) result.warnings = exportWarningSummaries(allWarnings);
-  if (unresolved.length) result.unresolved_local_assets = assetWarningSummaries(unresolved);
-  if (notices.length) result.notices = assetWarningSummaries(notices);
-  const noticeNote = notices.length ? " Export notices are available in notices." : "";
-  const hostNote =
-    "ht-ml.app (https://ht-ml.app), a third-party host not part of Lavish, hosts the page, so it needs no Lavish server.";
-  if (unresolved.length) {
-    result.next_step =
-      `Published ${isPasswordProtected ? "a PASSWORD-PROTECTED page at " : ""}${site.url}, but some LOCAL assets could not be inlined and were left as references (see unresolved_local_assets); inspect the hosted page and fix missing local assets before sharing it.${passwordNote}${noticeNote} ` +
-      `Remote CDN/font references are intentionally left as links and render where there is network access. ` +
-      `The update_key is a secret shown only once; keep it to update or delete the page later (there is no recovery). ` +
-      hostNote;
-  } else if (isPasswordProtected) {
-    result.next_step =
-      `Published a PASSWORD-PROTECTED page: ${site.url} - share this URL with the user and provide the password separately; viewers also need the password. ` +
-      `${noticeNote ? `${noticeNote} ` : ""}` +
-      `The update_key is a secret shown only once; keep it to update or delete the page later (there is no recovery). ` +
-      hostNote;
-  } else {
-    result.next_step =
-      `Published a PUBLIC page that anyone with the link can view: ${site.url} - share this URL with the user. ` +
-      `${noticeNote ? `${noticeNote} ` : ""}` +
-      `The update_key is a secret shown only once; keep it to update or delete the page later (there is no recovery). ` +
-      hostNote;
-  }
-  return result;
 }
 
 // Explicitly shut down the running Lavish Editor server. Unlike `end` (which closes a single
