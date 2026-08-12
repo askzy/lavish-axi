@@ -29,7 +29,7 @@ import * as mermaidNode from "./mermaid-node.js";
 import { buildSelfContainedHtml, exportFileName, splitExportWarnings } from "./export-bundle.js";
 import { injectLavishSdk } from "./html-transform.js";
 import { bindHost, extraAllowedHosts, hostForUrl, IPV6_LOOPBACK_HOST, linkHost, LOOPBACK_HOST } from "./paths.js";
-import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
+import { canonicalFile, canonicalSessionFile, SessionStore, sessionKey } from "./session-store.js";
 
 const chromeClientUrl = new URL("./chrome-client.js", import.meta.url);
 const chromeCssUrl = new URL("./chrome.css", import.meta.url);
@@ -179,7 +179,9 @@ export async function serve({
 
   app.get("/api/poll", async (req, res, next) => {
     try {
-      const file = await canonicalFile(String(req.query.file || ""));
+      // Lenient on purpose: queued feedback belongs to the session record, not to the file, so a
+      // deleted artifact must not make the queue unreachable.
+      const file = await canonicalSessionFile(String(req.query.file || ""));
       const key = sessionKey(file);
       const timeoutMs =
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
@@ -447,9 +449,15 @@ export async function serve({
 
   app.post("/api/end", async (req, res, next) => {
     try {
-      const file = await canonicalFile(req.body.file);
+      // Ending only rewrites the record, so it must not depend on the artifact still existing:
+      // a session whose HTML was deleted was previously impossible to close from any route.
+      const file = await canonicalSessionFile(req.body.file);
       const key = sessionKey(file);
-      await store.endSession(key, "agent");
+      const session = await store.endSession(key, "agent");
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
       clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
       events.emit("ended", key);
       res.json({ status: "ended" });

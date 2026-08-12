@@ -531,6 +531,46 @@ export async function canonicalFile(file) {
   return realpath(absolute);
 }
 
+// Session records outlive the artifacts they point at, so any path that only has to ADDRESS a
+// record must stay resolvable after the HTML file is deleted. `canonicalFile` cannot: `realpath`
+// throws ENOENT on a missing file, which strands the record - `end` can never close it and `poll`
+// can never drain it, and it sits in the bare-command listing forever. Rebuild the canonical path
+// from the deepest ancestor that still exists instead, so a deleted artifact hashes to the same
+// session key `open` stored for it while the file was there. Commands that genuinely need the
+// bytes (`open`, `export`) keep using the strict resolver.
+export async function canonicalSessionFile(file) {
+  try {
+    return await canonicalFile(file);
+  } catch (error) {
+    if (!isMissingPathError(error)) throw error;
+    return canonicalizeMissingFile(path.resolve(file));
+  }
+}
+
+async function canonicalizeMissingFile(absolute) {
+  const missingSegments = [];
+  let current = absolute;
+  for (;;) {
+    const parent = path.dirname(current);
+    missingSegments.unshift(path.basename(current));
+    // dirname() is its own fixed point at the filesystem root, so nothing above it can resolve:
+    // hand back the plain absolute path rather than looping.
+    if (parent === current) return absolute;
+    try {
+      return path.join(await realpath(parent), ...missingSegments);
+    } catch (error) {
+      if (!isMissingPathError(error)) throw error;
+      current = parent;
+    }
+  }
+}
+
+// ENOTDIR means an ancestor exists but is a file, so the path below it cannot exist either -
+// the same "nothing here to resolve" case as ENOENT.
+function isMissingPathError(error) {
+  return error?.code === "ENOENT" || error?.code === "ENOTDIR";
+}
+
 export function sessionKey(file) {
   return crypto.createHash("sha256").update(file).digest("hex").slice(0, 16);
 }

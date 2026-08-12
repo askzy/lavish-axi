@@ -1081,6 +1081,71 @@ test("spawned poll announces the wait on stderr and leaves re-run guidance when 
   }
 });
 
+// spawn, never spawnSync: this process hosts the server the CLI talks to, and a synchronous child
+// would block the event loop that has to answer its requests.
+function runCli(args, env) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), ...args], {
+      cwd: fileURLToPath(new URL("..", import.meta.url)),
+      env,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk.toString()));
+    child.stderr.on("data", (chunk) => (stderr += chunk.toString()));
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+test("end closes a session whose artifact file was deleted, and refuses an unknown path", async () => {
+  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-end-orphan-test-`);
+  const artifact = `${stateDir}/artifact.html`;
+  // A second session keeps the server up once the first one ends, so the later commands still have
+  // a server to reach.
+  const keepAlive = `${stateDir}/keep-alive.html`;
+  await writeFile(artifact, "<html><body>hello</body></html>", "utf8");
+  await writeFile(keepAlive, "<html><body>keep</body></html>", "utf8");
+  const server = await serve({ port: 0, stateFile: `${stateDir}/state.json`, version: VERSION });
+  const env = { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_PORT: String(server.port) };
+  const sessionStatuses = async () => {
+    const state = JSON.parse(await readFile(`${stateDir}/state.json`, "utf8"));
+    return Object.fromEntries(
+      Object.values(state.sessions).map((session) => [path.basename(session.file), session.status]),
+    );
+  };
+  try {
+    for (const file of [artifact, keepAlive]) {
+      const opened = await fetch(`http://127.0.0.1:${server.port}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file }),
+      });
+      assert.ok(opened.ok, "session opens");
+    }
+    await rm(artifact);
+
+    // Deleting the artifact used to strand its session for good: `end` resolved the path through
+    // realpath before touching the record, so it threw ENOENT and the session stayed open forever
+    // with no CLI route left to clear it.
+    const orphan = await runCli(["end", artifact], env);
+    assert.equal(orphan.code, 0, orphan.stdout + orphan.stderr);
+    assert.match(orphan.stdout, /status: ended/);
+    assert.deepEqual(await sessionStatuses(), { "artifact.html": "ended", "keep-alive.html": "open" });
+
+    const unknown = await runCli(["end", `${stateDir}/never-opened.html`], env);
+    assert.notEqual(unknown.code, 0, "a path with no session must not report a successful end");
+    assert.match(unknown.stdout, /NOT_FOUND/);
+    assert.deepEqual(await sessionStatuses(), { "artifact.html": "ended", "keep-alive.html": "open" });
+
+    const normal = await runCli(["end", keepAlive], env);
+    assert.equal(normal.code, 0, normal.stdout + normal.stderr);
+    assert.deepEqual(await sessionStatuses(), { "artifact.html": "ended", "keep-alive.html": "ended" });
+  } finally {
+    await server.close();
+    await rm(stateDir, { force: true, recursive: true });
+  }
+});
+
 test("waiting next step reassures agents that re-running poll loses nothing", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
