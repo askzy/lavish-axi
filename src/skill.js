@@ -1,7 +1,13 @@
 import { realpathSync } from "node:fs";
 import path from "node:path";
 
-import { POLL_SEND_AND_END_RULE, POLL_WAKE_PATH_RULES, createHomeOutput } from "./cli.js";
+import {
+  POLL_HANDOFF_RULE,
+  POLL_PICKUP_RULE,
+  POLL_SEND_AND_END_RULE,
+  POLL_WAKE_PATH_RULES,
+  createHomeOutput,
+} from "./cli.js";
 import { PLAYBOOK_ROUTER_HELP } from "./playbooks.js";
 
 // Trigger string Claude Code (and other agents) match against to auto-load the skill.
@@ -10,6 +16,15 @@ export const SKILL_DESCRIPTION =
   "Turn complex or visual agent responses into rich, reviewable HTML artifacts the user can " +
   "annotate and send feedback on, using the lavish-axi CLI. Use when about to give a plan, " +
   "comparison, diagram, table, code diff, report, or anything easier to grasp visually than as prose.";
+
+// Trigger string for the companion pickup skill. The /lavish skill deliberately stops listening
+// when a poll is reaped rather than looping (see POLL_HANDOFF_RULE), so this is how an agent gets
+// back to feedback the user queued in the meantime. Phrased around the user's words, not the
+// mechanism, because the user says "did anything come back" far more often than "drain the poll".
+export const CHECK_SKILL_DESCRIPTION =
+  "Collect feedback a user queued on a Lavish artifact while no agent was listening, without " +
+  "opening a long poll. Use when the user asks to check Lavish, asks whether feedback came back " +
+  "on an artifact or review page, or says they have sent notes on something you showed them.";
 
 // How the published skill tells agents to invoke the CLI: no global install, no prompt.
 export const NPX_INVOCATION = "npx -y lavish-axi";
@@ -144,8 +159,10 @@ ${home.help[home.help.length - 1]}
 ${POLL_WAKE_PATH_RULES.map((rule) => `   ${skillCommandText(rule)}`).join("\n")}
 4. If poll returns feedback, apply the user's prompts. A \`layout-warnings\` prompt is an explicit repair request; apply every listed fix in one pass before saving, and let Lavish re-check it after a newer artifact load.
 5. Apply human feedback, then poll again with \`--agent-reply "<message>"\` to reply in the browser and keep the loop going under the same foreground-or-verified-wake-path rule.
-6. Run \`${invocation} end <html-file>\` when the review is finished.
-7. ${POLL_SEND_AND_END_RULE} Deliver any remaining updates directly in this conversation.
+6. If a poll is reaped before the user sends anything, hand the review back rather than looping. One line is enough: you have stopped listening, anything already sent is safely queued, and \`/check-lavish\` will collect it. Do not re-enter the poll silently - see the wake-path rules in step 3 for why an unbounded loop is the wrong default.
+7. \`/check-lavish\` (collect feedback later): run \`${invocation}\` with no arguments, find the listed session for this review whose pending prompts count is above 0, then drain it with \`${invocation} poll <html-file> --timeout-ms 0\` - that returns immediately instead of waiting. Apply the prompts exactly as in step 4. If that count is 0, say so and stop; do not open a long poll just to look.
+8. Run \`${invocation} end <html-file>\` when the review is finished.
+9. ${POLL_SEND_AND_END_RULE} Deliver any remaining updates directly in this conversation.
 
 ## Visual guidance
 
@@ -162,5 +179,66 @@ ${playbookList(home.playbooks)}
 ## Commands & rules
 
 ${bullets(home.help.map(skillCommandText))}
+`;
+}
+
+/**
+ * Render the installable SKILL.md for the `check-lavish` companion skill.
+ *
+ * Deliberately short: it loads on demand mid-task, and its whole job is three commands plus the
+ * one judgement call (do not open a long poll just to look). The procedure text is imported from
+ * `POLL_PICKUP_RULE` rather than restated, so the two skills cannot disagree about it.
+ *
+ * @param {object} [options]
+ * @param {string} [options.invocation] how the skill tells agents to invoke the CLI. Defaults to
+ *   the published `npx -y lavish-axi`; pass `localInvocation(repoRoot)` for the checkout-local flavor.
+ * @returns {string} full SKILL.md contents including YAML frontmatter
+ */
+export function createCheckSkillMarkdown({ invocation = NPX_INVOCATION } = {}) {
+  const skillCommandText = (text) => text.replaceAll("`lavish-axi", `\`${invocation}`);
+
+  return `---
+name: check-lavish
+description: ${CHECK_SKILL_DESCRIPTION}
+argument-hint: "[artifact path or nothing]"
+author: Kun Chen (kunchenguid)
+metadata:
+  hermes:
+    tags: [html, review, artifacts, feedback]
+    category: productivity
+---
+
+# Check Lavish for queued feedback
+
+${installNote(invocation)}
+
+## Why this exists
+
+A Lavish poll is a long-lived job, and harnesses reap those on their own schedule. The \`/lavish\`
+skill therefore hands the review back instead of looping forever. Nothing is lost when it does:
+the server keeps queued feedback and delivers it to the next poll that attaches. This skill is
+that next poll.
+
+## Steps
+
+1. Run \`${invocation}\` with no arguments and read the session list it prints.
+2. Pick the session this request is about: the artifact the user named, else one under the current
+   working directory, else the most recently opened. Do NOT sweep every listed session - \`open\`
+   sessions accumulate across conversations, so the list is not a list of live reviews.
+3. If its pending prompts count is 0, say so in one line and stop. Do not open a long poll just to
+   look, and do not reopen an ended session.
+4. If the count is above 0, drain it with \`${invocation} poll <html-file> --timeout-ms 0\`. That
+   returns immediately instead of waiting.
+5. Apply the returned prompts exactly as the \`/lavish\` workflow describes. A \`layout-warnings\`
+   prompt is an explicit repair request; apply every listed fix in one pass.
+6. To carry on the conversation in the browser, reply with
+   \`${invocation} poll <html-file> --agent-reply "<message>"\` and follow the \`/lavish\` wake-path
+   rules from there. If the user is done, \`${invocation} end <html-file>\`.
+
+## Rules
+
+- ${skillCommandText(POLL_PICKUP_RULE)}
+- ${skillCommandText(POLL_HANDOFF_RULE)}
+- ${POLL_SEND_AND_END_RULE}
 `;
 }

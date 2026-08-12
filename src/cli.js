@@ -31,13 +31,22 @@ const DESCRIPTION =
 // dead feedback loop. This fork keeps that requirement but NOT upstream's foreground-by-default
 // mandate - harnesses here cap foreground command duration, so a tracked background poll is the
 // normal path, and the remaining rules are what make it safe.
+// The handoff and pickup halves of the fork's bounded re-poll policy. Exported by name because
+// the /check-lavish skill renders the pickup half directly: a second copy of this procedure is a
+// second thing to keep in sync, and the two would drift on the first reword.
+export const POLL_HANDOFF_RULE =
+  "Do NOT silently re-run the poll after a reap. Every wake re-reads the whole conversation, so an unbounded re-poll loop is a standing token cost that grows with the session, and it is the reason an agent eventually decides it is stuck and abandons a review the user is still working through. Hand back instead: say in one line that you have stopped listening, that anything already sent is safely queued, and that `/check-lavish` will collect it.";
+export const POLL_PICKUP_RULE =
+  "To collect queued feedback later - the `/check-lavish` path - run `lavish-axi` with no arguments and read the session list it prints: each listed session carries a pending prompts count, and anything above 0 has feedback waiting. Drain it with `lavish-axi poll <html-file> --timeout-ms 0`, which returns immediately instead of waiting. Scope this to the session you opened or to the current working directory, because `open` sessions accumulate across conversations.";
 export const POLL_WAKE_PATH_RULES = Object.freeze([
   "Run the poll in the foreground when your harness allows it, so it returns the feedback directly to the agent. If your harness caps how long a foreground command may run, running the poll as a background task is expected and supported.",
   "A background poll must go through a harness-native tracked background-job facility whose completion result is guaranteed to resume or notify the same agent.",
   "Never use `nohup`, shell `&`, `disown`, redirected fire-and-forget processes, or a detached terminal without an explicit verified callback merely to keep polling alive.",
   "If the harness has no completion-aware background facility, use the foreground poll or first wire a verified wake callback into the surrounding supervisor.",
   "Do not tell the user the artifact is being monitored until that wake path is live.",
-  "If the poll gets killed or times out anyway, just re-run it - queued feedback is never lost.",
+  "A reaped or timed-out poll is expected and is not a failure: harnesses reap long-lived jobs on their own schedule, so it says nothing about whether the user is still reviewing, and queued feedback is never lost either way.",
+  POLL_HANDOFF_RULE,
+  POLL_PICKUP_RULE,
 ]);
 export const POLL_SEND_AND_END_RULE =
   "`Send & End` ends the session. Its final feedback is still delivered once. After that response, polling stops, and the agent must not reopen the session uninvited.";
@@ -157,6 +166,7 @@ export function createHomeOutput({ bin, sessions, includeSessions = true }) {
       "Lavish serves the html file through a local express.js server. If your html needs to reference other filesystem assets such as images, CSS, fonts, and local scripts, copy them into the same directory as the HTML file, then reference them with relative paths from that directory. Never prepend `/` to those asset paths - root paths won't work",
       "The artifact runs in a sandboxed iframe with an opaque origin, so `localStorage` and `sessionStorage` throw on any access. An unguarded top-level access aborts that whole `<script>` block, so the page still renders while every listener below it silently never attaches - wrap storage in try/catch and treat persistence as optional",
       `Run \`lavish-axi poll <html-file>\` to wait for user feedback. It long-polls and stays silent until the user sends feedback or ends the session, so leave it running - never kill it. Detected layout issues never return this poll: the browser files them in the user's Layout issues inbox in the Lavish top bar, and they arrive as an ordinary tag "layout-warnings" prompt only when the user selects them and queues the fixes. Never edit the artifact to chase a layout issue the user has not queued. The only exception is a fatal artifact_failures response, which means the review surface itself could not be used. ${pollExecutionGuidance()} ${POLL_SEND_AND_END_RULE}`,
+      "Run `lavish-axi` with no arguments to collect feedback the user queued while nothing was listening - this is the `/check-lavish` path. Each listed session carries a pending prompts count; anything above 0 has feedback waiting. Drain it with `lavish-axi poll <html-file> --timeout-ms 0`, which returns immediately rather than waiting, then apply the prompts as usual. Prefer the session you opened or one under the current working directory: `open` sessions accumulate across conversations, so a bare listing is not a list of live reviews",
       "Run `lavish-axi end <html-file>` to end a session as the agent - ending it this way still allows a plain reopen later. When the user ends it from the browser instead, a later `lavish-axi <html-file>` refuses to reopen it without `--reopen`",
       "Run `lavish-axi export <html-file> [--out <path>]` to write a portable copy of the artifact - one HTML file with its LOCAL assets inlined - so it opens with no Lavish server and no sibling files. Remote CDN/font references are left as links, so it needs network to render those. Users can also export from the browser chrome's overflow menu",
       "Run `lavish-axi stop` to shut down the background server (it also self-stops when idle or after the last session ends with nothing connected)",
@@ -307,8 +317,10 @@ export function pollWaitTickText(elapsedMs) {
 
 export function pollInterruptedText(file) {
   return (
-    `[lavish-axi] Poll interrupted before user feedback arrived. The user may still be reviewing - ` +
-    `re-run \`lavish-axi poll ${file}\` to keep waiting; queued feedback is never lost.`
+    `[lavish-axi] Poll interrupted before user feedback arrived - expected on a reaped job, not a failure. ` +
+    `The user may still be reviewing, and queued feedback is never lost. Do not silently re-enter the poll: ` +
+    `tell the user you have stopped listening, then collect anything they queue with ` +
+    `\`lavish-axi poll ${file} --timeout-ms 0\` - the /check-lavish path.`
   );
 }
 

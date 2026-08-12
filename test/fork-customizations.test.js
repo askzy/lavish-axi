@@ -37,6 +37,7 @@ import { AxiError } from "axi-sdk-js";
 // at link time and take every other guard in this file down with it. This way each guard
 // fails on its own terms.
 import * as cli from "../src/cli.js";
+import * as skill from "../src/skill.js";
 import { createChromeHtml, serve } from "../src/server.js";
 
 const BIN = fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url));
@@ -240,5 +241,105 @@ test("fork: POST /api/:key/share is gone (410) and never reaches ht-ml.app", asy
     restoreEnv("LAVISH_AXI_HTML_APP_API_URL", previousApiUrl);
     await recorder.close();
     await rm(dir, { force: true, recursive: true });
+  }
+});
+
+// Upstream ends its poll wake-path rules with an unconditional "if the poll gets killed or times
+// out anyway, just re-run it". On a harness that reaps long-lived jobs on a fixed schedule (measured
+// here: every 30 minutes at HH:05 / HH:35), that instruction is an unbounded re-poll loop, and every
+// wake re-reads the whole conversation. It is also self-defeating: an agent following it eventually
+// decides it is stuck and abandons a review the user is still working through.
+//
+// This fork replaces it with a bounded handoff plus a cheap later-pickup path (/check-lavish).
+// Upstream's version is a single sentence inside a frozen array in src/cli.js, so a file-level
+// "take upstream" resolution restores the loop with no conflict and no other test failing -
+// exactly the silent revert this file exists to catch.
+test("fork: poll wake-path rules bound re-polling instead of looping unconditionally", () => {
+  const rules = cli.POLL_WAKE_PATH_RULES.join(" ");
+
+  assert.match(rules, /do NOT silently re-run the poll after a reap/i);
+  assert.match(rules, /\/check-lavish/);
+  assert.match(rules, /--timeout-ms 0/);
+  assert.match(rules, /pending prompts count/);
+  assert.match(rules, /reaped or timed-out poll is expected/i);
+
+  // Upstream's unconditional instruction must not reappear beside the bounded rule.
+  assert.doesNotMatch(rules, /just re-run it/i);
+});
+
+// The reaped-poll stderr notice is the one place an agent reads policy at the moment the poll dies,
+// so it has to agree with the rules above. Upstream's wording tells the agent to re-run and keep
+// waiting, which is the loop being guarded against.
+test("fork: the interrupted-poll notice routes to /check-lavish, not back into a poll", () => {
+  const interrupted = cli.pollInterruptedText("/tmp/report.html");
+
+  assert.match(interrupted, /Do not silently re-enter the poll/i);
+  // Upstream's --help test asserts no `sessions[` ever appears in agent-facing help output.
+  assert.doesNotMatch(cli.POLL_WAKE_PATH_RULES.join(" "), /sessions\[/);
+  assert.match(interrupted, /--timeout-ms 0/);
+  assert.match(interrupted, /\/check-lavish/);
+  assert.doesNotMatch(interrupted, /to keep waiting/i);
+});
+
+// The pickup path is only useful if an agent can find it. It has to survive in both agent-facing
+// surfaces: the bare-command help an agent reads from the CLI, and the generated SKILL.md an agent
+// reads when it never runs the CLI at all.
+test("fork: the /check-lavish pickup path reaches both the CLI help and the generated skill", () => {
+  const home = cli.createHomeOutput({ bin: "lavish-axi", sessions: [] });
+  const help = home.help.join(" ");
+  assert.match(help, /\/check-lavish/);
+  assert.match(help, /pending prompts count/);
+  assert.match(help, /--timeout-ms 0/);
+
+  const markdown = skill.createSkillMarkdown();
+  assert.match(markdown, /\/check-lavish/);
+  assert.match(markdown, /--timeout-ms 0/);
+  assert.match(markdown, /pending prompts count/);
+  // The handoff step must be numbered guidance, not buried only in the rules blob.
+  assert.match(markdown, /hand the review back rather than looping/i);
+  // Upstream's skill.test.js forbids the literal bookkeeping field name in SKILL.md.
+  assert.doesNotMatch(markdown, /pending_prompts/);
+});
+
+// The pickup path is only reachable if `/check-lavish` exists as a real skill. It is generated from
+// the same rule constants as /lavish so the two cannot describe the procedure differently, and it
+// is emitted in every build mode so it cannot go stale while /lavish stays fresh.
+test("fork: the /check-lavish companion skill is generated and shares the pickup rule verbatim", () => {
+  const markdown = skill.createCheckSkillMarkdown();
+
+  assert.match(markdown, /^---\nname: check-lavish\n/);
+  assert.match(markdown, /description: .*queued.*Lavish artifact/i);
+
+  // The mechanics an agent has to get right.
+  assert.match(markdown, /with no arguments/);
+  assert.match(markdown, /--timeout-ms 0/);
+  // \s+ not a literal space: the generated markdown hard-wraps, so this phrase spans a newline.
+  assert.match(markdown, /do not open a long poll just to\s+look/i);
+  assert.match(markdown, /Do NOT sweep every listed session/i);
+
+  // Single-sourced, not restated. Rendered with an identity invocation so the command rewrite is a
+  // no-op and the constants must appear byte-for-byte; under the default `npx -y lavish-axi` the
+  // rule text is deliberately rewritten, so a verbatim check there would fail for the wrong reason.
+  const raw = skill.createCheckSkillMarkdown({ invocation: "lavish-axi" });
+  assert.ok(raw.includes(cli.POLL_PICKUP_RULE), "renders POLL_PICKUP_RULE verbatim");
+  assert.ok(raw.includes(cli.POLL_HANDOFF_RULE), "renders POLL_HANDOFF_RULE verbatim");
+
+  // Same leak rule upstream enforces on the lavish skill.
+  assert.doesNotMatch(markdown, /pending_prompts/);
+  assert.doesNotMatch(markdown, /sessions\[/);
+
+  // The local flavor must never route through npm, which would fetch upstream.
+  const local = skill.createCheckSkillMarkdown({ invocation: "node /repo/dist/cli.mjs" });
+  assert.match(local, /node \/repo\/dist\/cli\.mjs/);
+  assert.doesNotMatch(local, /npx -y lavish-axi poll/);
+});
+
+// A skill that only exists in dist/ is not installed, and one that only exists in skills/ is not
+// usable from this checkout. Both flavors have to be produced from the same source.
+test("fork: both generated skills are committed and reproducible", async () => {
+  for (const name of ["lavish", "check-lavish"]) {
+    const committed = await readFile(path.join(REPO_ROOT, "skills", name, "SKILL.md"), "utf8");
+    const expected = name === "lavish" ? skill.createSkillMarkdown() : skill.createCheckSkillMarkdown();
+    assert.equal(committed, expected, `skills/${name}/SKILL.md is stale - run node scripts/build-skill.js`);
   }
 });
