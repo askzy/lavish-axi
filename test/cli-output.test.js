@@ -252,6 +252,16 @@ test("design output recommends luxury as the default theme and warns against @ap
   assert.ok(output.theme_usage.some((item) => /default.*luxury|luxury.*default/i.test(item)));
   assert.ok(output.theme_usage.some((item) => item.includes("@apply") && /daisyui/i.test(item)));
   assert.ok(output.theme_usage.some((item) => /aborts the entire|no Tailwind styles/i.test(item)));
+  // Opacity-faded text is the one contrast failure an author cannot catch by looking: it reads as
+  // grey on a light theme and as invisible on a dark one, so it has to be caught by the guidance.
+  assert.ok(
+    output.theme_usage.some((item) => /de-emphasis/i.test(item) && /opacity/i.test(item)),
+    "theme guidance rules out expressing de-emphasis with opacity",
+  );
+  assert.ok(
+    output.theme_usage.some((item) => item.includes("text-base-content/40") && /unreadable|invisible/i.test(item)),
+    "theme guidance names the concrete failing utility",
+  );
 });
 
 test("playbook index output lists known playbooks with concise descriptions", () => {
