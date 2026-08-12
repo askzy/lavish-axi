@@ -2510,6 +2510,80 @@ test("ending one of several sessions keeps the server running", async () => {
   }
 });
 
+test("a session whose artifact file was deleted can still be polled and ended", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  // A second session keeps the server up after the first one ends, so the assertions below still
+  // have a server to talk to.
+  const keepAlive = path.join(dir, "keep-alive.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(keepAlive, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    for (const file of [artifact, keepAlive]) {
+      await fetch(`${base}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file }),
+      });
+    }
+    // Capture the key while the file still exists: the session was stored under its real path.
+    const key = sessionKey(await canonicalFile(artifact));
+    await rm(artifact);
+
+    // Both routes address the record, not the bytes. Resolving the path through realpath first
+    // used to throw ENOENT here, which stranded the session: no route could reach it again.
+    const poll = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
+    assert.equal(poll.status, 200);
+    assert.equal((await poll.json()).status, "waiting");
+
+    const end = await fetch(`${base}/api/end`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    assert.equal(end.status, 200);
+    const state = JSON.parse(await readFile(path.join(dir, "state.json"), "utf8"));
+    assert.equal(state.sessions[key].status, "ended");
+    assert.equal(state.sessions[key].ended_by, "agent");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ending a path with no session reports not found instead of a false end", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const key = sessionKey(await canonicalFile(artifact));
+
+    // A mistyped or never-opened path must not answer "ended": an agent that believes a session is
+    // closed stops looking for the one that is still open.
+    const end = await fetch(`${base}/api/end`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: path.join(dir, "never-opened.html") }),
+    });
+    assert.equal(end.status, 404);
+    const state = JSON.parse(await readFile(path.join(dir, "state.json"), "utf8"));
+    assert.equal(Object.keys(state.sessions).length, 1);
+    assert.equal(state.sessions[key].status, "open");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a user-initiated end via the keyed route blocks a plain reopen but honors reopen: true", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");

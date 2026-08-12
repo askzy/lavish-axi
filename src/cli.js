@@ -17,7 +17,7 @@ import {
 import { clientHost, defaultPort, ensureStateDir, hostForUrl, serverLogFile, stateFile } from "./paths.js";
 import { findPlaybook, listPlaybooks, playbookIds, PLAYBOOK_ROUTER_HELP } from "./playbooks.js";
 import { resolveDesignAssetPath, serve } from "./server.js";
-import { canonicalFile, sessionKey, SessionStore } from "./session-store.js";
+import { canonicalFile, canonicalSessionFile, sessionKey, SessionStore } from "./session-store.js";
 import { initDefaultTelemetry } from "./telemetry.js";
 
 const COMMANDS = new Set(["open", "poll", "end", "stop", "server", "playbook", "design", "setup", "export", "share"]);
@@ -248,7 +248,9 @@ async function pollCommand(args) {
   if (!file) {
     throw new AxiError("HTML file path is required", "VALIDATION_ERROR", ["Run `lavish-axi poll <html-file>`"]);
   }
-  const absolute = await canonicalFile(file);
+  // A session outlives its artifact file: prompts already queued must stay collectable even if
+  // the HTML was deleted, so this addresses the record leniently instead of requiring the bytes.
+  const absolute = await canonicalSessionFile(file);
   const baseUrl = await ensureServer();
   const agentReply = flagValue(args, "--agent-reply");
   if (agentReply) {
@@ -437,10 +439,24 @@ async function endCommand(args) {
   if (!file) {
     throw new AxiError("HTML file path is required", "VALIDATION_ERROR", ["Run `lavish-axi end <html-file>`"]);
   }
-  const absolute = await canonicalFile(file);
+  // Deleting the artifact must not strand its session: ending is bookkeeping on the record, so it
+  // deliberately does not require the file to still be on disk.
+  const absolute = await canonicalSessionFile(file);
   const baseUrl = await ensureServer();
-  const response = await postJson(`${baseUrl}/api/end`, { file: absolute });
+  const response = await postJson(
+    `${baseUrl}/api/end`,
+    { file: absolute },
+    { notFound: () => sessionNotFoundError(absolute) },
+  );
   return { session: { file: absolute, status: response.status || "ended" } };
+}
+
+// Reporting "ended" for a path the server has no record of hides a typo behind a success, and an
+// agent that believes a session is closed stops looking for the one that is still open.
+function sessionNotFoundError(file) {
+  return new AxiError(`No Lavish Editor session for ${file}`, "NOT_FOUND", [
+    "Run `lavish-axi` with no arguments and end one of the paths it lists",
+  ]);
 }
 
 // Produce a portable copy of an artifact: one HTML file with its LOCAL assets (relative-path
@@ -903,7 +919,11 @@ export async function fetchJson(url, { retries = 0, retryDelayMs = 250 } = {}) {
   }
 }
 
-async function postJson(url, body) {
+/**
+ * @param {{ notFound?: () => Error }} [options]
+ */
+async function postJson(url, body, options = {}) {
+  const notFound = options.notFound;
   let response;
   try {
     response = await fetch(url, {
@@ -913,6 +933,9 @@ async function postJson(url, body) {
     });
   } catch {
     throw serverConnectionError();
+  }
+  if (response.status === 404 && notFound) {
+    throw notFound();
   }
   if (!response.ok) {
     throw new AxiError(`Lavish Editor request failed: ${response.status}`, "SERVER_ERROR");

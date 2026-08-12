@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { SessionStore } from "../src/session-store.js";
+import { canonicalFile, canonicalSessionFile, SessionStore, sessionKey } from "../src/session-store.js";
 
 let beginRequestSequence = 0;
 
@@ -1013,6 +1013,53 @@ test("concurrent queue and layout-diagnostic writes do not drop queued feedback"
     // The diagnostic write must survive too: neither side of the race may be lost.
     const updated = await store.findByKey(session.key);
     assert.equal(updated.layout_warnings.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a session stays addressable by path after its artifact file is deleted", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const whileOnDisk = await canonicalSessionFile(artifact);
+    assert.equal(whileOnDisk, await canonicalFile(artifact));
+
+    await rm(artifact);
+
+    // The record outlives the file it points at, so the key `open` stored has to stay computable
+    // once the artifact is gone - otherwise `end` can never close the session and `poll` can never
+    // drain it, and it sits in the bare-command listing forever.
+    assert.equal(await canonicalSessionFile(artifact), whileOnDisk);
+    assert.equal(sessionKey(await canonicalSessionFile(artifact)), sessionKey(whileOnDisk));
+    // The strict resolver stays strict: commands that need the artifact's bytes still fail loudly.
+    await assert.rejects(() => canonicalFile(artifact), /ENOENT/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a deleted artifact resolves through symlinked and deleted ancestor directories", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    // Mirrors the real shape of the bug: an artifact under a `.lavish` directory reached through a
+    // symlinked parent, where the whole directory - not just the HTML file - has been removed.
+    const realRoot = path.join(dir, "real");
+    const linkRoot = path.join(dir, "link");
+    const artifactDir = path.join(realRoot, ".lavish");
+    await mkdir(artifactDir, { recursive: true });
+    await symlink(realRoot, linkRoot, "dir");
+    const artifact = path.join(realRoot, ".lavish", "artifact.html");
+    const throughSymlink = path.join(linkRoot, ".lavish", "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const stored = await canonicalSessionFile(throughSymlink);
+    assert.equal(stored, await canonicalFile(artifact));
+
+    await rm(artifactDir, { recursive: true });
+
+    assert.equal(await canonicalSessionFile(throughSymlink), stored);
+    assert.equal(await canonicalSessionFile(artifact), stored);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
