@@ -223,6 +223,7 @@ export function createDesignOutput() {
       'Set a nested section theme with `<section data-theme="night">`.',
       "Prefer semantic colors such as `bg-base-100`, `bg-base-200`, `text-base-content`, `bg-primary`, `text-primary-content`, `alert-warning`, and `btn-primary` so themes remain readable.",
       "Avoid hardcoded Tailwind color names for text and surfaces unless the user asked for exact colors.",
+      "Express de-emphasis with size, weight, and position - never by fading text with an opacity modifier. In dark low-chroma themes (`dim`, `night`, `business`, `coffee`) `base-content` is already muted, so `text-base-content/40` over a dark surface lands on unreadable and `badge-ghost` all but disappears. Keep anything meant to be read at `/70` or above. The author cannot see this: it renders as intended on a light theme and as invisible on a dark one.",
       "Use Tailwind responsive prefixes such as `sm:`, `md:`, `lg:`, and `xl:` for layout changes.",
       'Never `@apply` DaisyUI classes (such as `text-base-content/40`, `bg-base-200`, or `btn`) inside `<style type="text/tailwindcss">` - the Tailwind browser runtime does not know them, and one unknown utility aborts the entire compile, leaving the page with no Tailwind styles at all. Put DaisyUI classes directly on elements, or write plain CSS with theme variables such as `var(--color-base-200)`.',
     ],
