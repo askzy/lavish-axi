@@ -262,6 +262,17 @@ test("design output recommends luxury as the default theme and warns against @ap
     output.theme_usage.some((item) => item.includes("text-base-content/40") && /unreadable|invisible/i.test(item)),
     "theme guidance names the concrete failing utility",
   );
+  // The sibling failure: a `base-*` surface nested inside a colored callout inherits the outer
+  // `*-content` color, which is picked for the opposite luminance. Same blind spot - it reads
+  // correctly on a light theme and as dark-on-dark on a dark one.
+  assert.ok(
+    output.theme_usage.some((item) => /inherit/i.test(item) && item.includes("*-content") && item.includes("base-*")),
+    "theme guidance rules out inheriting a semantic content color onto a base surface",
+  );
+  assert.ok(
+    output.theme_usage.some((item) => item.includes("text-base-content") && item.includes("alert-soft")),
+    "theme guidance names both fixes for the inherited content color",
+  );
 });
 
 test("playbook index output lists known playbooks with concise descriptions", () => {
