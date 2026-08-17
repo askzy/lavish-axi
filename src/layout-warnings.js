@@ -96,6 +96,11 @@ const RULE_DESCRIPTIONS = {
     title: "Text covered by another element",
     explain: () => "An opaque sibling covers nearly all of this text, so it cannot be read.",
   },
+  "unreadable-contrast": {
+    title: "Text too close in color to its background",
+    explain: (warning) =>
+      `Text and the background behind it contrast at ${ratioText(warning.contrastRatio)}, under the 3:1 floor WCAG sets for even large text, so the text cannot be read. The usual cause is inheritance: a surface nested inside a colored container keeps that container's content color, which was picked for the opposite luminance.`,
+  },
 };
 
 // Accepts either the stored record (snake_case) or a raw finding (camelCase) so the one set of
@@ -104,6 +109,7 @@ export function describeLayoutWarning(warning) {
   const normalized = {
     axis: warning?.axis,
     overflowPx: warning?.overflow_px ?? warning?.overflowPx,
+    contrastRatio: warning?.contrast_ratio ?? warning?.contrastRatio,
     viewportWidth: warning?.viewport_width ?? warning?.viewportWidth,
   };
   const description = RULE_DESCRIPTIONS[warning?.rule ?? warning?.kind];
@@ -296,6 +302,7 @@ export function serializeLayoutWarning(warning) {
     component: warning.component,
     axis: warning.axis,
     overflow_px: warning.overflow_px,
+    ...(finiteNumber(warning.contrast_ratio) > 0 ? { contrast_ratio: warning.contrast_ratio } : {}),
     viewport_class: warning.viewport_class,
     viewport_label: viewportClassLabel(warning.viewport_class),
     viewport_width: warning.viewport_width,
@@ -340,6 +347,7 @@ export function layoutWarningPromptPayload(warnings) {
       component: warning.component,
       axis: warning.axis,
       overflow_px: warning.overflow_px,
+      ...(finiteNumber(warning.contrast_ratio) > 0 ? { contrast_ratio: warning.contrast_ratio } : {}),
       viewport_class: warning.viewport_class,
       viewport_width: warning.viewport_width,
       status: warning.status,
@@ -365,6 +373,7 @@ export function normalizeLayoutWarningsTarget(target) {
       component: normalizeText(warning?.component).slice(0, 120),
       axis: warning?.axis === "vertical" ? "vertical" : "horizontal",
       overflow_px: finiteNumber(warning?.overflow_px),
+      ...(finiteNumber(warning?.contrast_ratio) > 0 ? { contrast_ratio: finiteNumber(warning.contrast_ratio) } : {}),
       viewport_class: normalizeText(warning?.viewport_class).slice(0, 16),
       viewport_width: finiteNumber(warning?.viewport_width),
       status: normalizeText(warning?.status).slice(0, 16),
@@ -403,6 +412,7 @@ function createWarning(fingerprint, observation, { at, revision, viewportClass, 
       component: componentIdentity(observation.selector),
       axis: observation.axis,
       overflow_px: observation.overflowPx,
+      ...(observation.contrastRatio > 0 ? { contrast_ratio: observation.contrastRatio } : {}),
       viewport_class: viewportClass,
       viewport_width: viewportWidth,
       first_seen_at: at,
@@ -431,6 +441,7 @@ function recordDetection(warning, observation, { at, revision, viewportWidth }) 
     warning.selector === observation.selector &&
     warning.axis === observation.axis &&
     finiteNumber(warning.overflow_px) === observation.overflowPx &&
+    finiteNumber(warning.contrast_ratio) === finiteNumber(observation.contrastRatio) &&
     finiteNumber(warning.viewport_width) === viewportWidth;
   if (unchanged) return warning;
 
@@ -441,6 +452,7 @@ function recordDetection(warning, observation, { at, revision, viewportWidth }) 
     component: componentIdentity(observation.selector),
     axis: observation.axis,
     overflow_px: observation.overflowPx,
+    ...(observation.contrastRatio > 0 ? { contrast_ratio: observation.contrastRatio } : {}),
     viewport_width: viewportWidth,
     last_seen_at: at,
     last_seen_revision: Math.max(finiteNumber(warning.last_seen_revision), revision),
@@ -528,13 +540,19 @@ function normalizeFindings(findings, viewportWidth) {
         String(finding.severity || "").toLowerCase() === "error",
     )
     .slice(0, MAX_STORED_WARNINGS)
-    .map((finding) => ({
-      rule: normalizeText(finding.kind || finding.rule || "layout-failure").slice(0, 64),
-      selector: normalizeText(finding.selector).slice(0, 300),
-      axis: finding.axis === "vertical" ? "vertical" : "horizontal",
-      overflowPx: Math.round(finiteNumber(finding.overflowPx ?? finding.overflow_px)),
-      viewportWidth: Math.round(finiteNumber(finding.viewportWidth ?? finding.viewport_width) || viewportWidth),
-    }));
+    .map((finding) => {
+      // A contrast ratio only exists for the rule that measures one, so it stays an optional
+      // field: every other rule's record keeps exactly the shape it had before.
+      const contrastRatio = finiteNumber(finding.contrastRatio ?? finding.contrast_ratio);
+      return {
+        rule: normalizeText(finding.kind || finding.rule || "layout-failure").slice(0, 64),
+        selector: normalizeText(finding.selector).slice(0, 300),
+        axis: finding.axis === "vertical" ? "vertical" : "horizontal",
+        overflowPx: Math.round(finiteNumber(finding.overflowPx ?? finding.overflow_px)),
+        ...(contrastRatio > 0 ? { contrastRatio: Math.round(contrastRatio * 100) / 100 } : {}),
+        viewportWidth: Math.round(finiteNumber(finding.viewportWidth ?? finding.viewport_width) || viewportWidth),
+      };
+    });
 }
 
 export function normalizeStoredWarnings(warnings) {
@@ -557,6 +575,11 @@ function finiteNumber(value) {
 
 function pxText(value) {
   return `${Math.round(finiteNumber(value))}px`;
+}
+
+function ratioText(value) {
+  const ratio = finiteNumber(value);
+  return ratio > 0 ? `${ratio.toFixed(2).replace(/\.?0+$/, "")}:1` : "under 3:1";
 }
 
 function axisEdge(axis) {

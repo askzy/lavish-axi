@@ -129,6 +129,7 @@ test(
         "real-editorial",
         "real-carousel",
         "occlusion-exclusions-clean",
+        "contrast-exclusions-clean",
         "real-poster-overlap",
         "real-animated-entry",
       ];
@@ -144,6 +145,11 @@ test(
       await audit("control-broken-clipping", "390x844x1,mobile,touch", 3200, 3);
       await audit("control-broken-reachability", "1440x1000x1", 3200, 3);
       await audit("control-broken-reachability", "390x844x1,mobile,touch", 3200, 3);
+
+      // One root, not one per row: a failing cell walks up to the surface that introduced the
+      // mismatch, which is where the missing text color belongs.
+      await audit("control-broken-contrast", "1440x1000x1", 3200, 1);
+      await audit("control-broken-contrast", "390x844x1,mobile,touch", 3200, 1);
 
       await audit("calibration-small-overflow", "390x844x1,mobile,touch", 3200, 0);
 
