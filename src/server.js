@@ -11,6 +11,8 @@ import express from "express";
 import {
   classifySevereTextOverflow,
   classifyMaterialRectEscape,
+  classifyUnreadableContrast,
+  compositeSrgbOver,
   createArtifactSdk,
   deriveLavishQueueKey,
   findStableLayoutFindings,
@@ -19,6 +21,9 @@ import {
   isNativeInteractiveControl,
   isNearTotalOcclusion,
   MODE_TOGGLE_HOTKEY_KEY,
+  resolveTextBackdrop,
+  srgbContrastRatio,
+  srgbRelativeLuminance,
 } from "./artifact-sdk.js";
 import {
   activeLayoutWarningCount,
@@ -1282,6 +1287,11 @@ const classifyMaterialRectEscape=${classifyMaterialRectEscape.toString()};
 const isMaterialPageOverflow=${isMaterialPageOverflow.toString()};
 const findStableLayoutFindings=${findStableLayoutFindings.toString()};
 const isNearTotalOcclusion=${isNearTotalOcclusion.toString()};
+const srgbRelativeLuminance=${srgbRelativeLuminance.toString()};
+const srgbContrastRatio=${srgbContrastRatio.toString()};
+const compositeSrgbOver=${compositeSrgbOver.toString()};
+const resolveTextBackdrop=${resolveTextBackdrop.toString()};
+const classifyUnreadableContrast=${classifyUnreadableContrast.toString()};
 ${mermaidHelperDecls}
 const mermaidHelpers={ ${mermaidHelperKeys} };
 (${createArtifactSdk.toString()})(deriveQueueKey, isNativeInteractiveControl, mermaidHelpers, artifactRevision, artifactLoadToken);

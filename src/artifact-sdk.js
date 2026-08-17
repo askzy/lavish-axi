@@ -246,6 +246,84 @@ export function isNearTotalOcclusion({ occludedSamples, totalSamples, minSamples
   return Number.isFinite(occluded) && Number.isFinite(total) && total >= minSamples && occluded / total >= minRatio;
 }
 
+// Text can also be unreadable for a reason no geometry rule sees: it is the same lightness as
+// what sits behind it. The classic cause is inheritance - a `bg-base-200` surface nested inside an
+// `alert-warning` keeps the outer `warning-content` color, which was picked for the opposite
+// luminance - and the author never sees it, because the same markup reads correctly on a light
+// theme. These four functions are the whole decision; the DOM pass only feeds them colors.
+
+// WCAG 2.1 relative luminance. Both inputs must already be opaque sRGB bytes.
+export function srgbRelativeLuminance(color) {
+  const channels = [0, 1, 2].map((index) => {
+    const value = Number(color?.[index]);
+    if (!Number.isFinite(value)) return NaN;
+    const unit = Math.min(1, Math.max(0, value / 255));
+    return unit <= 0.03928 ? unit / 12.92 : ((unit + 0.055) / 1.055) ** 2.4;
+  });
+  if (channels.some((value) => !Number.isFinite(value))) return NaN;
+  return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+}
+
+export function srgbContrastRatio(foreground, background) {
+  const first = srgbRelativeLuminance(foreground);
+  const second = srgbRelativeLuminance(background);
+  if (!Number.isFinite(first) || !Number.isFinite(second)) return NaN;
+  return (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05);
+}
+
+// Paint a possibly-translucent color over an already-opaque backdrop. Alpha is the 4th byte, so a
+// color with no alpha channel is treated as opaque.
+export function compositeSrgbOver(color, backdrop) {
+  const alphaByte = Number(color?.[3]);
+  const alpha = Number.isFinite(alphaByte) ? Math.min(1, Math.max(0, alphaByte / 255)) : 1;
+  return [0, 1, 2].map((index) => {
+    const front = Number(color?.[index]);
+    const back = Number(backdrop?.[index]);
+    if (!Number.isFinite(front) || !Number.isFinite(back)) return NaN;
+    return front * alpha + back * (1 - alpha);
+  });
+}
+
+// Flatten the background layers behind a text run into one opaque color. Layers run innermost
+// first, exactly as an ancestor walk produces them. Returns null when the real backdrop cannot be
+// known: an unparseable color, a layer the caller marked `unknown` (a gradient, an image, a blend
+// mode, group opacity), or a chain that reaches the root without ever becoming opaque. Unknown is
+// silence, never a finding - an artifact that paints text over a photograph is a legitimate design
+// this rule has no way to evaluate, and a transparent root is the viewer's canvas, not the page's.
+export function resolveTextBackdrop(layers) {
+  if (!Array.isArray(layers) || layers.length === 0) return null;
+  const stack = [];
+  for (const layer of layers) {
+    if (!layer || layer.unknown) return null;
+    const color = layer.color;
+    if (!Array.isArray(color)) return null;
+    const alphaByte = Number(color[3]);
+    const alpha = Number.isFinite(alphaByte) ? Math.min(1, Math.max(0, alphaByte / 255)) : 1;
+    if (alpha <= 0) continue;
+    stack.push(color);
+    if (alpha >= 0.999) {
+      // Innermost paints last, so composite the collected layers back down from the opaque one.
+      let resolved = stack.pop().slice(0, 3);
+      while (stack.length > 0) resolved = compositeSrgbOver(stack.pop(), resolved);
+      return resolved.some((value) => !Number.isFinite(value)) ? null : resolved;
+    }
+  }
+  return null;
+}
+
+// The severity bar is 3:1, which is WCAG 2.1's own floor for large text. Text below the most
+// permissive published threshold is unreadable at any size, so this stays a proven failure rather
+// than a taste call, and there is real margin on both sides of it: measured against DaisyUI's
+// `dim`, the inheritance bug lands at 1.15-1.37 and `text-base-content/40` at 2.74, while the
+// muted-but-deliberate `/50` and `/60` sit at 3.53 and 4.50 and stay silent.
+export function classifyUnreadableContrast({ textColor, backdrop, minRatio = 3 }) {
+  if (!Array.isArray(textColor) || !Array.isArray(backdrop)) return null;
+  const painted = compositeSrgbOver(textColor, backdrop);
+  const ratio = srgbContrastRatio(painted, backdrop);
+  if (!Number.isFinite(ratio) || ratio >= minRatio) return null;
+  return { kind: "unreadable-contrast", contrastRatio: Math.round(ratio * 100) / 100 };
+}
+
 export function createArtifactSdk(
   deriveQueueKey,
   isNativeInteractive = isNativeInteractiveControl,
@@ -893,11 +971,13 @@ export function createArtifactSdk(
     const key = `${finding.kind}:${selectorValue}:${axis}`;
     if (seen.has(key)) return;
     seen.add(key);
+    const contrastRatio = Number(finding.contrastRatio);
     findings.push({
       selector: selectorValue,
       kind: String(finding.kind || "layout-failure"),
       axis,
       overflowPx: roundedOverflowPx(finding.overflowPx),
+      ...(Number.isFinite(contrastRatio) && contrastRatio > 0 ? { contrastRatio } : {}),
       viewportWidth: Math.round(Number(finding.viewportWidth) || window.innerWidth || 0),
       severity: "error",
     });
@@ -1179,6 +1259,143 @@ export function createArtifactSdk(
     }
   }
 
+  // Any CSS color the browser produces - `rgb()`, `oklch()`, `color-mix()`, `lab()`, a keyword -
+  // normalized to sRGB bytes through a 1x1 canvas. The canvas is the only parser guaranteed to keep
+  // up with the color syntaxes DaisyUI themes actually emit, and computed style hands back the
+  // authored space rather than rgb, so `oklch()` reaches here verbatim.
+  let colorProbe;
+  function colorProbeContext() {
+    if (colorProbe === undefined) {
+      try {
+        colorProbe = document.createElement("canvas").getContext("2d", { willReadFrequently: true }) || null;
+      } catch {
+        colorProbe = null;
+      }
+    }
+    return colorProbe;
+  }
+
+  // A rejected `fillStyle` assignment silently keeps the previous value, so two sentinels are what
+  // tell a genuine black apart from a color the canvas could not parse.
+  function cssColorToSrgb(value) {
+    const text = String(value || "").trim();
+    const context = colorProbeContext();
+    if (!text || !context) return null;
+    try {
+      context.fillStyle = "#000000";
+      context.fillStyle = text;
+      if (context.fillStyle === "#000000") {
+        context.fillStyle = "#ffffff";
+        context.fillStyle = text;
+        if (context.fillStyle === "#ffffff") return null;
+      }
+      context.clearRect(0, 0, 1, 1);
+      context.fillRect(0, 0, 1, 1);
+      const [r, g, b, a] = context.getImageData(0, 0, 1, 1).data;
+      return [r, g, b, a];
+    } catch {
+      return null;
+    }
+  }
+
+  // Anything that repaints or recomposites a subtree puts the real backdrop out of reach. Blend
+  // modes, filters and group opacity all compose a whole subtree as a unit, and a background image
+  // or gradient has no single color at all.
+  function obscuresBackdrop(style) {
+    const backgroundImage = String(style.backgroundImage || "none").toLowerCase();
+    const blendMode = String(style.mixBlendMode || "normal").toLowerCase();
+    const filter = String(style.filter || "none").toLowerCase();
+    const backdropFilter = String(style.backdropFilter || style.webkitBackdropFilter || "none").toLowerCase();
+    const opacity = Number.parseFloat(style.opacity || "1");
+    return (
+      (backgroundImage !== "none" && backgroundImage !== "") ||
+      (blendMode !== "normal" && blendMode !== "") ||
+      (filter !== "none" && filter !== "") ||
+      (backdropFilter !== "none" && backdropFilter !== "") ||
+      (Number.isFinite(opacity) && opacity < 0.999)
+    );
+  }
+
+  function textBackdropFor(el) {
+    const layers = [];
+    let node = el;
+    while (node && node.nodeType === 1) {
+      const style = getComputedStyle(node);
+      if (obscuresBackdrop(style)) return null;
+      layers.push({ color: cssColorToSrgb(style.backgroundColor) });
+      node = node.parentElement;
+    }
+    return resolveTextBackdrop(layers);
+  }
+
+  // Text the browser paints in a way this rule cannot reason about: a gradient poured through the
+  // glyphs, or a shadow that carries the legibility instead of the fill.
+  function hasUnevaluableTextPaint(style) {
+    const clip = String(style.backgroundClip || style.webkitBackgroundClip || "border-box").toLowerCase();
+    const fill = String(style.webkitTextFillColor || "").toLowerCase();
+    const stroke = String(style.webkitTextStrokeWidth || "0px").toLowerCase();
+    const shadow = String(style.textShadow || "none").toLowerCase();
+    return (
+      clip === "text" ||
+      (fill !== "" && fill !== style.color?.toLowerCase()) ||
+      toPixelNumber(stroke) > 0 ||
+      (shadow !== "none" && shadow !== "")
+    );
+  }
+
+  function contrastFailureFor(el) {
+    const style = getComputedStyle(el);
+    if (hasUnevaluableTextPaint(style)) return null;
+    const textColor = cssColorToSrgb(style.color);
+    const backdrop = textBackdropFor(el);
+    if (!textColor || !backdrop) return null;
+    return classifyUnreadableContrast({ textColor, backdrop });
+  }
+
+  // The element to report is the outermost one whose subtree is unreadable, because that is where
+  // the missing `text-base-content` belongs. A failing `td` walks up through its rows and its table
+  // to the surface that introduced the mismatch, and stops at the first ancestor that either
+  // re-declares the color or reads acceptably against its own backdrop.
+  function contrastFailureRoot(el, color) {
+    let root = el;
+    let node = el.parentElement;
+    while (node && node !== document.body && node !== document.documentElement) {
+      if (getComputedStyle(node).color !== color) break;
+      if (!contrastFailureFor(node)) break;
+      root = node;
+      node = node.parentElement;
+    }
+    return root;
+  }
+
+  function auditUnreadableContrast(elements, viewportWidth, findings, seen, animationTargets) {
+    const candidates = elements
+      .filter((el) => !isExcludedLayoutAuditElement(el))
+      .filter((el) => auditedText(el).length >= 8)
+      .filter((el) => isSemanticTextBoundary(el) || !hasSemanticTextBoundaryAncestor(el))
+      .filter((el) => isVisibleForLayoutAudit(el))
+      .filter((el) => !isAnimationAssociatedWithElement(el, animationTargets))
+      .slice(0, 200);
+    const failedRoots = [];
+
+    for (const el of candidates) {
+      if (failedRoots.some((root) => root.contains(el))) continue;
+      const failure = contrastFailureFor(el);
+      if (!failure) continue;
+      const root = contrastFailureRoot(el, getComputedStyle(el).color);
+      failedRoots.push(root);
+      pushLayoutFinding(findings, seen, {
+        selector: selector(root),
+        kind: failure.kind,
+        axis: "horizontal",
+        overflowPx: 0,
+        contrastRatio: failure.contrastRatio,
+        viewportWidth,
+        severity: "error",
+      });
+    }
+  }
+
   function auditLayout() {
     const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
     const findings = [];
@@ -1209,6 +1426,7 @@ export function createArtifactSdk(
       auditSevereTextOverflow(el, viewportWidth, findings, seen, animationTargets, failedClippingRoots);
     }
     auditSevereTextOcclusion(elements, viewportWidth, findings, seen, animationTargets);
+    auditUnreadableContrast(elements, viewportWidth, findings, seen, animationTargets);
     return findings;
   }
 

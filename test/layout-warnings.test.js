@@ -379,3 +379,57 @@ test("a repair request is tracked by queue time, so revision 0 is not read as ne
   const recurring = applyDiagnosticPass(queued, pass([OVERFLOW], { revision: 1 })).warnings;
   assert.equal(recurring[0].status, "recurring");
 });
+
+const UNREADABLE = {
+  selector: "div.overflow-x-auto",
+  kind: "unreadable-contrast",
+  axis: "horizontal",
+  overflowPx: 0,
+  contrastRatio: 1.3,
+  severity: "error",
+};
+
+test("an unreadable-contrast finding stores and reports the ratio it measured", () => {
+  const [warning] = detect([UNREADABLE]);
+  assert.equal(warning.rule, "unreadable-contrast");
+  assert.equal(warning.contrast_ratio, 1.3);
+  const { title, explanation } = describeLayoutWarning(warning);
+  assert.match(title, /too close in color/i);
+  assert.match(explanation, /1\.3:1/);
+  assert.match(explanation, /3:1/);
+});
+
+test("describeLayoutWarning reads the ratio from a raw finding as well as a stored record", () => {
+  assert.match(describeLayoutWarning(UNREADABLE).explanation, /1\.3:1/);
+  // A record written before the field existed still describes itself without printing NaN.
+  const explanation = describeLayoutWarning({ rule: "unreadable-contrast" }).explanation;
+  assert.doesNotMatch(explanation, /NaN|undefined/);
+  assert.match(explanation, /under 3:1/);
+});
+
+test("the contrast ratio survives serialization and the queued prompt round trip", () => {
+  const warnings = detect([UNREADABLE]);
+  const [serialized] = serializeLayoutWarnings(warnings);
+  assert.equal(serialized.contrast_ratio, 1.3);
+  assert.match(serialized.explanation, /1\.3:1/);
+
+  const queued = queueLayoutWarnings(warnings, [warnings[0].id], { revision: 1 });
+  const payload = layoutWarningPromptPayload(queued.warnings);
+  assert.match(payload.prompt, /1\.3:1/);
+  assert.equal(payload.target.warnings[0].contrast_ratio, 1.3);
+  assert.equal(normalizeLayoutWarningsTarget(payload.target).warnings[0].contrast_ratio, 1.3);
+});
+
+test("the contrast ratio is optional, so every other rule's record keeps its shape", () => {
+  const [warning] = detect([CLIPPED]);
+  assert.equal(Object.hasOwn(warning, "contrast_ratio"), false);
+  assert.equal(Object.hasOwn(serializeLayoutWarnings([warning])[0], "contrast_ratio"), false);
+});
+
+test("a worsening contrast ratio updates the one record instead of forking a new warning", () => {
+  const first = applyDiagnosticPass([], pass([UNREADABLE]));
+  const second = applyDiagnosticPass(first.warnings, pass([{ ...UNREADABLE, contrastRatio: 1.05 }], { revision: 2 }));
+  assert.equal(second.warnings.length, 1);
+  assert.equal(second.warnings[0].contrast_ratio, 1.05);
+  assert.equal(second.warnings[0].id, first.warnings[0].id);
+});

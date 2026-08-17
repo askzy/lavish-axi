@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Deliberate dark-theme restraint</title>
+    <style>
+      /* Everything a themed dark artifact does on purpose, next to the two paint styles the rule
+         cannot evaluate. None of it is a defect, so the pass must stay silent on all of it. */
+      :root {
+        --base-100: oklch(22.648% 0.017 264.182);
+        --base-200: oklch(28.036% 0.019 264.182);
+        --base-300: oklch(33.528% 0.021 264.182);
+        --base-content: oklch(82.901% 0.031 222.959);
+        --warning: oklch(86.163% 0.142 94.818);
+        --warning-content: oklch(17.232% 0.028 94.818);
+        --primary: oklch(74.51% 0.167 183.61);
+        --primary-content: oklch(14.902% 0.033 183.61);
+        font-family: system-ui, sans-serif;
+        background: var(--base-100);
+        color: var(--base-content);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        padding: 32px;
+      }
+      main {
+        width: min(760px, 100%);
+        margin: 0 auto;
+        display: grid;
+        gap: 18px;
+      }
+      section {
+        padding: 18px;
+        border-radius: 12px;
+        background: var(--base-200);
+      }
+      h2 {
+        margin: 0 0 8px;
+        font-size: 17px;
+      }
+      p {
+        margin: 0;
+      }
+      /* Muted by intent: measured at 3.53:1 and 4.50:1 on this theme, above the severity bar. */
+      .muted-50 {
+        color: color-mix(in oklab, var(--base-content) 50%, transparent);
+      }
+      .muted-60 {
+        color: color-mix(in oklab, var(--base-content) 60%, transparent);
+      }
+      /* Correct semantic pairings, including a nested surface that does restate its text color. */
+      .callout {
+        background: var(--warning);
+        color: var(--warning-content);
+      }
+      .callout .rows {
+        margin-top: 12px;
+        padding: 12px;
+        border-radius: 8px;
+        background: var(--base-300);
+        color: var(--base-content);
+      }
+      .pill {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: var(--primary);
+        color: var(--primary-content);
+      }
+      /* Text over a photograph stand-in, and text whose legibility comes from its own paint. The
+         backdrop is unknowable in the first and the fill is not the computed color in the second. */
+      .over-gradient {
+        background-image: linear-gradient(120deg, #0b1b2a 0%, #f5e6a8 100%);
+        color: var(--base-content);
+      }
+      .gradient-text {
+        background-image: linear-gradient(90deg, #7dd3fc, #a78bfa);
+        background-clip: text;
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-size: 22px;
+        font-weight: 700;
+      }
+      .shadowed {
+        color: var(--base-200);
+        text-shadow:
+          0 0 2px #ffffff,
+          0 0 6px #ffffff;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <h2>Secondary detail</h2>
+        <p class="muted-50">Deliberately quiet supporting copy that still has to read on this theme.</p>
+        <p class="muted-60">A second line of supporting copy at a slightly stronger weight of the same color.</p>
+      </section>
+      <section class="callout">
+        <h2>A callout that restates the nested surface color</h2>
+        <p>The heading and this paragraph sit on amber, which is what the content color was for.</p>
+        <div class="rows">
+          <p>This nested surface declares its own text color, so nothing is inherited across it.</p>
+        </div>
+      </section>
+      <section>
+        <h2>Semantic pill</h2>
+        <p><span class="pill">Ready for review</span></p>
+      </section>
+      <section class="over-gradient">
+        <h2>Text over an image stand-in</h2>
+        <p>A gradient behind the text has no single backdrop color to measure against.</p>
+      </section>
+      <section>
+        <h2 class="gradient-text">Gradient lettering</h2>
+        <p class="shadowed">Copy whose legibility is carried by its own shadow rather than its fill.</p>
+      </section>
+    </main>
+  </body>
+</html>

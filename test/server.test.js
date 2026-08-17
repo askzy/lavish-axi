@@ -8,6 +8,7 @@ import test from "node:test";
 process.env.LAVISH_AXI_HOST = "127.0.0.1";
 process.env.LAVISH_AXI_LINK_HOST = "127.0.0.1";
 
+import * as artifactSdk from "../src/artifact-sdk.js";
 import {
   allowsAllHosts,
   buildAllowedHostnames,
@@ -786,8 +787,21 @@ test("artifact SDK reports only stable severe layout failures after fonts, resiz
   assert.match(js, /page-horizontal-overflow/);
   assert.match(js, /clipped-text/);
   assert.match(js, /overlapping-text/);
+  assert.match(js, /unreadable-contrast/);
   assert.doesNotMatch(js, /element-scroll-overflow/);
   assert.doesNotMatch(js, /element-parent-overflow/);
+});
+
+// The SDK reaches the browser as `createArtifactSdk.toString()`, so a helper it calls only exists
+// there if the injected preamble declares it too. That preamble is a hand-kept list, and a missing
+// entry is a runtime ReferenceError inside the diagnostic pass rather than a failing build - so
+// assert the whole module instead of naming helpers one at a time.
+test("every helper the artifact SDK module exports is declared in the injected script", () => {
+  const js = createSdkJs("abc");
+  for (const [name, value] of Object.entries(artifactSdk)) {
+    if (typeof value !== "function" || name === "createArtifactSdk") continue;
+    assert.ok(js.includes(value.toString()), `${name} is exported but never injected into the browser`);
+  }
 });
 
 test("artifact SDK verifies severe clipping from direct rendered text fragments", () => {
