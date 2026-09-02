@@ -156,11 +156,12 @@ ${home.help[home.help.length - 1]}
    Browser-detected layout issues are filed passively in the user's Layout issues inbox and arrive as an ordinary \`layout-warnings\` prompt only when the user selects and queues them. Never edit an issue the user has not queued. The only response that arrives without user action is \`artifact_failures\`, when the review surface itself is unusable.
    The poll stays silent until the user acts or a fatal artifact failure makes the review surface unusable - leave it running, never kill it.
    Cosmetic, intentional, transient, tiny, and uncertain observations remain silent.
+   The agent that starts the poll must outlive it, so a SUBAGENT must never own one: its notification dies with it and the feedback drains into an output file nobody reads (see \`/check-lavish\` for the signals and the recovery). Delegating the artifact edits is fine - forbid \`${invocation}\` in the brief and poll from the parent session after the subagent returns.
 ${POLL_WAKE_PATH_RULES.map((rule) => `   ${skillCommandText(rule)}`).join("\n")}
 4. If poll returns feedback, apply the user's prompts. A \`layout-warnings\` prompt is an explicit repair request; apply every listed fix in one pass before saving, and let Lavish re-check it after a newer artifact load.
 5. Apply human feedback, then poll again with \`--agent-reply "<message>"\` to reply in the browser and keep the loop going under the same foreground-or-verified-wake-path rule.
 6. If a poll is reaped before the user sends anything, hand the review back rather than looping. One line is enough: you have stopped listening, anything already sent is safely queued, and \`/check-lavish\` will collect it. Do not re-enter the poll silently - see the wake-path rules in step 3 for why an unbounded loop is the wrong default.
-7. \`/check-lavish\` (collect feedback later): run \`${invocation}\` with no arguments, find the listed session for this review whose pending prompts count is above 0, then drain it with \`${invocation} poll <html-file> --timeout-ms 0\` - that returns immediately instead of waiting. Apply the prompts exactly as in step 4. If that count is 0, say so and stop; do not open a long poll just to look.
+7. \`/check-lavish\` (collect feedback later): poll this review's artifact directly with \`${invocation} poll <html-file> --timeout-ms 0\` - that returns immediately instead of waiting, and it works after the user has ended the session, which drops the session from the no-argument list. Apply the prompts exactly as in step 4. If nothing comes back, say so and stop; do not open a long poll just to look.
 8. Run \`${invocation} end <html-file>\` when the review is finished.
 9. ${POLL_SEND_AND_END_RULE} Deliver any remaining updates directly in this conversation.
 
@@ -185,8 +186,9 @@ ${bullets(home.help.map(skillCommandText))}
 /**
  * Render the installable SKILL.md for the `check-lavish` companion skill.
  *
- * Deliberately short: it loads on demand mid-task, and its whole job is three commands plus the
- * one judgement call (do not open a long poll just to look). The procedure text is imported from
+ * It loads on demand mid-task. The lookup order is the point: name the artifact from the
+ * conversation, poll it directly, and only then fall back to the session list, which omits
+ * user-ended sessions that still hold queued feedback. The rule text is imported from
  * `POLL_PICKUP_RULE` rather than restated, so the two skills cannot disagree about it.
  *
  * @param {object} [options]
@@ -221,24 +223,46 @@ that next poll.
 
 ## Steps
 
-1. Run \`${invocation}\` with no arguments and read the session list it prints.
-2. Pick the session this request is about: the artifact the user named, else one under the current
-   working directory, else the most recently opened. Do NOT sweep every listed session - \`open\`
-   sessions accumulate across conversations, so the list is not a list of live reviews.
-3. If its pending prompts count is 0, say so in one line and stop. Do not open a long poll just to
-   look, and do not reopen an ended session.
-4. If the count is above 0, drain it with \`${invocation} poll <html-file> --timeout-ms 0\`. That
-   returns immediately instead of waiting.
-5. Apply the returned prompts exactly as the \`/lavish\` workflow describes. A \`layout-warnings\`
+1. Name the artifact before touching the session list. It is the html file this session, or a
+   subagent it dispatched, passed to \`${invocation}\` - subagent reports carry the path. If the
+   conversation names nothing, take the newest file under \`.lavish/\` in the working directory.
+   Only when both come up empty, run \`${invocation}\` with no arguments and pick from the list it
+   prints: the artifact the user named, else one under the current working directory. Do NOT sweep
+   every listed session - \`open\` sessions accumulate across conversations, and the list omits
+   sessions the user has ended, so it is neither complete nor live.
+2. Drain it with \`${invocation} poll <html-file> --timeout-ms 0\`. That returns immediately
+   instead of waiting. Run it whether or not the file appears in the list: a session the user ended
+   is absent from the list but still delivers its queued feedback once.
+3. Read the result. \`session_ended: true\` means the user is done - apply what came back, deliver
+   any further updates in this conversation, and do not reopen. An empty result means the queue is
+   empty _right now_, not that the user sent nothing; rule out a drained queue (below) before
+   reporting "no feedback". Do not open a long poll just to look.
+4. Apply the returned prompts exactly as the \`/lavish\` workflow describes. A \`layout-warnings\`
    prompt is an explicit repair request; apply every listed fix in one pass.
-6. To carry on the conversation in the browser, reply with
+5. If the session is still open and you want to carry on in the browser, reply with
    \`${invocation} poll <html-file> --agent-reply "<message>"\` and follow the \`/lavish\` wake-path
    rules from there. If the user is done, \`${invocation} end <html-file>\`.
+
+## When the queue is empty but the user says they sent feedback
+
+A poll that collected the feedback and then exited took it with it - typically a poll a subagent
+started and left behind. Signals: the browser is stuck on "Working" or a spinner, or a recent
+background job in this session's \`tasks/\` directory contains a \`prompts[\` block. The last one is
+decisive:
+
+\`\`\`bash
+grep -l 'prompts\\[' /private/tmp/claude-501/<cwd-slug>/<session-uuid>/tasks/*.output
+\`\`\`
+
+Read the newest match, treat its \`prompts[N]{uid,prompt,selector,tag,text}:\` block as the feedback,
+apply it normally, then reply into the browser so it stops spinning. A bash background-job
+\`.output\` file is plain text and safe to read, unlike a subagent's JSONL transcript.
 
 ## Rules
 
 - ${skillCommandText(POLL_PICKUP_RULE)}
 - ${skillCommandText(POLL_HANDOFF_RULE)}
+- A subagent must NEVER own a Lavish poll. The poll delivers to whoever started it, so when the subagent exits the prompts land in an output file nobody reads and no completion notification reaches the session that can act on them. When delegating artifact edits, forbid \`${invocation}\` in the brief; the parent polls after the subagent returns.
 - ${POLL_SEND_AND_END_RULE}
 `;
 }
