@@ -315,7 +315,17 @@ test("fork: the /check-lavish companion skill is generated and shares the pickup
   assert.match(markdown, /--timeout-ms 0/);
   // \s+ not a literal space: the generated markdown hard-wraps, so this phrase spans a newline.
   assert.match(markdown, /do not open a long poll just to\s+look/i);
-  assert.match(markdown, /Do NOT sweep every listed session/i);
+  assert.match(markdown, /Do NOT sweep\s+every listed session/i);
+  // Lookup order: the artifact the conversation names comes first, the session list is the
+  // fallback, and a user-ended session (absent from that list) still drains once.
+  const steps = markdown.slice(markdown.indexOf("## Steps"), markdown.indexOf("## Rules"));
+  assert.ok(
+    steps.indexOf("Name the artifact") < steps.indexOf("with no arguments"),
+    "names the artifact before consulting the session list",
+  );
+  assert.match(steps, /absent from the list but still delivers its queued feedback once/);
+  assert.match(steps, /session_ended: true/);
+  assert.match(markdown, /subagent must NEVER own a Lavish poll/);
 
   // Single-sourced, not restated. Rendered with an identity invocation so the command rewrite is a
   // no-op and the constants must appear byte-for-byte; under the default `npx -y lavish-axi` the
