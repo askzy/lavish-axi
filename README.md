@@ -43,6 +43,16 @@ Lavish Editor is an [AXI](https://axi.md), which means -
 - It's optimized for agent ergonomics. TOON output, long polling, and contextual disclosure making it highly token efficient.
 - The skill and hooks below only handle discovery; agents learn to use the AXI by using it.
 
+## About this fork
+
+This is [askzy/lavish-axi](https://github.com/askzy/lavish-axi), a fork of [kunchenguid/lavish-axi](https://github.com/kunchenguid/lavish-axi). It differs from upstream in three ways:
+
+- **No sharing.** `lavish-axi share` and the browser Publish button are removed. Nothing is published anywhere. Use `lavish-axi export` for a portable local file.
+- **No setup hooks.** `lavish-axi setup hooks` is disabled and does not edit your agent settings. Add a `SessionStart` hook by hand if you want one (see [Session hook](#session-hook)).
+- **Different poll policy.** When a harness reaps a long poll, the agent hands the review back to you instead of re-running the poll in a loop. Queued feedback is kept on the server. A second generated skill, `/check-lavish`, collects it later.
+
+The npm package `lavish-axi` is upstream's build, so `npx lavish-axi` and `npx skills add` give you upstream, not this fork. To use the fork, install it [from source](#from-source).
+
 ## Quick Start
 
 Install the Lavish skill in the [Agent Skills](https://agentskills.io) format with [`npx skills`](https://github.com/vercel-labs/skills):
@@ -50,6 +60,8 @@ Install the Lavish skill in the [Agent Skills](https://agentskills.io) format wi
 ```sh
 npx skills add kunchenguid/lavish-axi --skill lavish
 ```
+
+Note: this installs upstream, not this fork. For the fork, see [From source](#from-source).
 
 That is the entire setup - no npm install needed.
 The skill teaches your agent to run Lavish through `npx -y lavish-axi`, so the CLI comes along on demand.
@@ -91,13 +103,20 @@ Upstream ships `lavish-axi setup hooks` to write that hook into **Claude Code**,
 
 ### From source
 
+This is the install path for the fork. It needs Node 22+. pnpm is not required; npm works.
+
 ```sh
-git clone https://github.com/kunchenguid/lavish-axi.git
+git clone https://github.com/askzy/lavish-axi.git
 cd lavish-axi
-pnpm install --frozen-lockfile
-pnpm run build
-pnpm link
+npm install
+npm run build
+ln -s "$PWD/dist/skill-local" ~/.claude/skills/lavish
+ln -s "$PWD/dist/skill-local-check-lavish" ~/.claude/skills/check-lavish
 ```
+
+`npm run build` writes two skills under `dist/`: `lavish` and `check-lavish`. Both call the CLI as `node <repo>/dist/cli.mjs`, so nothing is installed globally and `npx` never fetches upstream by mistake. The symlinks make them available in every Claude Code project. Restart your Claude Code session afterwards so it picks them up.
+
+To put the `lavish-axi` binary on your `PATH` (for a session hook, for example), run `npm link` in the checkout.
 
 ## How It Works
 
@@ -158,7 +177,7 @@ pnpm link
 - **Keyboard shortcuts** - In the chrome composer, Enter sends queued prompts and Shift+Enter inserts a newline.
   In the annotation card, Enter queues the annotation, Shift+Enter inserts a newline, and Ctrl+Enter (Cmd+Enter on macOS) queues it and sends all queued prompts immediately.
   Cmd+I or Ctrl+I toggles between annotate and explore mode from either the browser chrome or the artifact iframe, including while focus is in a textarea or control.
-- **Agent presence** - The browser shows when no agent is listening, keeps queued feedback for the next successful `lavish-axi poll` send even across reloads, and only blocks human sends while the agent is working on delivered feedback; the agent's reply (`--agent-reply`) concludes that work and re-enables sends. The no-timeout poll always writes an immediate stderr banner so it is visibly not hung; it adds the periodic stderr wait ticks only in an interactive terminal, so when stderr is piped (as under agent harnesses) the captured output carries no tick noise. Stdout always stays reserved for the final response; if the poll is interrupted or times out, re-run it because queued feedback is never lost.
+- **Agent presence** - The browser shows when no agent is listening, keeps queued feedback for the next successful `lavish-axi poll` send even across reloads, and only blocks human sends while the agent is working on delivered feedback; the agent's reply (`--agent-reply`) concludes that work and re-enables sends. The no-timeout poll always writes an immediate stderr banner so it is visibly not hung; it adds the periodic stderr wait ticks only in an interactive terminal, so when stderr is piped (as under agent harnesses) the captured output carries no tick noise. Stdout always stays reserved for the final response. If the poll is interrupted or reaped, queued feedback is never lost: in this fork the agent hands the review back to the user instead of re-running the poll, and `/check-lavish` collects the queue later.
 - **Session end etiquette** - Lavish tracks who ended a session: a human clicking **End session** (or **Send & End**) in the browser is a user-initiated end, while `lavish-axi end <html-file>` is agent-initiated.
   A plain `lavish-axi <html-file>` after a user-initiated end refuses to reopen the browser and returns guidance instead; pass `--reopen` only when the user asks for further review or something important needs their visual attention.
   Agent-initiated ends keep reopening normally, same as before.
@@ -176,20 +195,20 @@ pnpm link
 
 ## CLI Reference
 
-| Command                         | Description                                                                                                                                                                                                                                                                          |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `lavish-axi`                    | Show current sessions and usage guidance.                                                                                                                                                                                                                                            |
-| `lavish-axi update`             | Check for or apply the latest npm release through the AXI SDK self-updater.                                                                                                                                                                                                          |
-| `lavish-axi <html-file>`        | Open or resume a Lavish Editor session, with the open-time layout gate enabled by default. Unresolved layout issues from earlier in the session are preserved. Refuses to reopen a session the user explicitly ended from the browser unless `--reopen` is passed.                   |
-| `lavish-axi poll <html-file>`   | Long-poll until the user sends feedback or ends the session; detected layout issues wait in the user's Layout issues inbox and arrive only when queued. Leave no-timeout polls running, or re-run them if interrupted. On `status: ended`, stop polling and do not reopen uninvited. |
-| `lavish-axi end <html-file>`    | End a session as the agent; unlike a user-initiated end from the browser, this still allows a plain reopen later.                                                                                                                                                                    |
-| `lavish-axi export <html-file>` | Write a portable copy of the artifact: one HTML file with its local assets inlined, so it opens with no server and no sibling files. Remote CDN/font references are left as links.                                                                                                   |
-| `lavish-axi share <html-file>`  | **Disabled in this fork.** Rejects with a validation error instead of publishing anywhere; use `lavish-axi export` for a portable local file.                                                                                                                                        |
-| `lavish-axi stop`               | Shut down the background server.                                                                                                                                                                                                                                                     |
-| `lavish-axi playbook [id]`      | List focused artifact guidance or show one playbook; agents must open each matching playbook before writing HTML.                                                                                                                                                                    |
-| `lavish-axi design`             | Show agent-facing design guidance, including optional CDN and Mermaid snippets.                                                                                                                                                                                                      |
-| `lavish-axi setup hooks`        | **Disabled in this fork.** Rejects with a validation error instead of writing agent hooks; add the `SessionStart` hook by hand (see [Session hook](#session-hook)).                                                                                                                  |
-| `lavish-axi server`             | Run the local Lavish Editor server.                                                                                                                                                                                                                                                  |
+| Command                         | Description                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lavish-axi`                    | Show current sessions and usage guidance.                                                                                                                                                                                                                                                                                                                   |
+| `lavish-axi update`             | Check for or apply the latest npm release through the AXI SDK self-updater.                                                                                                                                                                                                                                                                                 |
+| `lavish-axi <html-file>`        | Open or resume a Lavish Editor session, with the open-time layout gate enabled by default. Unresolved layout issues from earlier in the session are preserved. Refuses to reopen a session the user explicitly ended from the browser unless `--reopen` is passed.                                                                                          |
+| `lavish-axi poll <html-file>`   | Long-poll until the user sends feedback or ends the session; detected layout issues wait in the user's Layout issues inbox and arrive only when queued. Leave no-timeout polls running. If one is reaped, hand back instead of re-running it; `/check-lavish` collects queued feedback later. On `status: ended`, stop polling and do not reopen uninvited. |
+| `lavish-axi end <html-file>`    | End a session as the agent; unlike a user-initiated end from the browser, this still allows a plain reopen later.                                                                                                                                                                                                                                           |
+| `lavish-axi export <html-file>` | Write a portable copy of the artifact: one HTML file with its local assets inlined, so it opens with no server and no sibling files. Remote CDN/font references are left as links.                                                                                                                                                                          |
+| `lavish-axi share <html-file>`  | **Disabled in this fork.** Rejects with a validation error instead of publishing anywhere; use `lavish-axi export` for a portable local file.                                                                                                                                                                                                               |
+| `lavish-axi stop`               | Shut down the background server.                                                                                                                                                                                                                                                                                                                            |
+| `lavish-axi playbook [id]`      | List focused artifact guidance or show one playbook; agents must open each matching playbook before writing HTML.                                                                                                                                                                                                                                           |
+| `lavish-axi design`             | Show agent-facing design guidance, including optional CDN and Mermaid snippets.                                                                                                                                                                                                                                                                             |
+| `lavish-axi setup hooks`        | **Disabled in this fork.** Rejects with a validation error instead of writing agent hooks; add the `SessionStart` hook by hand (see [Session hook](#session-hook)).                                                                                                                                                                                         |
+| `lavish-axi server`             | Run the local Lavish Editor server.                                                                                                                                                                                                                                                                                                                         |
 
 Known playbook IDs: `diagram`, `table`, `comparison`, `plan`, `code`, `input`, `slides`.
 One artifact often combines several playbooks, such as a plan that includes a comparison and a diagram, so agents must match against each `use_when` trigger and open every matching playbook before writing HTML.
