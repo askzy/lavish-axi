@@ -212,7 +212,7 @@ To put the `lavish-axi` binary on your `PATH` (for a session hook, for example),
 | `lavish-axi setup hooks`        | **Disabled in this fork.** Rejects with a validation error instead of writing agent hooks; add the `SessionStart` hook by hand (see [Session hook](#session-hook)).                                                                                                                                                                                                                                                |
 | `lavish-axi server`             | Run the local Lavish Editor server.                                                                                                                                                                                                                                                                                                                                                                                |
 
-Known playbook IDs: `diagram`, `table`, `comparison`, `plan`, `code`, `input`, `slides`.
+Known playbook IDs: `diagram`, `table`, `comparison`, `plan`, `code`, `input`, `explanation`, `slides`.
 One artifact often combines several playbooks, such as a plan that includes a comparison and a diagram, so agents must match against each `use_when` trigger and open every matching playbook before writing HTML.
 Figures are hand-authored inline SVG by default; open the diagram playbook before drawing. Mermaid is the opt-in for when you ask for a Mermaid diagram.
 
