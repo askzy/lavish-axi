@@ -1473,6 +1473,53 @@ test("chrome client sends without a snapshot when the artifact frame never answe
   assert.equal(posts.length, 1);
 });
 
+test("a failed send keeps the prompts queued and shows an error in the composer", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: JSON.parse(init.body) });
+      return { ok: false, status: 500, json: async () => ({}) };
+    },
+  });
+  chrome.element("sendHint").hidden = true;
+
+  chrome.element("chatInput").value = "Looks good";
+  chrome.element("sendAndEnd").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  assert.equal(chrome.queued().length, 1);
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.match(chrome.element("sendHint").textContent, /Could not send/);
+  assert.equal(chrome.element("chatInput").disabled, false);
+});
+
+test("a 413 send retries once without the snapshot", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: JSON.parse(init.body) });
+      if (posts.length === 1) return { ok: false, status: 413, json: async () => ({}) };
+      return { ok: true };
+    },
+  });
+
+  chrome.element("chatInput").value = "Looks good";
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "x".repeat(64) });
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0].body.domSnapshot, "x".repeat(64));
+  assert.equal(posts[1].body.domSnapshot, "");
+  assert.deepEqual(posts[1].body.prompts, posts[0].body.prompts);
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("sendHint").hidden, true);
+});
+
 test("chrome send and end carries the end intent with queued prompts", async () => {
   const posts = [];
   const chrome = await createChromeHarness({
