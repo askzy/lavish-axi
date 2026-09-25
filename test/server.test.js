@@ -3603,3 +3603,155 @@ test("extractArtifactHead reads the real href, not one hidden in another attribu
   );
   assert.equal(inValue.faviconTag, '<link rel="icon" href="https://cdn.example.com/logo.png">');
 });
+
+async function leaseServerFixture({ feedbackLeaseTtlMs = 300 } = {}) {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body><p>hi</p></body></html>");
+  const stateFile = path.join(dir, "state.json");
+  const server = await serve({ port: 0, stateFile, version: "9.9.9-test", idleTimeoutMs: null, feedbackLeaseTtlMs });
+  const base = `http://127.0.0.1:${server.port}`;
+  const open = await fetch(`${base}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ file: artifact }),
+  });
+  const { key } = await open.json();
+  const post = (route, body) =>
+    fetch(`${base}/api/${key}/${route}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  const drain = async () => (await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`)).json();
+  const queue = (prompt) =>
+    post("prompts", { prompts: [{ uid: "", prompt, selector: "", tag: "message", text: "Freeform message" }] });
+  return {
+    base,
+    key,
+    artifact,
+    stateFile,
+    post,
+    drain,
+    queue,
+    async close() {
+      await server.close();
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+// Regression for feedback lost when the poll client disconnected while takeFeedback was in
+// flight: the server used to clear the prompts on disk before the response ever left, so a poll
+// that got reaped, or a background job nobody read, took the only copy with it.
+test("feedback taken by a poll that disconnects mid-delivery is delivered again after the lease expires", async () => {
+  const fixture = await leaseServerFixture({ feedbackLeaseTtlMs: 300 });
+  try {
+    const controller = new AbortController();
+    const poll = fetch(`${fixture.base}/api/poll?file=${encodeURIComponent(fixture.artifact)}`, {
+      signal: controller.signal,
+    })
+      .then(async (response) => ({ aborted: false, text: await response.text() }))
+      .catch((error) => ({ aborted: true, name: error.name }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal((await fixture.queue("important note")).status, 200);
+    controller.abort();
+    const outcome = await poll;
+    assert.equal(outcome.aborted, true);
+
+    // Inside the lease the drain sees nothing new, and says when to come back. It also runs
+    // behind the aborted poll's own takeFeedback in the store queue, so the state read below
+    // observes that write.
+    const inFlight = await fixture.drain();
+    assert.equal(inFlight.status, "waiting");
+    assert.ok(inFlight.retry_after_ms > 0 && inFlight.retry_after_ms <= 300);
+
+    // The batch is on disk under a lease, not gone.
+    const state = JSON.parse(await readFile(fixture.stateFile, "utf8"));
+    const session = state.sessions[fixture.key];
+    assert.equal(session.prompts.length, 0);
+    assert.equal(session.leases.length, 1);
+    assert.equal(session.leases[0].prompts[0].prompt, "important note");
+
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const redelivered = await fixture.drain();
+    assert.equal(redelivered.status, "feedback");
+    assert.equal(redelivered.prompts[0].prompt, "important note");
+    assert.ok(redelivered.delivery_id);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("POST /api/:key/ack retires the delivered batch", async () => {
+  const fixture = await leaseServerFixture({ feedbackLeaseTtlMs: 200 });
+  try {
+    await fixture.queue("important note");
+    const delivered = await fixture.drain();
+    assert.equal(delivered.status, "feedback");
+
+    const missing = await fixture.post("ack", {});
+    assert.equal(missing.status, 400);
+    const unknown = await fixture.post("ack", { delivery_id: "nope" });
+    assert.deepEqual(await unknown.json(), { status: "acked", retired: false });
+    const acked = await fixture.post("ack", { delivery_id: delivered.delivery_id });
+    assert.deepEqual(await acked.json(), { status: "acked", retired: true });
+    const absent = await fetch(`${fixture.base}/api/does-not-exist/ack`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ delivery_id: delivered.delivery_id }),
+    });
+    assert.equal(absent.status, 404);
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.deepEqual(await fixture.drain(), { status: "waiting" });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("an agent reply retires an unacked lease", async () => {
+  const fixture = await leaseServerFixture({ feedbackLeaseTtlMs: 200 });
+  try {
+    await fixture.queue("important note");
+    assert.equal((await fixture.drain()).status, "feedback");
+    assert.equal((await fixture.post("agent-reply", { text: "Applied it" })).status, 200);
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.deepEqual(await fixture.drain(), { status: "waiting" });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a waiting long-poll wakes when an unacked lease expires", async () => {
+  const fixture = await leaseServerFixture({ feedbackLeaseTtlMs: 300 });
+  try {
+    await fixture.queue("important note");
+    const lost = await fixture.drain();
+    assert.equal(lost.status, "feedback");
+
+    const started = Date.now();
+    const woken = await (await fetch(`${fixture.base}/api/poll?file=${encodeURIComponent(fixture.artifact)}`)).json();
+    assert.equal(woken.status, "feedback");
+    assert.equal(woken.prompts[0].prompt, "important note");
+    assert.notEqual(woken.delivery_id, lost.delivery_id);
+    assert.ok(Date.now() - started >= 200, "woke on lease expiry, not immediately");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a timed poll shorter than the lease does not wake for it", async () => {
+  const fixture = await leaseServerFixture({ feedbackLeaseTtlMs: 60_000 });
+  try {
+    await fixture.queue("important note");
+    assert.equal((await fixture.drain()).status, "feedback");
+    const timed = await (
+      await fetch(`${fixture.base}/api/poll?file=${encodeURIComponent(fixture.artifact)}&timeoutMs=50`)
+    ).json();
+    assert.equal(timed.status, "waiting");
+  } finally {
+    await fixture.close();
+  }
+});

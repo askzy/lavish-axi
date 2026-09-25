@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -31,7 +31,7 @@ function diagnosticPayload(load, sequence, body = {}) {
 
 function feedbackResult(result) {
   assert.equal(result.status, "feedback");
-  return /** @type {{ status: string, dom_snapshot: string, prompts: any[], artifact_failures?: any[], session_ended?: boolean, ended_by?: string }} */ (
+  return /** @type {{ status: string, delivery_id: string, dom_snapshot: string, prompts: any[], artifact_failures?: any[], session_ended?: boolean, ended_by?: string }} */ (
     result
   );
 }
@@ -1060,6 +1060,229 @@ test("a deleted artifact resolves through symlinked and deleted ancestor directo
 
     assert.equal(await canonicalSessionFile(throughSymlink), stored);
     assert.equal(await canonicalSessionFile(artifact), stored);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+async function leaseFixture(options = {}) {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  const stateFile = path.join(dir, "state.json");
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<h1>Hello</h1>");
+  let clock = 1_000_000;
+  const store = new SessionStore(stateFile, { feedbackLeaseTtlMs: 60_000, now: () => clock, ...options });
+  const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+  return {
+    dir,
+    stateFile,
+    store,
+    session,
+    advance(ms) {
+      clock += ms;
+    },
+  };
+}
+
+const notePrompt = { uid: "", prompt: "important note", selector: "", tag: "message", text: "Freeform message" };
+
+test("taken feedback stays leased and is delivered again once the lease expires unacked", async () => {
+  const { dir, store, session, advance } = await leaseFixture();
+  try {
+    await store.queuePrompts(session.key, { domSnapshot: "snap", prompts: [notePrompt] });
+
+    const first = feedbackResult(await store.takeFeedback(session.key));
+    assert.ok(first.delivery_id);
+    assert.equal(first.prompts[0].prompt, "important note");
+
+    // Inside the lease window the batch belongs to the poll that took it.
+    advance(30_000);
+    const inFlight = await store.takeFeedback(session.key);
+    assert.equal(inFlight.status, "waiting");
+    assert.equal(inFlight.retry_after_ms, 30_000);
+
+    // Nobody acked: the poll died. The next poll gets the same prompts under a new lease.
+    advance(30_000);
+    const redelivered = feedbackResult(await store.takeFeedback(session.key));
+    assert.notEqual(redelivered.delivery_id, first.delivery_id);
+    assert.deepEqual(redelivered.prompts, first.prompts);
+    assert.equal(redelivered.dom_snapshot, "snap");
+    assert.equal((await store.takeFeedback(session.key)).status, "waiting");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("acking a delivery retires its lease so the batch is never delivered again", async () => {
+  const { dir, store, session, advance } = await leaseFixture();
+  try {
+    await store.queuePrompts(session.key, { prompts: [notePrompt] });
+    const first = feedbackResult(await store.takeFeedback(session.key));
+
+    const ack = await store.ackFeedback(session.key, first.delivery_id);
+    assert.equal(ack.retired, true);
+    assert.equal((await store.ackFeedback(session.key, first.delivery_id)).retired, false);
+    assert.equal((await store.ackFeedback(session.key, "unknown")).retired, false);
+    assert.equal(await store.ackFeedback("missing-session", first.delivery_id), null);
+
+    advance(120_000);
+    const after = await store.takeFeedback(session.key);
+    assert.equal(after.status, "waiting");
+    assert.equal(after.retry_after_ms, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("prompts queued during a lease are delivered ahead of the lease expiring", async () => {
+  const { dir, store, session, advance } = await leaseFixture();
+  try {
+    await store.queuePrompts(session.key, { prompts: [notePrompt] });
+    const first = feedbackResult(await store.takeFeedback(session.key));
+    await store.queuePrompts(session.key, { prompts: [{ ...notePrompt, prompt: "second" }] });
+
+    const second = feedbackResult(await store.takeFeedback(session.key));
+    assert.deepEqual(
+      second.prompts.map((prompt) => prompt.prompt),
+      ["second"],
+    );
+
+    // Both leases expire: the redelivery keeps the original order.
+    advance(60_000);
+    const redelivered = feedbackResult(await store.takeFeedback(session.key));
+    assert.deepEqual(
+      redelivered.prompts.map((prompt) => prompt.prompt),
+      ["important note", "second"],
+    );
+    assert.notEqual(redelivered.delivery_id, first.delivery_id);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an agent reply retires every outstanding lease", async () => {
+  const { dir, store, session, advance } = await leaseFixture();
+  try {
+    await store.queuePrompts(session.key, { prompts: [notePrompt] });
+    feedbackResult(await store.takeFeedback(session.key));
+
+    await store.addAgentReply(session.key, "Done, take a look");
+
+    advance(120_000);
+    assert.equal((await store.takeFeedback(session.key)).status, "waiting");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an ended session delivers its final batch under a lease and reports ended once acked", async () => {
+  const { dir, store, session, advance } = await leaseFixture();
+  try {
+    await store.queuePrompts(session.key, { prompts: [notePrompt] });
+    await store.endSession(session.key, "user");
+
+    const first = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(first.session_ended, true);
+    assert.equal(first.ended_by, "user");
+
+    // In flight: the session reads as ended, the batch is not duplicated.
+    assert.equal((await store.takeFeedback(session.key)).status, "ended");
+
+    // The poll that took it died: the final batch comes back after the lease expires.
+    advance(60_000);
+    const redelivered = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(redelivered.session_ended, true);
+    assert.deepEqual(redelivered.prompts, first.prompts);
+
+    await store.ackFeedback(session.key, redelivered.delivery_id);
+    advance(60_000);
+    const final = await store.takeFeedback(session.key);
+    assert.equal(final.status, "ended");
+    assert.equal(final.ended_by, "user");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reopening a session keeps its outstanding leases", async () => {
+  const { dir, store, session, advance } = await leaseFixture();
+  try {
+    await store.queuePrompts(session.key, { prompts: [notePrompt] });
+    feedbackResult(await store.takeFeedback(session.key));
+
+    await store.upsertSession(session.file, session.url);
+
+    advance(60_000);
+    const redelivered = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(redelivered.prompts[0].prompt, "important note");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a state file written before leases existed still loads and delivers its prompts", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const key = sessionKey(await canonicalFile(artifact));
+    await writeFile(
+      stateFile,
+      JSON.stringify({
+        sessions: {
+          [key]: {
+            key,
+            file: await canonicalFile(artifact),
+            url: "http://localhost:4387/session/old",
+            status: "feedback",
+            pending_prompts: 1,
+            prompts: [notePrompt],
+            dom_snapshot: "legacy snapshot",
+            chat: [],
+            updated_at: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      }),
+    );
+
+    const store = new SessionStore(stateFile);
+    const result = feedbackResult(await store.takeFeedback(key));
+    assert.deepEqual(result.prompts, [notePrompt]);
+    assert.equal(result.dom_snapshot, "legacy snapshot");
+    assert.ok(result.delivery_id);
+    assert.equal((await store.takeFeedback(key)).status, "waiting");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("state is written through a temp file and renamed into place", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await store.queuePrompts(session.key, { prompts: [notePrompt] });
+
+    const before = await readFile(stateFile, "utf8");
+    assert.equal(JSON.parse(before).sessions[session.key].prompts.length, 1);
+    assert.deepEqual(
+      (await readdir(dir)).filter((name) => name.endsWith(".tmp")),
+      [],
+    );
+
+    // A write that cannot complete must leave the previous state.json untouched rather than a
+    // truncated file: the temp file fails to be created, so nothing ever touches state.json.
+    await chmod(dir, 0o500);
+    try {
+      await assert.rejects(store.queuePrompts(session.key, { prompts: [notePrompt] }));
+    } finally {
+      await chmod(dir, 0o700);
+    }
+    assert.equal(await readFile(stateFile, "utf8"), before);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
