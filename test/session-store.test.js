@@ -1276,13 +1276,16 @@ test("state is written through a temp file and renamed into place", async () => 
 
     // A write that cannot complete must leave the previous state.json untouched rather than a
     // truncated file: the temp file fails to be created, so nothing ever touches state.json.
-    await chmod(dir, 0o500);
-    try {
-      await assert.rejects(store.queuePrompts(session.key, { prompts: [notePrompt] }));
-    } finally {
-      await chmod(dir, 0o700);
+    // Windows ignores directory mode bits, so the failure cannot be forced there.
+    if (process.platform !== "win32") {
+      await chmod(dir, 0o500);
+      try {
+        await assert.rejects(store.queuePrompts(session.key, { prompts: [notePrompt] }));
+      } finally {
+        await chmod(dir, 0o700);
+      }
+      assert.equal(await readFile(stateFile, "utf8"), before);
     }
-    assert.equal(await readFile(stateFile, "utf8"), before);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
