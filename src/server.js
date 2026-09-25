@@ -82,6 +82,7 @@ export async function serve({
   port,
   stateFile,
   version = "",
+  build = undefined,
   debug = false,
   log = null,
   pollHeartbeatMs = 15_000,
@@ -138,7 +139,7 @@ export async function serve({
   app.use(express.json({ limit: "2mb" }));
 
   app.get("/health", (req, res) => {
-    res.json({ ok: true, app: "lavish-axi", version });
+    res.json({ ok: true, app: "lavish-axi", version, build });
   });
 
   let shutdownResolve;
