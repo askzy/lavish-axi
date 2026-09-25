@@ -1442,6 +1442,37 @@ test("chrome client strips the internal queue key before posting prompts", async
   assert.equal(chrome.queued().length, 0);
 });
 
+test("chrome client sends without a snapshot when the artifact frame never answers", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: JSON.parse(init.body) });
+      return { ok: true };
+    },
+  });
+  chrome.element("sendHint").hidden = true;
+
+  chrome.element("chatInput").value = "Looks good";
+  chrome.element("send").onclick();
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:requestSnapshot");
+  await flushPromises();
+  assert.equal(posts.length, 0);
+
+  chrome.runTimers(5000);
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].body.domSnapshot, "");
+  assert.equal(posts[0].body.prompts[0].prompt, "Looks good");
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.match(chrome.element("sendHint").textContent, /without a page snapshot/);
+
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  assert.equal(posts.length, 1);
+});
+
 test("chrome send and end carries the end intent with queued prompts", async () => {
   const posts = [];
   const chrome = await createChromeHarness({

@@ -80,6 +80,11 @@ let layoutWarnings = Array.isArray(sessionData.initialLayoutWarnings) ? sessionD
 const selectedWarningIds = new Set(loadJsonState(warningSelectionStorageKey, []));
 let warningsDrawerOpen = false;
 let warningsAcknowledged = loadJsonState(warningAckStorageKey, false) === true;
+// The snapshot is context; the reviewer's words are the payload. If the artifact frame stops
+// answering, send the words without a snapshot instead of waiting forever.
+const SNAPSHOT_REQUEST_TIMEOUT_MS = 5000;
+const SEND_EMPTY_COPY = "Write a message or annotate an element first.";
+const SNAPSHOT_SKIPPED_COPY = "Sent without a page snapshot because the artifact did not answer in time.";
 const snapshotRequests = [];
 let endAfterSubmit = false;
 let workingBubble = null;
@@ -205,7 +210,8 @@ function updateSendState() {
   if (warningsQueueButton) updateWarningSelectionState();
 }
 
-function showSendHint() {
+function showSendHint(copy = SEND_EMPTY_COPY) {
+  sendHint.textContent = copy;
   sendHint.hidden = false;
   clearTimeout(sendHintTimer);
   sendHintTimer = setTimeout(() => {
@@ -371,8 +377,24 @@ function postToFrame(message) {
 }
 
 function requestSnapshot(action) {
-  snapshotRequests.push(action);
+  const request = { action, timeout: setTimeout(() => expireSnapshotRequest(request), SNAPSHOT_REQUEST_TIMEOUT_MS) };
+  snapshotRequests.push(request);
   postToFrame({ type: "lavish:requestSnapshot" });
+}
+
+function takeSnapshotRequest(request) {
+  const index = snapshotRequests.indexOf(request);
+  if (index === -1) return null;
+  snapshotRequests.splice(index, 1);
+  clearTimeout(request.timeout);
+  return request;
+}
+
+function expireSnapshotRequest(request) {
+  if (!takeSnapshotRequest(request) || request.action !== "submit") return;
+  showSendHint(SNAPSHOT_SKIPPED_COPY);
+  pendingSnapshot = "";
+  submitQueued();
 }
 
 function sendQueued(endAfter) {
@@ -1180,10 +1202,10 @@ window.addEventListener("message", (event) => {
     enqueuePrompt(msg.prompt);
   }
   if (msg.type === "lavish:snapshot") {
-    const snapshotAction = snapshotRequests.shift() || "submit";
-    if (snapshotAction === "copy") {
+    const request = takeSnapshotRequest(snapshotRequests[0]);
+    if (request?.action === "copy") {
       copyText(msg.snapshot || "");
-    } else {
+    } else if (queued.length) {
       pendingSnapshot = msg.snapshot || "";
       submitQueued();
     }

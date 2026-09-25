@@ -527,8 +527,8 @@ test("copy DOM snapshot requests a fresh snapshot and copies it to the clipboard
 
   assert.match(js, /const snapshotRequests = \[\]/);
   assert.match(js, /requestSnapshot\("copy"\)/);
-  assert.match(js, /const snapshotAction = snapshotRequests\.shift\(\) \|\| "submit"/);
-  assert.match(js, /if \(snapshotAction === "copy"\)/);
+  assert.match(js, /const request = takeSnapshotRequest\(snapshotRequests\[0\]\)/);
+  assert.match(js, /if \(request\?\.action === "copy"\)/);
   assert.match(js, /copyText\(msg\.snapshot \|\| ""\)/);
 });
 
@@ -627,7 +627,7 @@ test("sending with an empty composer nudges instead of blocking", async () => {
   const css = await chromeCssSource();
 
   assert.match(html, /class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div>/);
-  assert.match(js, /function showSendHint\(\)/);
+  assert.match(js, /function showSendHint\(copy = SEND_EMPTY_COPY\)/);
   assert.match(js, /sendHint\.hidden = false/);
   assert.match(js, /chatInput\.focus\(\)/);
   assert.match(css, /\.send-hint\{/);
