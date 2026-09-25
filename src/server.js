@@ -63,6 +63,10 @@ const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
 // window: the user asked for one group of fixes and should get one artifact refresh for it.
 export const RELOAD_DEBOUNCE_MS = 100;
 export const BATCH_RELOAD_DEBOUNCE_MS = 900;
+// How long an active poll keeps waiting after the last browser chrome for its session drops
+// before it returns `browser_disconnected`. Long enough to ride out a reload, short enough that
+// a foreground poll stops blocking soon after the user closes the page.
+export const BROWSER_DISCONNECT_GRACE_MS = 10_000;
 
 // A detached server should not live forever. When no browser chrome (SSE) and no agent poll
 // are connected for this long, the server shuts itself down so it stops dangling. The next
@@ -86,6 +90,7 @@ export async function serve({
   debug = false,
   log = null,
   pollHeartbeatMs = 15_000,
+  browserDisconnectGraceMs = BROWSER_DISCONNECT_GRACE_MS,
   idleTimeoutMs = resolveIdleTimeoutMs(),
   host = bindHost(),
   linkHost: linkHostName = linkHost(),
@@ -98,7 +103,10 @@ export async function serve({
   const watchers = new Map();
   const activePolls = new Map();
   const deliveredFeedback = new Set();
-  const sseClients = new Set();
+  // SSE response -> session key, so a session can tell whether any browser chrome still holds it.
+  const sseClients = new Map();
+  const browserDisconnectTimers = new Map();
+  let shuttingDown = false;
   // Sessions with at least one warning the user queued that has not been re-checked yet.
   const outstandingRepairBatches = new Set();
   const diagnosticViewportClasses = resolveDiagnosticViewportClasses();
@@ -230,10 +238,12 @@ export async function serve({
         if (heartbeat) clearInterval(heartbeat);
         events.off("feedback", onFeedback);
         events.off("ended", onFeedback);
+        events.off("browser-disconnected", onBrowserDisconnected);
         setPollActive(key, activePolls, deliveredFeedback, events, false);
+        if (!activePolls.has(key)) clearBrowserDisconnectTimer(key);
         refreshIdleTimer();
       };
-      const respond = async ({ leaseExpiry = false } = {}) => {
+      const respond = async ({ leaseExpiry = false, browserDisconnected = false } = {}) => {
         if (responding || res.writableEnded) return;
         responding = true;
         try {
@@ -244,11 +254,15 @@ export async function serve({
             armLeaseTimer(result.retry_after_ms);
             return;
           }
-          if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+          // Feedback or an end that raced the grace timer wins. The disconnect result only
+          // replaces a poll that would otherwise keep waiting, and it touches no lease: a batch
+          // still leased to an earlier poll is left for the next drain.
+          const body = browserDisconnected && result.status === "waiting" ? { status: "browser_disconnected" } : result;
+          if (body.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
           if (streamHeartbeat) {
-            res.end(JSON.stringify(result));
+            res.end(JSON.stringify(body));
           } else {
-            res.json(result);
+            res.json(body);
           }
         } finally {
           cleanup();
@@ -268,8 +282,13 @@ export async function serve({
         }
         respond().catch(handleRespondError);
       };
+      const onBrowserDisconnected = (changedKey) => {
+        if (changedKey !== key || res.writableEnded) return;
+        respond({ browserDisconnected: true }).catch(handleRespondError);
+      };
       events.on("feedback", onFeedback);
       events.on("ended", onFeedback);
+      events.on("browser-disconnected", onBrowserDisconnected);
       req.on("close", cleanup);
       armLeaseTimer(immediate.retry_after_ms);
     } catch (error) {
@@ -642,6 +661,34 @@ export async function serve({
     }
   });
 
+  function hasSseClient(key) {
+    for (const clientKey of sseClients.values()) {
+      if (clientKey === key) return true;
+    }
+    return false;
+  }
+
+  function clearBrowserDisconnectTimer(key) {
+    const timer = browserDisconnectTimers.get(key);
+    if (!timer) return;
+    clearTimeout(timer);
+    browserDisconnectTimers.delete(key);
+  }
+
+  // Losing the last chrome for a session starts the grace timer, but only while a poll is
+  // waiting on it: a poll that starts later with no browser attached gets its own full wait.
+  // A reconnect within the grace period cancels the timer, so a reload never releases a poll.
+  function scheduleBrowserDisconnect(key) {
+    clearBrowserDisconnectTimer(key);
+    if (shuttingDown || hasSseClient(key) || !activePolls.has(key)) return;
+    const timer = setTimeout(() => {
+      browserDisconnectTimers.delete(key);
+      if (!hasSseClient(key) && activePolls.has(key)) events.emit("browser-disconnected", key);
+    }, browserDisconnectGraceMs);
+    timer.unref?.();
+    browserDisconnectTimers.set(key, timer);
+  }
+
   app.get("/events/:key", async (req, res, next) => {
     try {
       res.writeHead(200, {
@@ -649,7 +696,8 @@ export async function serve({
         "cache-control": "no-cache",
         connection: "keep-alive",
       });
-      sseClients.add(res);
+      sseClients.set(res, req.params.key);
+      clearBrowserDisconnectTimer(req.params.key);
       refreshIdleTimer();
       const session = await store.findByKey(req.params.key);
       const sendReload = (key) => {
@@ -684,6 +732,7 @@ export async function serve({
       events.on("layout-warnings", sendLayoutWarnings);
       req.on("close", () => {
         sseClients.delete(res);
+        scheduleBrowserDisconnect(req.params.key);
         events.off("reload", sendReload);
         events.off("agent-reply", sendAgentReply);
         events.off("agent-presence", sendPresence);
@@ -759,7 +808,6 @@ export async function serve({
   });
   publicPort = httpServer.address().port;
 
-  let shuttingDown = false;
   function shutdown() {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -770,7 +818,7 @@ export async function serve({
     // Tell open browser chromes to reload before we drop their SSE connection. The new
     // server adopts the session via state.json once it binds, so the reloaded chrome
     // immediately gets the upgraded HTML/CSS/JS.
-    for (const res of sseClients) {
+    for (const res of sseClients.keys()) {
       try {
         res.write("event: chrome-reload\ndata: {}\n\n");
         res.end();
@@ -779,6 +827,8 @@ export async function serve({
       }
     }
     sseClients.clear();
+    for (const timer of browserDisconnectTimers.values()) clearTimeout(timer);
+    browserDisconnectTimers.clear();
     for (const w of watchers.values()) {
       w.close().catch(() => {});
     }
