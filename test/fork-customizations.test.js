@@ -23,7 +23,7 @@
 
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -398,4 +398,74 @@ test("fork: the poll acks a delivered batch only after stdout has drained", asyn
     }),
     false,
   );
+});
+
+// A CLI run from a local build (`dist/cli.mjs` next to `src/`) forces a server restart on every
+// open so a rebuilt checkout is picked up. A restart drops every poll attached to the server, so
+// the guard must (1) recognise the checkout when it is reached through a symlink - the generated
+// local skill invokes the shortest equivalent path, which is one - and (2) leave a server alone
+// when it already runs the same source, which the server advertises as `build` on /health.
+test("fork: the local-build restart guard follows symlinks to the checkout", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "lavish-fork-restart-"));
+  try {
+    const real = path.join(dir, "real");
+    await mkdir(path.join(real, "dist"), { recursive: true });
+    await writeFile(path.join(real, "dist", "cli.mjs"), "", "utf8");
+    const link = path.join(dir, "link");
+    await symlink(real, link, "junction");
+    const entry = path.join(real, "dist", "cli.mjs");
+
+    assert.equal(cli.shouldForceRestartForLocalBuild(path.join(link, "dist", "cli.mjs"), true, entry), true);
+    assert.equal(cli.shouldForceRestartForLocalBuild(entry, true, entry), true);
+    assert.equal(cli.shouldForceRestartForLocalBuild(path.join(link, "bin", "lavish-axi.js"), true, entry), false);
+    assert.equal(cli.shouldForceRestartForLocalBuild(path.join(link, "dist", "cli.mjs"), false, entry), false);
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("fork: a forced restart is skipped when the running server reports the same build", () => {
+  const health = { ok: true, app: "lavish-axi", version: "0.1.4", build: "abc" };
+  assert.equal(cli.shouldRestartServer("0.1.4", health, true, "abc"), false);
+  assert.equal(cli.shouldRestartServer("0.1.4", health, true, "def"), true);
+  // No build on either side: fall back to the unconditional forced restart.
+  assert.equal(cli.shouldRestartServer("0.1.4", { ok: true, app: "lavish-axi", version: "0.1.4" }, true, "abc"), true);
+  assert.equal(cli.shouldRestartServer("0.1.4", health, true, undefined), true);
+  // Same build never masks a version mismatch.
+  assert.equal(cli.shouldRestartServer("0.1.5", health, true, "abc"), true);
+  assert.equal(cli.shouldRestartServer("0.1.4", health, false), false);
+});
+
+test("fork: the local build id tracks the source tree contents", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "lavish-fork-build-id-"));
+  try {
+    const src = path.join(dir, "src");
+    await mkdir(path.join(src, "nested"), { recursive: true });
+    await writeFile(path.join(src, "a.js"), "export const a = 1;\n", "utf8");
+    await writeFile(path.join(src, "b.js"), "export const b = 2;\n", "utf8");
+    const first = cli.localBuildId(src);
+    assert.match(first, /^[0-9a-f]{64}$/);
+    assert.equal(cli.localBuildId(src), first);
+
+    await writeFile(path.join(src, "b.js"), "export const b = 3;\n", "utf8");
+    assert.notEqual(cli.localBuildId(src), first);
+
+    assert.equal(cli.localBuildId(path.join(dir, "missing")), undefined);
+    assert.equal(typeof cli.localBuildId(), "string", "the real checkout has a source tree");
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("fork: /health advertises the build id the server was started with", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "lavish-fork-health-"));
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test", build: "b1" });
+  try {
+    const body = await fetch(`http://127.0.0.1:${server.port}/health`).then((res) => res.json());
+    assert.equal(body.build, "b1");
+    assert.equal(body.version, "9.9.9-test");
+  } finally {
+    await server.close();
+    await rm(dir, { force: true, recursive: true });
+  }
 });

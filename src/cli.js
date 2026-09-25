@@ -1,5 +1,15 @@
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from "node:fs";
 import { access, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -722,7 +732,7 @@ function deepEqual(a, b) {
 async function serverCommand(args) {
   const port = Number(flagValue(args, "--port") || defaultPort());
   const debug = args.includes("--verbose") || process.env.LAVISH_AXI_DEBUG === "1";
-  const server = await serve({ port, stateFile: stateFile(), version: VERSION, debug });
+  const server = await serve({ port, stateFile: stateFile(), version: VERSION, build: localBuildId(), debug });
   await server.done;
   return "";
 }
@@ -753,7 +763,8 @@ async function ensureServer({ forceRestart = false } = {}) {
   const port = defaultPort();
   const baseUrl = `http://${hostForUrl(clientHost())}:${port}`;
   const existing = await fetchHealth(baseUrl);
-  if (existing && !shouldRestartServer(VERSION, existing, forceRestart)) {
+  const build = forceRestart ? localBuildId() : undefined;
+  if (existing && !shouldRestartServer(VERSION, existing, forceRestart, build)) {
     return baseUrl;
   }
   if (existing) {
@@ -793,21 +804,65 @@ async function ensureServer({ forceRestart = false } = {}) {
 // Pure helper so the upgrade-detection logic is unit-testable without spinning up HTTP.
 // Returns true when the running server is a different (or pre-handshake) version than
 // what this CLI was built with - i.e. the user just upgraded and the stale server needs
-// to step aside.
-export function shouldRestartServer(currentVersion, healthBody, forceRestart = false) {
+// to step aside. A forced restart (local build) is skipped when the server reports the
+// same build id, because restarting drops every poll attached to it and a server already
+// running the current source has nothing to pick up.
+export function shouldRestartServer(currentVersion, healthBody, forceRestart = false, currentBuild = undefined) {
   if (!healthBody || typeof healthBody !== "object") return false;
-  if (forceRestart && healthBody.app === "lavish-axi") return true;
+  if (forceRestart && healthBody.app === "lavish-axi") {
+    if (typeof currentBuild !== "string" || healthBody.build !== currentBuild) return true;
+  }
   if (typeof healthBody.version !== "string" || healthBody.version === "") return true;
   return healthBody.version !== currentVersion;
 }
 
-export function shouldForceRestartForLocalBuild(executablePath, sourceServerExists = localSourceServerExists()) {
-  const localBuildEntry = fileURLToPath(new URL("../dist/cli.mjs", import.meta.url));
-  return sourceServerExists && path.resolve(executablePath) === path.resolve(localBuildEntry);
+export function shouldForceRestartForLocalBuild(
+  executablePath,
+  sourceServerExists = localSourceServerExists(),
+  localBuildEntry = fileURLToPath(new URL("../dist/cli.mjs", import.meta.url)),
+) {
+  return sourceServerExists && canonicalPath(executablePath) === canonicalPath(localBuildEntry);
+}
+
+// Symlink-aware path identity. process.argv[1] keeps whatever path the caller typed, while
+// import.meta.url is already resolved, so a textual compare misses a checkout reached through
+// a symlink. Falls back a level at a time so a not-yet-built entry still compares.
+function canonicalPath(target) {
+  const resolved = path.resolve(target);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    try {
+      return path.join(realpathSync(path.dirname(resolved)), path.basename(resolved));
+    } catch {
+      return resolved;
+    }
+  }
 }
 
 function localSourceServerExists() {
-  return existsSync(fileURLToPath(new URL("../src/server.js", import.meta.url)));
+  return existsSync(localSourceDir());
+}
+
+function localSourceDir() {
+  return fileURLToPath(new URL("../src/", import.meta.url));
+}
+
+// A checkout runs the server from src/ whichever entry the CLI used (see resolveServerEntry), so
+// the identity of the running server code is the source tree, not the bundle. Undefined for a
+// packaged install, where only the version handshake applies.
+export function localBuildId(sourceDir = localSourceDir()) {
+  if (!existsSync(sourceDir)) return undefined;
+  const hash = createHash("sha256");
+  const entries = readdirSync(sourceDir, { withFileTypes: true }).filter((entry) => entry.isFile());
+  for (const name of entries.map((entry) => entry.name).sort()) {
+    hash
+      .update(name)
+      .update("\0")
+      .update(readFileSync(path.join(sourceDir, name)))
+      .update("\0");
+  }
+  return hash.digest("hex");
 }
 
 export function shouldKillProcessOnPort(currentVersion, healthBody) {
