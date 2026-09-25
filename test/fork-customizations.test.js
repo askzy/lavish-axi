@@ -469,3 +469,209 @@ test("fork: /health advertises the build id the server was started with", async 
     await rm(dir, { force: true, recursive: true });
   }
 });
+
+// Port of upstream #329 (dcf49d3) onto the fork's lease-and-ack poll. Closing the last review
+// tab for a session releases an active poll with `browser_disconnected` after a short grace
+// period, so a foreground poll stops blocking when the user closes the page. The fork adds two
+// constraints upstream did not have to meet: the result must leave every lease untouched, and a
+// `--timeout-ms 0` drain must behave exactly as before.
+async function startPresenceStream(base, key) {
+  const controller = new AbortController();
+  const res = await fetch(`${base}/events/${key}`, { signal: controller.signal });
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  return {
+    async next() {
+      const deadline = Date.now() + 500;
+      while (true) {
+        const match = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m);
+        if (match) {
+          buffer = buffer.replace(match[0], "");
+          return JSON.parse(match[1]).state;
+        }
+        const remaining = Math.max(1, deadline - Date.now());
+        const { value, done } = await Promise.race([
+          reader.read(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("timed out waiting for agent presence event")), remaining),
+          ),
+        ]);
+        if (done) throw new Error("presence stream closed before an agent presence event");
+        buffer += decoder.decode(value, { stream: true });
+      }
+    },
+    async close() {
+      controller.abort();
+      await reader.cancel().catch(() => {});
+    },
+  };
+}
+
+async function disconnectFixture({ browserDisconnectGraceMs, feedbackLeaseTtlMs = 300 }) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "lavish-fork-disconnect-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body><p>hi</p></body></html>", "utf8");
+  const stateFile = path.join(dir, "state.json");
+  const server = await serve({
+    port: 0,
+    stateFile,
+    version: "9.9.9-test",
+    idleTimeoutMs: null,
+    browserDisconnectGraceMs,
+    feedbackLeaseTtlMs,
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  const { key } = await fetch(`${base}/api/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ file: artifact }),
+  }).then((res) => res.json());
+  const pollUrl = (timeoutMs) =>
+    `${base}/api/poll?file=${encodeURIComponent(artifact)}${timeoutMs === undefined ? "" : `&timeoutMs=${timeoutMs}`}`;
+  return {
+    base,
+    key,
+    stateFile,
+    pollUrl,
+    poll: (timeoutMs, init = {}) => fetch(pollUrl(timeoutMs), init).then((res) => res.json()),
+    drain: () => fetch(pollUrl(0)).then((res) => res.json()),
+    queue: (prompt) =>
+      fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          prompts: [{ uid: "", prompt, selector: "", tag: "message", text: "Freeform message" }],
+        }),
+      }),
+    async close() {
+      await server.close();
+      await rm(dir, { force: true, recursive: true });
+    },
+  };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("fork: closing the last review tab releases an active poll as browser_disconnected without ending the session", async () => {
+  const fixture = await disconnectFixture({ browserDisconnectGraceMs: 20 });
+  try {
+    const first = await startPresenceStream(fixture.base, fixture.key);
+    const last = await startPresenceStream(fixture.base, fixture.key);
+    assert.equal(await first.next(), "waiting");
+    assert.equal(await last.next(), "waiting");
+
+    let settled = false;
+    const poll = fixture.poll(undefined, { signal: AbortSignal.timeout(2000) }).finally(() => {
+      settled = true;
+    });
+    assert.equal(await first.next(), "listening");
+    assert.equal(await last.next(), "listening");
+
+    await first.close();
+    await sleep(60);
+    assert.equal(settled, false, "closing one of two review tabs must not release the poll");
+    await last.close();
+
+    assert.deepEqual(await poll, { status: "browser_disconnected" });
+    assert.deepEqual(await fixture.drain(), { status: "waiting" }, "the session is still open");
+    const state = JSON.parse(await readFile(fixture.stateFile, "utf8"));
+    assert.equal(state.sessions[fixture.key].status, "open");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("fork: a poll that starts with no review tab attached gets its own full wait", async () => {
+  const fixture = await disconnectFixture({ browserDisconnectGraceMs: 30 });
+  try {
+    const browser = await startPresenceStream(fixture.base, fixture.key);
+    assert.equal(await browser.next(), "waiting");
+    await browser.close();
+    await sleep(60);
+
+    assert.deepEqual(await fixture.poll(80), { status: "waiting" });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("fork: a review tab reconnecting within the grace period keeps the poll waiting", async () => {
+  const fixture = await disconnectFixture({ browserDisconnectGraceMs: 100 });
+  let reconnected = null;
+  try {
+    const browser = await startPresenceStream(fixture.base, fixture.key);
+    assert.equal(await browser.next(), "waiting");
+
+    const poll = fixture.poll(250);
+    assert.equal(await browser.next(), "listening");
+    await browser.close();
+    await sleep(20);
+    reconnected = await startPresenceStream(fixture.base, fixture.key);
+    assert.equal(await reconnected.next(), "listening");
+
+    assert.deepEqual(await poll, { status: "waiting" });
+  } finally {
+    await reconnected?.close();
+    await fixture.close();
+  }
+});
+
+test("fork: browser_disconnected leaves an outstanding lease untouched and the drain unaffected", async () => {
+  const fixture = await disconnectFixture({ browserDisconnectGraceMs: 20, feedbackLeaseTtlMs: 400 });
+  try {
+    assert.equal((await fixture.queue("important note")).status, 200);
+    const delivered = await fixture.drain();
+    assert.equal(delivered.status, "feedback");
+    assert.ok(delivered.delivery_id, "the batch is leased to the drain, never acked in this test");
+
+    const browser = await startPresenceStream(fixture.base, fixture.key);
+    await browser.next();
+    const poll = fixture.poll(undefined, { signal: AbortSignal.timeout(2000) });
+    assert.equal(await browser.next(), "listening");
+    await browser.close();
+
+    assert.deepEqual(await poll, { status: "browser_disconnected" });
+
+    const state = JSON.parse(await readFile(fixture.stateFile, "utf8"));
+    assert.equal(state.sessions[fixture.key].leases.length, 1, "the disconnect retired nothing");
+    const inFlight = await fixture.drain();
+    assert.equal(inFlight.status, "waiting");
+    assert.ok(inFlight.retry_after_ms > 0, "a --timeout-ms 0 drain still reports the outstanding lease");
+
+    await sleep(450);
+    const redelivered = await fixture.drain();
+    assert.equal(redelivered.status, "feedback");
+    assert.equal(redelivered.prompts[0].prompt, "important note");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("fork: browser_disconnected poll output hands back without reopening or touching the queue", () => {
+  const output = cli.createPollOutput({ file: "/tmp/report.html", response: { status: "browser_disconnected" } });
+
+  assert.deepEqual(output.session, { file: "/tmp/report.html", status: "browser_disconnected" });
+  assert.match(output.next_step, /closed the page/);
+  assert.match(output.next_step, /stop polling/i);
+  assert.match(output.next_step, /do not reopen/i);
+  assert.match(output.next_step, /remains open|resumable/i);
+  assert.match(output.next_step, /ask the user/i);
+  assert.match(output.next_step, /safely leased/);
+  assert.match(output.next_step, /`\/check-lavish`/);
+  assert.doesNotMatch(output.next_step, /Run `lavish-axi \/tmp\/report\.html`/);
+});
+
+test("fork: the browser_disconnected rule is a named wake-path rule rendered into the /lavish skill", () => {
+  assert.ok(cli.POLL_WAKE_PATH_RULES.includes(cli.POLL_BROWSER_DISCONNECTED_RULE));
+  assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /browser_disconnected/);
+  assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /closed the review page/);
+  assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /stop polling/i);
+  assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /do not reopen it uninvited/);
+  assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /safely leased/);
+  assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /`\/check-lavish`/);
+  // The hand-back pair is untouched: the new rule is added beside it, not folded into it.
+  assert.ok(cli.POLL_WAKE_PATH_RULES.includes(cli.POLL_HANDOFF_RULE));
+  assert.ok(cli.POLL_WAKE_PATH_RULES.includes(cli.POLL_PICKUP_RULE));
+  assert.ok(skill.createSkillMarkdown().includes("browser_disconnected"));
+});
