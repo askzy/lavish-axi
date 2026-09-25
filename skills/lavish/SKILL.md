@@ -73,6 +73,7 @@ Figures are hand-authored inline SVG by default - open the diagram playbook befo
 - `plan` - Explain a product or technical plan before implementation
 - `code` - Render source code, code files, patches, PR diffs, and before/after code inside Lavish artifacts
 - `input` - Must be used when the agent needs to collect user input on decisions, choices, preferences, triage, scope, or other structured feedback from within the artifact
+- `explanation` - Explain an existing system, PR, incident, or decision to a reader who was not there - when the goal is understanding what is and why, not choosing a direction or inspecting a plan before implementation
 - `slides` - Create a deliberate presentation when slides are requested
 
 ## Commands & rules
