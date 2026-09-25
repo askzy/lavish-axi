@@ -85,6 +85,7 @@ let warningsAcknowledged = loadJsonState(warningAckStorageKey, false) === true;
 const SNAPSHOT_REQUEST_TIMEOUT_MS = 5000;
 const SEND_EMPTY_COPY = "Write a message or annotate an element first.";
 const SNAPSHOT_SKIPPED_COPY = "Sent without a page snapshot because the artifact did not answer in time.";
+const SEND_FAILED_COPY = "Could not send. Your feedback is still queued in this tab. Click Send to Agent to retry.";
 const snapshotRequests = [];
 let endAfterSubmit = false;
 let workingBubble = null;
@@ -218,6 +219,12 @@ function showSendHint(copy = SEND_EMPTY_COPY) {
     sendHint.hidden = true;
   }, 2600);
   chatInput.focus();
+}
+
+function showSendError(copy) {
+  clearTimeout(sendHintTimer);
+  sendHint.textContent = copy;
+  sendHint.hidden = false;
 }
 
 function hideSendHint() {
@@ -448,24 +455,33 @@ async function submitQueued() {
   }
 }
 
+function postPrompts(body) {
+  return fetch("/api/" + key + "/prompts", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch(() => null);
+}
+
 async function submitQueuedOnce() {
   const prompts = queued.slice();
   const shouldEndSession = endAfterSubmit;
   const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: pendingSnapshot };
   if (shouldEndSession) body.endSession = true;
-  const response = await fetch("/api/" + key + "/prompts", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    if (response.status === 409) {
+  let response = await postPrompts(body);
+  if (response?.status === 413 && body.domSnapshot) {
+    body.domSnapshot = "";
+    response = await postPrompts(body);
+  }
+  if (!response?.ok) {
+    if (response?.status === 409) {
       const data = await response.json().catch(() => null);
       if (Array.isArray(data?.warnings)) setLayoutWarnings(data.warnings);
       endAfterSubmit = false;
       return false;
     }
-    throw new Error("failed to submit queued prompts");
+    showSendError(SEND_FAILED_COPY);
+    return false;
   }
   for (const prompt of prompts) {
     const index = queued.indexOf(prompt);
