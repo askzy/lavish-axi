@@ -100,6 +100,7 @@ export async function run(argv) {
       },
       getCommandHelp,
     });
+    await settlePendingFeedbackAck();
     telemetry.track("command", { command, status: "success" });
   } catch (error) {
     telemetry.track("command", { command, status: "error" });
@@ -286,6 +287,7 @@ async function pollCommand(args) {
       retries: 3,
       retryDelayMs: 500,
     });
+    queueFeedbackAck({ baseUrl, key: sessionKey(absolute), response });
     return createPollOutput({ file: absolute, response });
   } finally {
     waitReporter?.stop();
@@ -294,6 +296,37 @@ async function pollCommand(args) {
       process.off("SIGTERM", onPollSignal);
     }
   }
+}
+
+// A delivered batch stays leased on the server until this process acks it. The ack is deferred
+// until `run` has written the poll output and stdout has drained, so a poll killed anywhere
+// before that point leaves the lease to expire and the server delivers the batch again.
+let pendingFeedbackAck = null;
+
+export function queueFeedbackAck({ baseUrl, key, response }) {
+  if (response?.status !== "feedback" || typeof response.delivery_id !== "string" || !response.delivery_id) return;
+  pendingFeedbackAck = { url: `${baseUrl}/api/${key}/ack`, deliveryId: response.delivery_id };
+}
+
+export async function settlePendingFeedbackAck({ flush = flushStdout, post = postJson } = {}) {
+  const ack = pendingFeedbackAck;
+  if (!ack) return false;
+  pendingFeedbackAck = null;
+  await flush();
+  try {
+    await post(ack.url, { delivery_id: ack.deliveryId });
+  } catch {
+    // The lease expires on its own and the batch is delivered again; the output above already
+    // reached the agent, so a failed ack is not worth failing the command over.
+    return false;
+  }
+  return true;
+}
+
+function flushStdout() {
+  return new Promise((resolve) => {
+    process.stdout.write("", () => resolve());
+  });
 }
 
 // The recurring per-minute wait ticks are only useful to a human watching a terminal. Agent
@@ -382,9 +415,15 @@ export function createPollOutput({ file, response }) {
       next_step: createEndedNextStep(file, response.ended_by),
     };
   }
+  const retryAfterMs = typeof response.retry_after_ms === "number" ? response.retry_after_ms : null;
+  const leaseNote =
+    retryAfterMs === null
+      ? ""
+      : ` A batch delivered to an earlier poll is still leased to it; if that poll died before acting on it, the batch is delivered again in about ${Math.ceil(retryAfterMs / 1000)}s - drain again then.`;
   return {
     session: { file, status: response.status || "waiting" },
-    next_step: `No user feedback arrived before the optional timeout. Run \`lavish-axi poll ${file}\` without --timeout-ms to wait indefinitely - queued feedback is never lost, so re-running the poll is always safe.`,
+    ...(retryAfterMs === null ? {} : { retry_after_ms: retryAfterMs }),
+    next_step: `No user feedback arrived before the optional timeout. Run \`lavish-axi poll ${file}\` without --timeout-ms to wait indefinitely - queued feedback is never lost, so re-running the poll is always safe.${leaseNote}`,
   };
 }
 

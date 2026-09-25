@@ -353,3 +353,49 @@ test("fork: both generated skills are committed and reproducible", async () => {
     assert.equal(committed, expected, `skills/${name}/SKILL.md is stale - run node scripts/build-skill.js`);
   }
 });
+
+// The lease only protects feedback if the ack goes out after the batch is on stdout. A poll that
+// dies between the response and the ack must leave the lease to expire, so the order is the whole
+// point: flush first, ack second, and nothing to ack for a non-feedback response.
+test("fork: the poll acks a delivered batch only after stdout has drained", async () => {
+  const calls = [];
+  const flush = async () => {
+    calls.push("flush");
+  };
+  const post = async (url, body) => {
+    calls.push(["post", url, body]);
+    return { status: "acked", retired: true };
+  };
+
+  cli.queueFeedbackAck({ baseUrl: "http://127.0.0.1:1", key: "abc", response: { status: "waiting" } });
+  assert.equal(await cli.settlePendingFeedbackAck({ flush, post }), false);
+  assert.deepEqual(calls, []);
+
+  cli.queueFeedbackAck({
+    baseUrl: "http://127.0.0.1:1",
+    key: "abc",
+    response: { status: "feedback", delivery_id: "d-1", prompts: [] },
+  });
+  assert.equal(await cli.settlePendingFeedbackAck({ flush, post }), true);
+  assert.deepEqual(calls, ["flush", ["post", "http://127.0.0.1:1/api/abc/ack", { delivery_id: "d-1" }]]);
+
+  // Settled once: a second settle has nothing to send.
+  assert.equal(await cli.settlePendingFeedbackAck({ flush, post }), false);
+  assert.equal(calls.length, 2);
+
+  // A failed ack is swallowed: the lease expires on its own and the batch is delivered again.
+  cli.queueFeedbackAck({
+    baseUrl: "http://127.0.0.1:1",
+    key: "abc",
+    response: { status: "feedback", delivery_id: "d-2", prompts: [] },
+  });
+  assert.equal(
+    await cli.settlePendingFeedbackAck({
+      flush,
+      post: async () => {
+        throw new Error("connection refused");
+      },
+    }),
+    false,
+  );
+});

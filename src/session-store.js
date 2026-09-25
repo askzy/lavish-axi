@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { readFile, realpath, writeFile } from "node:fs/promises";
+import { readFile, realpath, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -18,10 +18,16 @@ import { normalizeMermaidNodeTarget } from "./mermaid-node.js";
 
 export const LAYOUT_WARNINGS_TARGET_TYPE = "layout-warnings";
 const MAX_ARTIFACT_FAILURES = 20;
+// How long a delivered feedback batch stays leased to the poll that took it. A poll that dies
+// before acknowledging (reaped harness job, background process nobody reads) leaves the lease to
+// expire, after which the batch is delivered again instead of being lost.
+export const FEEDBACK_LEASE_TTL_MS = 60_000;
 
 export class SessionStore {
-  constructor(file) {
+  constructor(file, { feedbackLeaseTtlMs = FEEDBACK_LEASE_TTL_MS, now = () => Date.now() } = {}) {
     this.file = file;
+    this.feedbackLeaseTtlMs = feedbackLeaseTtlMs;
+    this.now = now;
     /** @type {Promise<unknown>} */
     this.stateOperationQueue = Promise.resolve();
     this.artifactLoads = new Map();
@@ -65,6 +71,7 @@ export class SessionStore {
         status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
         pending_prompts: existing.pending_prompts || 0,
         prompts: existingPrompts,
+        leases: normalizeLeases(existing.leases),
         // The warning inbox is durable review state, not deliverable feedback: reopening a session
         // must never silently drop unresolved warnings the user has not triaged yet.
         layout_warnings: normalizeStoredWarnings(existing.layout_warnings),
@@ -426,27 +433,48 @@ export class SessionStore {
       if (!session) {
         return { status: "missing" };
       }
+      const now = this.now();
+      const leases = normalizeLeases(session.leases);
+      const expired = leases.filter((lease) => this.leaseExpired(lease, now));
+      const live = leases.filter((lease) => !this.leaseExpired(lease, now));
       // Prompts queued before the session ended (a browser send-and-end) must still reach the
       // agent, so deliver them before reporting the ended state; the next poll then sees ended.
-      const prompts = session.prompts || [];
+      // Batches whose lease expired without an ack were taken by a poll that never got to act on
+      // them, so they go out again ahead of anything queued since.
+      const prompts = [...expired.flatMap((lease) => lease.prompts), ...(session.prompts || [])];
       // Layout warnings are NOT delivered here. Detection is passive: the user decides which
       // warnings become work by queueing them, and that arrives as an ordinary prompt above.
       // Only artifact failures - a review that cannot be used at all - still reach the agent
       // without user action.
-      const artifactFailures = Array.isArray(session.artifact_failures) ? session.artifact_failures : [];
+      const artifactFailures = dedupeArtifactFailures([
+        ...expired.flatMap((lease) => lease.artifact_failures),
+        ...(Array.isArray(session.artifact_failures) ? session.artifact_failures : []),
+      ]);
       const alreadyEnded = session.status === "ended";
       if (prompts.length === 0 && artifactFailures.length === 0) {
-        return alreadyEnded ? { status: "ended", ended_by: session.ended_by } : { status: "waiting" };
+        if (alreadyEnded) return { status: "ended", ended_by: session.ended_by };
+        const retryAfterMs = this.nextLeaseExpiryMs(live, now);
+        return retryAfterMs === null ? { status: "waiting" } : { status: "waiting", retry_after_ms: retryAfterMs };
       }
+      const domSnapshot = session.dom_snapshot || expired.at(-1)?.dom_snapshot || "";
+      const lease = {
+        delivery_id: crypto.randomUUID(),
+        leased_at: new Date(now).toISOString(),
+        prompts,
+        dom_snapshot: domSnapshot,
+        artifact_failures: artifactFailures,
+      };
       const result = {
         status: "feedback",
-        dom_snapshot: session.dom_snapshot || "",
+        delivery_id: lease.delivery_id,
+        dom_snapshot: domSnapshot,
         prompts,
         ...(artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
         // This is the final delivery before the session shows as ended - flag it so the agent
         // knows not to expect (or force) a reopened browser afterward.
         ...(alreadyEnded ? { session_ended: true, ended_by: session.ended_by } : {}),
       };
+      session.leases = [...live, lease];
       session.prompts = [];
       session.artifact_failures = [];
       session.pending_prompts = 0;
@@ -458,6 +486,38 @@ export class SessionStore {
       await this.writeState(state);
       return result;
     });
+  }
+
+  // Retires one delivered batch. The CLI acks only after the batch is fully on stdout, so an
+  // unacked lease always means the consumer never got to act on it.
+  async ackFeedback(key, deliveryId) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) {
+        return null;
+      }
+      const leases = normalizeLeases(session.leases);
+      const remaining = leases.filter((lease) => lease.delivery_id !== deliveryId);
+      const retired = remaining.length !== leases.length;
+      if (retired) {
+        session.leases = remaining;
+        session.updated_at = new Date().toISOString();
+        await this.writeState(state);
+      }
+      return { session, retired };
+    });
+  }
+
+  leaseExpired(lease, now) {
+    const leasedAt = Date.parse(lease.leased_at);
+    return !Number.isFinite(leasedAt) || now - leasedAt >= this.feedbackLeaseTtlMs;
+  }
+
+  nextLeaseExpiryMs(leases, now) {
+    if (leases.length === 0) return null;
+    const soonest = Math.min(...leases.map((lease) => Date.parse(lease.leased_at) + this.feedbackLeaseTtlMs));
+    return Math.max(0, soonest - now);
   }
 
   // `endedBy` distinguishes a human ending review from the browser chrome ("user") from an
@@ -491,6 +551,9 @@ export class SessionStore {
         ...(session.chat || []),
         { role: "agent", text: String(text || ""), at: new Date().toISOString() },
       ];
+      // A reply means the agent acted on everything delivered so far, so every lease is retired
+      // even when the poll that took it never acked.
+      session.leases = [];
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
       return session;
@@ -521,9 +584,36 @@ export class SessionStore {
     }
   }
 
+  // Write-then-rename so a crash mid-write leaves the previous state.json intact instead of a
+  // truncated file that loses every session.
   async writeState(state) {
-    await writeFile(this.file, `${JSON.stringify(state, null, 2)}\n`);
+    const temp = `${this.file}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+    await writeFile(temp, `${JSON.stringify(state, null, 2)}\n`);
+    await rename(temp, this.file);
   }
+}
+
+function normalizeLeases(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((lease) => lease && typeof lease === "object" && typeof lease.delivery_id === "string")
+    .map((lease) => ({
+      delivery_id: lease.delivery_id,
+      leased_at: String(lease.leased_at || ""),
+      prompts: Array.isArray(lease.prompts) ? lease.prompts : [],
+      dom_snapshot: typeof lease.dom_snapshot === "string" ? lease.dom_snapshot : "",
+      artifact_failures: Array.isArray(lease.artifact_failures) ? lease.artifact_failures : [],
+    }));
+}
+
+function dedupeArtifactFailures(failures) {
+  const seen = new Set();
+  return failures.filter((failure) => {
+    const id = `${failure?.kind}\u0000${failure?.detail}`;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
 }
 
 export async function canonicalFile(file) {

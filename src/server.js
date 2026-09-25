@@ -89,9 +89,10 @@ export async function serve({
   host = bindHost(),
   linkHost: linkHostName = linkHost(),
   allowedHosts = extraAllowedHosts(),
+  feedbackLeaseTtlMs = undefined,
 }) {
   const app = express();
-  const store = new SessionStore(stateFile);
+  const store = new SessionStore(stateFile, feedbackLeaseTtlMs === undefined ? {} : { feedbackLeaseTtlMs });
   const events = new EventEmitter();
   const watchers = new Map();
   const activePolls = new Map();
@@ -209,23 +210,39 @@ export async function serve({
       setPollActive(key, activePolls, deliveredFeedback, events, true);
       refreshIdleTimer();
       const timer = timeoutMs === null ? null : setTimeout(() => respond().catch(handleRespondError), timeoutMs);
+      // A batch leased to a poll that died is re-delivered when the lease expires. Nothing
+      // emits an event at that moment, so a poll already waiting arms its own timer for it.
+      let leaseTimer = null;
+      const armLeaseTimer = (retryAfterMs) => {
+        if (cleaned || typeof retryAfterMs !== "number") return;
+        if (timeoutMs !== null && retryAfterMs >= timeoutMs) return;
+        leaseTimer = setTimeout(() => respond({ leaseExpiry: true }).catch(handleRespondError), retryAfterMs);
+        leaseTimer.unref?.();
+      };
       let cleaned = false;
       let responding = false;
       const cleanup = () => {
         if (cleaned) return;
         cleaned = true;
         if (timer) clearTimeout(timer);
+        if (leaseTimer) clearTimeout(leaseTimer);
         if (heartbeat) clearInterval(heartbeat);
         events.off("feedback", onFeedback);
         events.off("ended", onFeedback);
         setPollActive(key, activePolls, deliveredFeedback, events, false);
         refreshIdleTimer();
       };
-      const respond = async () => {
+      const respond = async ({ leaseExpiry = false } = {}) => {
         if (responding || res.writableEnded) return;
         responding = true;
         try {
           const result = await store.takeFeedback(key);
+          if (leaseExpiry && result.status === "waiting") {
+            // The lease was acked in the meantime; keep waiting for real feedback.
+            responding = false;
+            armLeaseTimer(result.retry_after_ms);
+            return;
+          }
           if (result.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
           if (streamHeartbeat) {
             res.end(JSON.stringify(result));
@@ -253,6 +270,27 @@ export async function serve({
       events.on("feedback", onFeedback);
       events.on("ended", onFeedback);
       req.on("close", cleanup);
+      armLeaseTimer(immediate.retry_after_ms);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Retires a delivered batch. The CLI sends this only after the batch is fully on stdout, so a
+  // poll that dies first leaves the lease to expire and the batch is delivered again.
+  app.post("/api/:key/ack", async (req, res, next) => {
+    try {
+      const deliveryId = String(req.body?.delivery_id || "");
+      if (!deliveryId) {
+        res.status(400).json({ error: "delivery_id is required" });
+        return;
+      }
+      const result = await store.ackFeedback(req.params.key, deliveryId);
+      if (!result) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      res.json({ status: "acked", retired: result.retired });
     } catch (error) {
       next(error);
     }

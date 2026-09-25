@@ -34,7 +34,7 @@ that next poll.
    is absent from the list but still delivers its queued feedback once.
 3. Read the result. `session_ended: true` means the user is done - apply what came back, deliver
    any further updates in this conversation, and do not reopen. An empty result means the queue is
-   empty _right now_, not that the user sent nothing; rule out a drained queue (below) before
+   empty _right now_, not that the user sent nothing; rule out a leased batch (below) before
    reporting "no feedback". Do not open a long poll just to look.
 4. Apply the returned prompts exactly as the `/lavish` workflow describes. A `layout-warnings`
    prompt is an explicit repair request; apply every listed fix in one pass.
@@ -44,18 +44,12 @@ that next poll.
 
 ## When the queue is empty but the user says they sent feedback
 
-A poll that collected the feedback and then exited took it with it - typically a poll a subagent
-started and left behind. Signals: the browser is stuck on "Working" or a spinner, or a recent
-background job in this session's `tasks/` directory contains a `prompts[` block. The last one is
-decisive:
-
-```bash
-grep -l 'prompts\[' /private/tmp/claude-501/<cwd-slug>/<session-uuid>/tasks/*.output
-```
-
-Read the newest match, treat its `prompts[N]{uid,prompt,selector,tag,text}:` block as the feedback,
-apply it normally, then reply into the browser so it stops spinning. A bash background-job
-`.output` file is plain text and safe to read, unlike a subagent's JSONL transcript.
+Delivered feedback stays leased to the poll that took it for about a minute. A poll that collected
+the feedback and then exited before acknowledging it - typically a poll a subagent started and left
+behind - leaves that lease to expire, and the next drain delivers the batch again. Signals: the
+browser is stuck on "Working" or a spinner, or the drain came back `waiting` with a
+`retry_after_ms`. Wait that long, then drain again with `--timeout-ms 0`; the prompts come back.
+Apply them normally, then reply into the browser so it stops spinning.
 
 ## Rules
 
