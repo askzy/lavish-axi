@@ -75,7 +75,7 @@ export const POLL_PICKUP_RULE =
 // period for a reload, then answers `browser_disconnected` so a foreground poll stops blocking.
 // The session stays open, and nothing queued is touched.
 export const POLL_BROWSER_DISCONNECTED_RULE =
-  "If the poll returns `browser_disconnected`, the user closed the review page (every review tab stayed disconnected past a short grace period). Say so in one line and stop polling. The session stays open and resumable, but do not reopen it uninvited - ask the user whether to reopen or end the session. Anything already sent is safely leased, and `/check-lavish` will collect it.";
+  "If the poll returns `browser_disconnected`, the user closed the review page (every review tab stayed disconnected past a short grace period). Say so in one line and stop polling. The session stays open and resumable, but do not reopen it uninvited - ask the user whether to reopen, and run `lavish-axi end <html-file>` unless they do, so the session does not linger. Anything already sent is safely leased, and `/check-lavish` will collect it.";
 export const POLL_WAKE_PATH_RULES = Object.freeze([
   "Run the poll in the foreground when your harness allows it, so it returns the feedback directly to the agent. If your harness caps how long a foreground command may run, running the poll as a background task is expected and supported.",
   "A background poll must go through a harness-native tracked background-job facility whose completion result is guaranteed to resume or notify the same agent.",
@@ -459,7 +459,7 @@ export function createPollOutput({ file, response }) {
   if (response.status === "browser_disconnected") {
     return {
       session: { file, status: "browser_disconnected" },
-      next_step: `The Lavish review window was closed: the user closed the page for ${file} and no review tab reconnected within the grace period. Tell the user in one line that you have stopped listening, and stop polling. The session remains open and resumable, but do not reopen it or end it uninvited - ask the user whether they want to reopen it or end the session. Anything the user already sent is safely leased on the server, and \`/check-lavish\` will collect it.`,
+      next_step: `The Lavish review window was closed: the user closed the page for ${file} and no review tab reconnected within the grace period. Tell the user in one line that you have stopped listening, and stop polling. The session remains open and resumable, but do not reopen it uninvited - ask the user whether they want to reopen it, and run \`lavish-axi end ${file}\` unless they do, so the session does not linger. Anything the user already sent is safely leased on the server, and \`/check-lavish\` will collect it.`,
     };
   }
   const retryAfterMs = typeof response.retry_after_ms === "number" ? response.retry_after_ms : null;
