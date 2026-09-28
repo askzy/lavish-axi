@@ -201,7 +201,7 @@ export function createHomeOutput({ bin, sessions, includeSessions = true }) {
       "Run `lavish-axi end <html-file>` to end a session as the agent - ending it this way still allows a plain reopen later. When the user ends it from the browser instead, a later `lavish-axi <html-file>` refuses to reopen it without `--reopen`",
       "Run `lavish-axi export <html-file> [--out <path>]` to write a portable copy of the artifact - one HTML file with its LOCAL assets inlined - so it opens with no Lavish server and no sibling files. Remote CDN/font references are left as links, so it needs network to render those. Users can also export from the browser chrome's overflow menu",
       "Run `lavish-axi stop` to shut down the background server (it also self-stops when idle or after the last session ends with nothing connected)",
-      "Run `lavish-axi prune [--older-than 30d] [--dry-run]` to drop ended sessions older than the cutoff, sessions whose artifact is gone, and stale `.lavish/*.html` files nobody is reviewing. The server runs the same prune with the default cutoff each time it starts",
+      "Run `lavish-axi prune [--older-than 30d] [--dry-run]` to drop ended sessions older than the cutoff, sessions whose artifact is gone, and stale `.lavish/*.html` files nobody is reviewing, across every project directory the store has a session in. The server runs the same prune with the default cutoff each time it starts",
       `Run \`lavish-axi playbook <playbook_id>\` for focused artifact guidance. ${PLAYBOOK_ROUTER_HELP}`,
       DESIGN_SYSTEM_HINT,
       "Use lavish-axi when the user asks for a visual artifact, HTML explainer, interactive prototype, review surface, product or technical plan, comparison, report, or browser-based feedback loop",
@@ -776,10 +776,10 @@ async function pruneCommand(args) {
       "Run `lavish-axi prune --older-than 30d` (units: d, h, m)",
     ]);
   }
-  const cwd = path.resolve(flagValue(args, "--cwd") || process.cwd());
+  const cwd = flagValue(args, "--cwd");
   const result = await prune({
     store: new SessionStore(stateFile()),
-    artifactDirs: [path.join(cwd, ARTIFACT_DIR_NAME)],
+    artifactDirs: cwd ? [path.join(path.resolve(cwd), ARTIFACT_DIR_NAME)] : undefined,
     maxAgeMs,
     dryRun: args.includes("--dry-run"),
   });
@@ -1164,7 +1164,7 @@ function createCommandHelp() {
     export: `Usage: lavish-axi export <html-file> [--out <path>]\n\nWrite a portable copy of an artifact: one HTML file with its LOCAL assets inlined (relative-path stylesheets, scripts, images, and fonts become inline <style>/<script> blocks and data URIs). Remote CDN/font references (https URLs) are left as links for the browser to load, so the file needs network to render those. Lavish makes no outbound requests - it only reads local files, confined to the artifact's directory. Defaults to writing <name>.export.html next to the source; pass --out to choose a path. The Lavish annotation SDK is never included in an export.\n`,
     share: `The \`share\` command is disabled in this fork (askzy/lavish-axi). Use \`lavish-axi export\` for a portable local file instead.\n`,
     stop: `Usage: lavish-axi stop [--port <port>]\n\nShut down the background Lavish Editor server. The server also stops itself when no browser or poll has been connected for a while (LAVISH_AXI_IDLE_TIMEOUT_MS, default 30m) and immediately when the last session ends with nothing connected.\n`,
-    prune: `Usage: lavish-axi prune [--older-than <duration>] [--dry-run] [--cwd <dir>]\n\nRemove stale review state. Sessions go when they are ended and last updated before the cutoff, or when their artifact file no longer exists; an open session with a live file is kept whatever its age. Then \`.lavish/*.html\` files under the working directory (or --cwd) older than the cutoff are deleted, except files an open session still points at. The cutoff defaults to 30d and accepts d, h, or m units. --dry-run prints the same summary and changes nothing.\n\nThe server runs this prune once with the default cutoff each time it starts, across every .lavish/ directory the store knows about. LAVISH_AXI_PRUNE_MAX_AGE overrides that cutoff; 0 or off disables it.\n`,
+    prune: `Usage: lavish-axi prune [--older-than <duration>] [--dry-run] [--cwd <dir>]\n\nRemove stale review state. Sessions go when they are ended and last updated before the cutoff, or when their artifact file no longer exists; an open session with a live file is kept whatever its age. Then \`.lavish/*.html\` files older than the cutoff are deleted from every .lavish/ directory the store has a session in, except files an open session still points at. --cwd <dir> narrows that sweep to <dir>/.lavish/ alone; sessions are still pruned store-wide. The cutoff defaults to 30d and accepts d, h, or m units. --dry-run prints the same summary and changes nothing.\n\nThe server runs this same store-wide prune once with the default cutoff each time it starts. LAVISH_AXI_PRUNE_MAX_AGE overrides that cutoff; 0 or off disables it.\n`,
     playbook: `Usage: lavish-axi playbook [playbook_id]\n\nList focused artifact guidance playbooks, or show one playbook by ID. Known IDs: diagram, table, comparison, plan, code, input, slides.\n\n${PLAYBOOK_ROUTER_HELP}\n\nExamples:\n  lavish-axi playbook\n  lavish-axi playbook diagram\n  lavish-axi playbook input\n`,
     design: `Usage: lavish-axi design\n\nShow a copy-pasteable CDN snippet for Tailwind CSS browser runtime v4 + DaisyUI v5 + themes, Mermaid diagram tooling, a content-to-playbook router, an optional layout safety CSS snippet, plus technical reference for DaisyUI components. ${PLAYBOOK_ROUTER_HELP} Lavish artifacts stay portable HTML. This CDN snippet is the design fallback, not the default: inspect the subject project before falling back, and paste the layout safety CSS only when useful for dense nested grid/flex layouts, badges, wide fonts, or local media. ${DESIGN_PRIORITY_RULE}\n`,
     setup: `The \`setup hooks\` command is disabled in this fork (askzy/lavish-axi). Wire up any lavish-axi ambient context manually in your agent settings if desired.\n`,
