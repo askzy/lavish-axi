@@ -561,6 +561,32 @@ export class SessionStore {
   }
 
   /**
+   * Drop every session `shouldRemove` accepts and persist the rest. `bytesFreed` is how much
+   * smaller the serialized state becomes. With `dryRun`, nothing is written.
+   *
+   * @param {(session: any) => Promise<boolean> | boolean} shouldRemove
+   * @param {{ dryRun?: boolean }} [options]
+   */
+  async removeSessions(shouldRemove, { dryRun = false } = {}) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const before = serializedStateBytes(state);
+      const removed = [];
+      const kept = [];
+      for (const [key, session] of Object.entries(state.sessions)) {
+        if (await shouldRemove(session)) {
+          removed.push(session);
+          delete state.sessions[key];
+        } else {
+          kept.push(session);
+        }
+      }
+      if (removed.length > 0 && !dryRun) await this.writeState(state);
+      return { removed, kept, bytesFreed: before - serializedStateBytes(state) };
+    });
+  }
+
+  /**
    * @template T
    * @param {() => Promise<T>} operation
    * @returns {Promise<T>}
@@ -588,9 +614,17 @@ export class SessionStore {
   // truncated file that loses every session.
   async writeState(state) {
     const temp = `${this.file}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
-    await writeFile(temp, `${JSON.stringify(state, null, 2)}\n`);
+    await writeFile(temp, serializeState(state));
     await rename(temp, this.file);
   }
+}
+
+function serializeState(state) {
+  return `${JSON.stringify(state, null, 2)}\n`;
+}
+
+function serializedStateBytes(state) {
+  return Buffer.byteLength(serializeState(state));
 }
 
 function normalizeLeases(value) {
