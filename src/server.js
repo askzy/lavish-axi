@@ -34,6 +34,7 @@ import * as mermaidNode from "./mermaid-node.js";
 import { buildSelfContainedHtml, exportFileName, splitExportWarnings } from "./export-bundle.js";
 import { injectLavishSdk } from "./html-transform.js";
 import { bindHost, extraAllowedHosts, hostForUrl, IPV6_LOOPBACK_HOST, linkHost, LOOPBACK_HOST } from "./paths.js";
+import { formatPruneSummary, knownArtifactDirs, prune, resolvePruneMaxAgeMs } from "./prune.js";
 import { canonicalFile, canonicalSessionFile, SessionStore, sessionKey } from "./session-store.js";
 
 const chromeClientUrl = new URL("./chrome-client.js", import.meta.url);
@@ -96,6 +97,8 @@ export async function serve({
   linkHost: linkHostName = linkHost(),
   allowedHosts = extraAllowedHosts(),
   feedbackLeaseTtlMs = undefined,
+  // undefined resolves LAVISH_AXI_PRUNE_MAX_AGE at start; null skips the start-up prune.
+  pruneMaxAgeMs = undefined,
 }) {
   const app = express();
   const store = new SessionStore(stateFile, feedbackLeaseTtlMs === undefined ? {} : { feedbackLeaseTtlMs });
@@ -895,6 +898,22 @@ export async function serve({
   function reloadDebounceMs(key) {
     return outstandingRepairBatches.has(key) ? BATCH_RELOAD_DEBOUNCE_MS : RELOAD_DEBOUNCE_MS;
   }
+
+  // Housekeeping runs at start so no scheduler or agent discipline is needed to keep state.json
+  // and .lavish/ from growing forever. It must never stop the server from coming up.
+  async function runStartupPrune() {
+    try {
+      const maxAgeMs = pruneMaxAgeMs === undefined ? resolvePruneMaxAgeMs() : pruneMaxAgeMs;
+      if (maxAgeMs === null) return;
+      const result = await prune({ store, artifactDirs: await knownArtifactDirs(store), maxAgeMs });
+      if (result.sessionsRemoved > 0 || result.filesRemoved > 0) {
+        writeLog(`[lavish] prune: ${formatPruneSummary(result)}`);
+      }
+    } catch (error) {
+      writeLog(`[lavish] prune failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  await runStartupPrune();
 
   // Arm the idle timer for a server that is spawned but never opens a session.
   refreshIdleTimer();
