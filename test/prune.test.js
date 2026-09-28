@@ -213,6 +213,59 @@ test("knownArtifactDirs lists each .lavish directory the store points into once"
   }
 });
 
+test("default sweep covers every .lavish directory the store has a session in and nothing else", async () => {
+  const projectA = await makeTemp();
+  const projectB = await makeTemp();
+  const unreferenced = await makeTemp();
+  try {
+    const endedA = await writeArtifact(projectA, "ended-old.html", OLD);
+    const orphanA = await writeArtifact(projectA, "orphan-old.html", OLD);
+    const orphanB = await writeArtifact(projectB, "orphan-old.html", OLD);
+    const liveB = await writeArtifact(projectB, "open-live.html", OLD);
+    const untouched = await writeArtifact(unreferenced, "orphan-old.html", OLD);
+    const stateFile = await writeStore(projectA, [
+      sessionRecord(endedA, "ended", OLD),
+      sessionRecord(liveB, "open", OLD),
+    ]);
+
+    const result = await prune({ store: new SessionStore(stateFile), maxAgeMs: 30 * DAY_MS, now: () => NOW });
+
+    assert.equal(result.sessionsRemoved, 1);
+    assert.deepEqual(result.removedFiles.sort(), [endedA, orphanA, orphanB].sort());
+    assert.ok(await exists(liveB), "open session artifact kept");
+    assert.ok(await exists(untouched), "a directory no session references is not swept");
+  } finally {
+    await Promise.all([projectA, projectB, unreferenced].map((dir) => rm(dir, { recursive: true, force: true })));
+  }
+});
+
+test("explicit artifactDirs narrows the sweep to those directories", async () => {
+  const projectA = await makeTemp();
+  const projectB = await makeTemp();
+  try {
+    const orphanA = await writeArtifact(projectA, "orphan-old.html", OLD);
+    const orphanB = await writeArtifact(projectB, "orphan-old.html", OLD);
+    const recentA = await writeArtifact(projectA, "recent.html", RECENT);
+    const recentB = await writeArtifact(projectB, "recent.html", RECENT);
+    const stateFile = await writeStore(projectA, [
+      sessionRecord(recentA, "ended", RECENT),
+      sessionRecord(recentB, "ended", RECENT),
+    ]);
+
+    const result = await prune({
+      store: new SessionStore(stateFile),
+      artifactDirs: [path.join(projectA, ".lavish")],
+      maxAgeMs: 30 * DAY_MS,
+      now: () => NOW,
+    });
+
+    assert.deepEqual(result.removedFiles, [orphanA]);
+    assert.ok(await exists(orphanB), "a directory outside the narrowed set is left alone");
+  } finally {
+    await Promise.all([projectA, projectB].map((dir) => rm(dir, { recursive: true, force: true })));
+  }
+});
+
 test("formatBytes picks a readable unit", () => {
   assert.equal(formatBytes(0), "0 B");
   assert.equal(formatBytes(900), "900 B");
@@ -297,33 +350,44 @@ test("server start prune is skipped when disabled and non-fatal on a corrupt sto
   }
 });
 
-test("prune command prints one summary line and rejects a bad duration", async () => {
+test("prune command sweeps store-wide by default, narrows with --cwd, and rejects a bad duration", async () => {
   const dir = await makeTemp();
+  const other = await makeTemp();
   const stateDir = path.join(dir, "state");
   await mkdir(stateDir);
   try {
     const endedOld = await writeArtifact(dir, "ended-old.html", OLD);
-    await writeStore(stateDir, [sessionRecord(endedOld, "ended", OLD)]);
+    const orphanOther = await writeArtifact(other, "orphan-old.html", OLD);
+    const recentOther = await writeArtifact(other, "recent.html", RECENT);
+    await writeStore(stateDir, [sessionRecord(endedOld, "ended", OLD), sessionRecord(recentOther, "ended", RECENT)]);
     const env = { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_TELEMETRY: "0" };
 
-    const dry = spawnSync(process.execPath, [BIN, "prune", "--dry-run", "--cwd", dir], { encoding: "utf8", env });
+    const dry = spawnSync(process.execPath, [BIN, "prune", "--dry-run"], { encoding: "utf8", env, cwd: os.tmpdir() });
     assert.equal(dry.status, 0, dry.stderr || dry.stdout);
-    assert.match(dry.stdout.trim(), /^Would remove 1 session and 1 file, .* freed$/);
+    assert.match(dry.stdout.trim(), /^Would remove 1 session and 2 files, .* freed$/);
     assert.ok(await exists(endedOld));
+    assert.ok(await exists(orphanOther));
 
-    const real = spawnSync(process.execPath, [BIN, "prune", "--older-than=7d", "--cwd", dir], {
+    const narrowed = spawnSync(process.execPath, [BIN, "prune", "--older-than=7d", "--cwd", dir], {
       encoding: "utf8",
       env,
     });
-    assert.equal(real.status, 0, real.stderr || real.stdout);
-    assert.match(real.stdout.trim(), /^Removed 1 session and 1 file, .* freed$/);
+    assert.equal(narrowed.status, 0, narrowed.stderr || narrowed.stdout);
+    assert.match(narrowed.stdout.trim(), /^Removed 1 session and 1 file, .* freed$/);
     assert.equal(await exists(endedOld), false);
+    assert.ok(await exists(orphanOther), "--cwd leaves other known directories alone");
+
+    const wide = spawnSync(process.execPath, [BIN, "prune"], { encoding: "utf8", env, cwd: os.tmpdir() });
+    assert.equal(wide.status, 0, wide.stderr || wide.stdout);
+    assert.match(wide.stdout.trim(), /^Removed 0 sessions and 1 file, .* freed$/);
+    assert.equal(await exists(orphanOther), false);
+    assert.ok(await exists(recentOther));
 
     const bad = spawnSync(process.execPath, [BIN, "prune", "--older-than", "soon"], { encoding: "utf8", env });
     assert.notEqual(bad.status, 0);
     assert.match(`${bad.stdout}${bad.stderr}`, /Invalid duration .*soon/);
     assert.match(`${bad.stdout}${bad.stderr}`, /VALIDATION_ERROR/);
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    await Promise.all([dir, other].map((d) => rm(d, { recursive: true, force: true })));
   }
 });

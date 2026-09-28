@@ -33,18 +33,23 @@ export function resolvePruneMaxAgeMs(env = process.env) {
  * whatever its age. Then every `.html` file directly inside each artifact directory that is older
  * than the cutoff is deleted, unless a session that is still open points at it.
  *
+ * Without `artifactDirs` the sweep covers every `.lavish/` directory the store has a session in,
+ * resolved before any session is removed so a directory whose last session goes is still swept.
+ * The CLI and the server start-up prune both take this path; `artifactDirs` narrows it.
+ *
  * The caller passes its own store so the removal joins that store's exclusive queue: a second
  * store on the same file would race the server's own writes.
  *
  * @param {object} options
  * @param {SessionStore} options.store
- * @param {string[]} [options.artifactDirs] directories to sweep for stale `.html` files
+ * @param {string[]} [options.artifactDirs] directories to sweep instead of the store-wide set
  * @param {number} options.maxAgeMs
  * @param {boolean} [options.dryRun]
  * @param {() => number} [options.now]
  */
-export async function prune({ store, artifactDirs = [], maxAgeMs, dryRun = false, now = () => Date.now() }) {
+export async function prune({ store, artifactDirs, maxAgeMs, dryRun = false, now = () => Date.now() }) {
   const cutoff = now() - maxAgeMs;
+  const sweepDirs = artifactDirs ?? (await knownArtifactDirs(store));
   const {
     removed: removedSessions,
     kept,
@@ -60,7 +65,7 @@ export async function prune({ store, artifactDirs = [], maxAgeMs, dryRun = false
   const protectedFiles = new Set(kept.filter((session) => session.status !== "ended").map((session) => session.file));
   const removedFiles = [];
   let fileBytesFreed = 0;
-  for (const dir of uniqueDirs(artifactDirs)) {
+  for (const dir of uniqueDirs(sweepDirs)) {
     for (const file of await staleArtifactFiles(dir, cutoff)) {
       if (protectedFiles.has(await realpath(file.path))) continue;
       if (!dryRun) await rm(file.path, { force: true });
@@ -80,8 +85,8 @@ export async function prune({ store, artifactDirs = [], maxAgeMs, dryRun = false
 }
 
 // The artifact directories the store knows about: every `.lavish/` that holds a recorded session.
-// The server has no meaningful working directory of its own, so this is how the start-up prune
-// finds artifacts across projects.
+// Lavish pages live next to many projects, so neither the server nor the CLI has one working
+// directory that could stand in for this set.
 export async function knownArtifactDirs(store) {
   const sessions = await store.listSessions();
   const dirs = sessions.map((session) => path.dirname(session.file));

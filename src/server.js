@@ -34,7 +34,7 @@ import * as mermaidNode from "./mermaid-node.js";
 import { buildSelfContainedHtml, exportFileName, splitExportWarnings } from "./export-bundle.js";
 import { injectLavishSdk } from "./html-transform.js";
 import { bindHost, extraAllowedHosts, hostForUrl, IPV6_LOOPBACK_HOST, linkHost, LOOPBACK_HOST } from "./paths.js";
-import { formatPruneSummary, knownArtifactDirs, prune, resolvePruneMaxAgeMs } from "./prune.js";
+import { formatPruneSummary, prune, resolvePruneMaxAgeMs } from "./prune.js";
 import { canonicalFile, canonicalSessionFile, SessionStore, sessionKey } from "./session-store.js";
 
 const chromeClientUrl = new URL("./chrome-client.js", import.meta.url);
@@ -905,7 +905,7 @@ export async function serve({
     try {
       const maxAgeMs = pruneMaxAgeMs === undefined ? resolvePruneMaxAgeMs() : pruneMaxAgeMs;
       if (maxAgeMs === null) return;
-      const result = await prune({ store, artifactDirs: await knownArtifactDirs(store), maxAgeMs });
+      const result = await prune({ store, maxAgeMs });
       if (result.sessionsRemoved > 0 || result.filesRemoved > 0) {
         writeLog(`[lavish] prune: ${formatPruneSummary(result)}`);
       }
