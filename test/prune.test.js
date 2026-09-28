@@ -8,12 +8,16 @@ import test from "node:test";
 
 import {
   DEFAULT_PRUNE_MAX_AGE,
+  DEFAULT_PRUNE_OPEN_MAX_AGE,
+  DEFAULT_PRUNE_UNREPLIED_MAX_AGE,
   formatBytes,
   formatPruneSummary,
   knownArtifactDirs,
   parseDuration,
   prune,
   resolvePruneMaxAgeMs,
+  resolvePruneOpenMaxAgeMs,
+  resolvePruneUnrepliedMaxAgeMs,
 } from "../src/prune.js";
 import { serve } from "../src/server.js";
 import { SessionStore, sessionKey } from "../src/session-store.js";
@@ -37,7 +41,7 @@ async function writeArtifact(dir, name, at) {
   return file;
 }
 
-function sessionRecord(file, status, updatedAt) {
+function sessionRecord(file, status, updatedAt, overrides = {}) {
   return {
     key: sessionKey(file),
     file,
@@ -51,8 +55,16 @@ function sessionRecord(file, status, updatedAt) {
     dom_snapshot: "<html>snapshot</html>",
     chat: [],
     updated_at: updatedAt.toISOString(),
+    ...overrides,
   };
 }
+
+function daysAgo(days) {
+  return new Date(NOW - days * DAY_MS);
+}
+
+const USER_REPLY = { chat: [{ role: "user", text: "Looks good, ship it", at: daysAgo(70).toISOString() }] };
+const AGENT_ONLY = { chat: [{ role: "agent", text: "Here is the plan", at: daysAgo(70).toISOString() }] };
 
 async function writeStore(dir, sessions) {
   const file = path.join(dir, "state.json");
@@ -90,6 +102,117 @@ test("resolvePruneMaxAgeMs reads LAVISH_AXI_PRUNE_MAX_AGE with 0/off disabling",
   assert.throws(() => resolvePruneMaxAgeMs({ LAVISH_AXI_PRUNE_MAX_AGE: "soon" }), /Invalid duration/);
 });
 
+test("resolvers for the open-session windows read their own env vars with 0/off disabling", () => {
+  assert.equal(parseDuration(DEFAULT_PRUNE_UNREPLIED_MAX_AGE), 14 * DAY_MS);
+  assert.equal(parseDuration(DEFAULT_PRUNE_OPEN_MAX_AGE), 60 * DAY_MS);
+  assert.equal(resolvePruneUnrepliedMaxAgeMs({}), 14 * DAY_MS);
+  assert.equal(resolvePruneUnrepliedMaxAgeMs({ LAVISH_AXI_PRUNE_UNREPLIED_MAX_AGE: "3d" }), 3 * DAY_MS);
+  assert.equal(resolvePruneUnrepliedMaxAgeMs({ LAVISH_AXI_PRUNE_UNREPLIED_MAX_AGE: "off" }), null);
+  assert.equal(resolvePruneOpenMaxAgeMs({}), 60 * DAY_MS);
+  assert.equal(resolvePruneOpenMaxAgeMs({ LAVISH_AXI_PRUNE_OPEN_MAX_AGE: "90d" }), 90 * DAY_MS);
+  assert.equal(resolvePruneOpenMaxAgeMs({ LAVISH_AXI_PRUNE_OPEN_MAX_AGE: "0" }), null);
+  assert.throws(() => resolvePruneOpenMaxAgeMs({ LAVISH_AXI_PRUNE_OPEN_MAX_AGE: "1w" }), /Invalid duration/);
+});
+
+test("prune removes abandoned open sessions by the unreplied and open windows", async () => {
+  const dir = await makeTemp();
+  try {
+    const unreplied15 = await writeArtifact(dir, "unreplied-15d.html", RECENT);
+    const unreplied13 = await writeArtifact(dir, "unreplied-13d.html", RECENT);
+    const agentOnly15 = await writeArtifact(dir, "agent-only-15d.html", RECENT);
+    const replied59 = await writeArtifact(dir, "replied-59d.html", RECENT);
+    const replied61 = await writeArtifact(dir, "replied-61d.html", RECENT);
+    const stateFile = await writeStore(dir, [
+      sessionRecord(unreplied15, "open", daysAgo(15)),
+      sessionRecord(unreplied13, "open", daysAgo(13)),
+      sessionRecord(agentOnly15, "open", daysAgo(15), AGENT_ONLY),
+      sessionRecord(replied59, "open", daysAgo(59), USER_REPLY),
+      sessionRecord(replied61, "open", daysAgo(61), USER_REPLY),
+    ]);
+
+    const result = await prune({ store: new SessionStore(stateFile), maxAgeMs: 30 * DAY_MS, now: () => NOW });
+
+    assert.deepEqual(result.removedSessions.sort(), [agentOnly15, replied61, unreplied15].sort());
+    assert.equal(result.filesRemoved, 0, "a removed session's recent file waits for the normal cutoff");
+    const remaining = await new SessionStore(stateFile).listSessions();
+    assert.deepEqual(remaining.map((session) => session.file).sort(), [replied59, unreplied13].sort());
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("prune keeps an open session with queued or leased feedback whatever its age", async () => {
+  const dir = await makeTemp();
+  try {
+    const queued = await writeArtifact(dir, "queued.html", RECENT);
+    const feedback = await writeArtifact(dir, "feedback.html", RECENT);
+    const leased = await writeArtifact(dir, "leased.html", RECENT);
+    const control = await writeArtifact(dir, "control.html", RECENT);
+    const prompt = { uid: "u1", prompt: "Make the title bigger", selector: "h1", tag: "text", text: "Title" };
+    const stateFile = await writeStore(dir, [
+      sessionRecord(queued, "open", daysAgo(400), { prompts: [prompt], pending_prompts: 1 }),
+      sessionRecord(feedback, "feedback", daysAgo(400), USER_REPLY),
+      sessionRecord(leased, "open", daysAgo(400), {
+        leases: [{ delivery_id: "d1", leased_at: daysAgo(400).toISOString(), prompts: [prompt] }],
+      }),
+      sessionRecord(control, "open", daysAgo(400)),
+    ]);
+
+    const result = await prune({ store: new SessionStore(stateFile), maxAgeMs: 30 * DAY_MS, now: () => NOW });
+
+    assert.deepEqual(result.removedSessions, [control]);
+    const remaining = await new SessionStore(stateFile).listSessions();
+    assert.deepEqual(remaining.map((session) => session.file).sort(), [feedback, leased, queued].sort());
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("open-session windows can be moved or disabled per call", async () => {
+  const dir = await makeTemp();
+  try {
+    const unreplied15 = await writeArtifact(dir, "unreplied-15d.html", RECENT);
+    const replied61 = await writeArtifact(dir, "replied-61d.html", RECENT);
+    const stateFile = await writeStore(dir, [
+      sessionRecord(unreplied15, "open", daysAgo(15)),
+      sessionRecord(replied61, "open", daysAgo(61), USER_REPLY),
+    ]);
+    const store = new SessionStore(stateFile);
+
+    const disabled = await prune({
+      store,
+      maxAgeMs: 30 * DAY_MS,
+      unrepliedMaxAgeMs: null,
+      openMaxAgeMs: null,
+      dryRun: true,
+      now: () => NOW,
+    });
+    assert.equal(disabled.sessionsRemoved, 0);
+
+    const moved = await prune({
+      store,
+      maxAgeMs: 30 * DAY_MS,
+      unrepliedMaxAgeMs: 20 * DAY_MS,
+      openMaxAgeMs: 90 * DAY_MS,
+      dryRun: true,
+      now: () => NOW,
+    });
+    assert.equal(moved.sessionsRemoved, 0);
+
+    const tightened = await prune({
+      store,
+      maxAgeMs: 30 * DAY_MS,
+      unrepliedMaxAgeMs: 10 * DAY_MS,
+      openMaxAgeMs: 50 * DAY_MS,
+      dryRun: true,
+      now: () => NOW,
+    });
+    assert.deepEqual(tightened.removedSessions.sort(), [replied61, unreplied15].sort());
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("prune removes ended-and-old and file-gone sessions, keeps open-and-live and ended-but-recent", async () => {
   const dir = await makeTemp();
   try {
@@ -99,7 +222,7 @@ test("prune removes ended-and-old and file-gone sessions, keeps open-and-live an
     const gone = path.join(dir, ".lavish", "gone.html");
     const stateFile = await writeStore(dir, [
       sessionRecord(endedOld, "ended", OLD),
-      sessionRecord(openOld, "open", OLD),
+      sessionRecord(openOld, "open", OLD, USER_REPLY),
       sessionRecord(endedRecent, "ended", RECENT),
       sessionRecord(gone, "open", RECENT),
     ]);
@@ -117,7 +240,7 @@ test("prune removes ended-and-old and file-gone sessions, keeps open-and-live an
     assert.deepEqual(
       remaining.map((session) => session.file).sort(),
       [openOld, endedRecent].sort(),
-      "open-and-live and ended-but-recent survive",
+      "open-with-a-reply and ended-but-recent survive",
     );
     assert.ok(await exists(openOld), "an open session's artifact is never deleted");
   } finally {
@@ -135,7 +258,7 @@ test("artifact sweep removes stale .lavish html except what an open session stil
     const exportOld = await writeArtifact(dir, "orphan-old.export.html", OLD);
     const imageOld = await writeArtifact(dir, "screenshot.png", OLD);
     const stateFile = await writeStore(dir, [
-      sessionRecord(openOld, "open", OLD),
+      sessionRecord(openOld, "open", OLD, USER_REPLY),
       sessionRecord(endedOld, "ended", OLD),
     ]);
 
@@ -225,7 +348,7 @@ test("default sweep covers every .lavish directory the store has a session in an
     const untouched = await writeArtifact(unreferenced, "orphan-old.html", OLD);
     const stateFile = await writeStore(projectA, [
       sessionRecord(endedA, "ended", OLD),
-      sessionRecord(liveB, "open", OLD),
+      sessionRecord(liveB, "open", OLD, USER_REPLY),
     ]);
 
     const result = await prune({ store: new SessionStore(stateFile), maxAgeMs: 30 * DAY_MS, now: () => NOW });
@@ -282,7 +405,7 @@ test("server start prunes across every known .lavish directory and logs a summar
     const openLive = await writeArtifact(dir, "open-live.html", OLD);
     const stateFile = await writeStore(dir, [
       sessionRecord(endedOld, "ended", OLD),
-      sessionRecord(openLive, "open", OLD),
+      sessionRecord(openLive, "open", OLD, USER_REPLY),
     ]);
     const lines = [];
     const server = await serve({
@@ -389,5 +512,61 @@ test("prune command sweeps store-wide by default, narrows with --cwd, and reject
     assert.match(`${bad.stdout}${bad.stderr}`, /VALIDATION_ERROR/);
   } finally {
     await Promise.all([dir, other].map((d) => rm(d, { recursive: true, force: true })));
+  }
+});
+
+test("prune command takes the open-session windows from flags, then env, then defaults", async () => {
+  const dir = await makeTemp();
+  const stateDir = path.join(dir, "state");
+  await mkdir(stateDir);
+  try {
+    const unreplied = await writeArtifact(dir, "unreplied.html", new Date());
+    const replied = await writeArtifact(dir, "replied.html", new Date());
+    const now = Date.now();
+    const seed = () =>
+      writeStore(stateDir, [
+        sessionRecord(unreplied, "open", new Date(now - 5 * DAY_MS)),
+        sessionRecord(replied, "open", new Date(now - 20 * DAY_MS), USER_REPLY),
+      ]);
+    const baseEnv = {
+      ...process.env,
+      LAVISH_AXI_STATE_DIR: stateDir,
+      LAVISH_AXI_TELEMETRY: "0",
+      LAVISH_AXI_PRUNE_UNREPLIED_MAX_AGE: "",
+      LAVISH_AXI_PRUNE_OPEN_MAX_AGE: "",
+    };
+    const run = (args, env) =>
+      spawnSync(process.execPath, [BIN, "prune", "--dry-run", ...args], { encoding: "utf8", env, cwd: os.tmpdir() });
+
+    await seed();
+    const defaults = run([], baseEnv);
+    assert.equal(defaults.status, 0, defaults.stderr || defaults.stdout);
+    assert.match(defaults.stdout.trim(), /^Would remove 0 sessions/);
+
+    const viaEnv = run([], {
+      ...baseEnv,
+      LAVISH_AXI_PRUNE_UNREPLIED_MAX_AGE: "3d",
+      LAVISH_AXI_PRUNE_OPEN_MAX_AGE: "10d",
+    });
+    assert.equal(viaEnv.status, 0, viaEnv.stderr || viaEnv.stdout);
+    assert.match(viaEnv.stdout.trim(), /^Would remove 2 sessions/);
+
+    const viaFlags = run(["--unreplied-older-than", "3d", "--open-older-than=10d"], baseEnv);
+    assert.equal(viaFlags.status, 0, viaFlags.stderr || viaFlags.stdout);
+    assert.match(viaFlags.stdout.trim(), /^Would remove 2 sessions/);
+
+    const flagBeatsEnv = run(["--unreplied-older-than", "off", "--open-older-than", "0"], {
+      ...baseEnv,
+      LAVISH_AXI_PRUNE_UNREPLIED_MAX_AGE: "3d",
+      LAVISH_AXI_PRUNE_OPEN_MAX_AGE: "10d",
+    });
+    assert.equal(flagBeatsEnv.status, 0, flagBeatsEnv.stderr || flagBeatsEnv.stdout);
+    assert.match(flagBeatsEnv.stdout.trim(), /^Would remove 0 sessions/);
+
+    const bad = run(["--open-older-than", "soon"], baseEnv);
+    assert.notEqual(bad.status, 0);
+    assert.match(`${bad.stdout}${bad.stderr}`, /Invalid duration .*soon/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
