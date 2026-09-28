@@ -35,12 +35,15 @@ that next poll.
 3. Read the result. `session_ended: true` means the user is done - apply what came back, deliver
    any further updates in this conversation, and do not reopen. An empty result means the queue is
    empty _right now_, not that the user sent nothing; rule out a leased batch (below) before
-   reporting "no feedback". Do not open a long poll just to look.
+   reporting "no feedback". Do not open a long poll just to look. Once you have ruled that out and
+   this conversation will not poll again, run `npx -y lavish-axi end <html-file>` so the session does
+   not stay open for nobody.
 4. Apply the returned prompts exactly as the `/lavish` workflow describes. A `layout-warnings`
    prompt is an explicit repair request; apply every listed fix in one pass.
 5. If the session is still open and you want to carry on in the browser, reply with
    `npx -y lavish-axi poll <html-file> --agent-reply "<message>"` and follow the `/lavish` wake-path
-   rules from there. If the user is done, `npx -y lavish-axi end <html-file>`.
+   rules from there. If the user is done, or you will not poll again in this conversation, run
+   `npx -y lavish-axi end <html-file>`.
 
 ## When the queue is empty but the user says they sent feedback
 

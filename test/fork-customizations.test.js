@@ -659,6 +659,7 @@ test("fork: browser_disconnected poll output hands back without reopening or tou
   assert.match(output.next_step, /ask the user/i);
   assert.match(output.next_step, /safely leased/);
   assert.match(output.next_step, /`\/check-lavish`/);
+  assert.match(output.next_step, /run `lavish-axi end \/tmp\/report\.html` unless they do/);
   assert.doesNotMatch(output.next_step, /Run `lavish-axi \/tmp\/report\.html`/);
 });
 
@@ -668,10 +669,22 @@ test("fork: the browser_disconnected rule is a named wake-path rule rendered int
   assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /closed the review page/);
   assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /stop polling/i);
   assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /do not reopen it uninvited/);
+  assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /run `lavish-axi end <html-file>` unless they do/);
   assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /safely leased/);
   assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /`\/check-lavish`/);
   // The hand-back pair is untouched: the new rule is added beside it, not folded into it.
   assert.ok(cli.POLL_WAKE_PATH_RULES.includes(cli.POLL_HANDOFF_RULE));
   assert.ok(cli.POLL_WAKE_PATH_RULES.includes(cli.POLL_PICKUP_RULE));
   assert.ok(skill.createSkillMarkdown().includes("browser_disconnected"));
+});
+
+test("fork: both skills tell the agent when to end a session instead of leaving it open", () => {
+  const lavish = skill.createSkillMarkdown();
+  assert.match(lavish, /8\. Run `npx -y lavish-axi end <html-file>` at two moments\./);
+  assert.match(lavish, /feedback whose text says the user is done/);
+  assert.match(lavish, /will not start another poll in this conversation/);
+  assert.match(lavish, /after a `browser_disconnected` poll result, unless the user asks to reopen/);
+  assert.doesNotMatch(lavish, /when the review is finished/);
+  const check = skill.createCheckSkillMarkdown();
+  assert.match(check, /this conversation will not poll again, run `npx -y lavish-axi end <html-file>`/);
 });

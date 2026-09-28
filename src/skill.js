@@ -162,7 +162,7 @@ ${POLL_WAKE_PATH_RULES.map((rule) => `   ${skillCommandText(rule)}`).join("\n")}
 5. Apply human feedback, then poll again with \`--agent-reply "<message>"\` to reply in the browser and keep the loop going under the same foreground-or-verified-wake-path rule.
 6. If a poll is reaped before the user sends anything, hand the review back rather than looping. One line is enough: you have stopped listening, anything already sent is safely queued, and \`/check-lavish\` will collect it. Do not re-enter the poll silently - see the wake-path rules in step 3 for why an unbounded loop is the wrong default.
 7. \`/check-lavish\` (collect feedback later): poll this review's artifact directly with \`${invocation} poll <html-file> --timeout-ms 0\` - that returns immediately instead of waiting, and it works after the user has ended the session, which drops the session from the no-argument list. Apply the prompts exactly as in step 4. If nothing comes back, say so and stop; do not open a long poll just to look.
-8. Run \`${invocation} end <html-file>\` when the review is finished.
+8. Run \`${invocation} end <html-file>\` at two moments. After applying feedback whose text says the user is done (for example "looks good", "ship it", "thanks"), or when you will not start another poll in this conversation. And after a \`browser_disconnected\` poll result, unless the user asks to reopen. An open session nobody polls again is never cleaned up by the browser, so ending it is the agent's job.
 9. ${POLL_SEND_AND_END_RULE} Deliver any remaining updates directly in this conversation.
 
 ## Visual guidance
@@ -236,12 +236,15 @@ that next poll.
 3. Read the result. \`session_ended: true\` means the user is done - apply what came back, deliver
    any further updates in this conversation, and do not reopen. An empty result means the queue is
    empty _right now_, not that the user sent nothing; rule out a leased batch (below) before
-   reporting "no feedback". Do not open a long poll just to look.
+   reporting "no feedback". Do not open a long poll just to look. Once you have ruled that out and
+   this conversation will not poll again, run \`${invocation} end <html-file>\` so the session does
+   not stay open for nobody.
 4. Apply the returned prompts exactly as the \`/lavish\` workflow describes. A \`layout-warnings\`
    prompt is an explicit repair request; apply every listed fix in one pass.
 5. If the session is still open and you want to carry on in the browser, reply with
    \`${invocation} poll <html-file> --agent-reply "<message>"\` and follow the \`/lavish\` wake-path
-   rules from there. If the user is done, \`${invocation} end <html-file>\`.
+   rules from there. If the user is done, or you will not poll again in this conversation, run
+   \`${invocation} end <html-file>\`.
 
 ## When the queue is empty but the user says they sent feedback
 
