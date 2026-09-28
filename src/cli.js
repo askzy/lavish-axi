@@ -26,7 +26,17 @@ import {
 } from "./export-bundle.js";
 import { clientHost, defaultPort, ensureStateDir, hostForUrl, serverLogFile, stateFile } from "./paths.js";
 import { findPlaybook, listPlaybooks, playbookIds, PLAYBOOK_ROUTER_HELP } from "./playbooks.js";
-import { ARTIFACT_DIR_NAME, DEFAULT_PRUNE_MAX_AGE, formatPruneSummary, parseDuration, prune } from "./prune.js";
+import {
+  ARTIFACT_DIR_NAME,
+  DEFAULT_PRUNE_MAX_AGE,
+  DEFAULT_PRUNE_OPEN_MAX_AGE,
+  DEFAULT_PRUNE_UNREPLIED_MAX_AGE,
+  formatPruneSummary,
+  parseDuration,
+  prune,
+  resolvePruneOpenMaxAgeMs,
+  resolvePruneUnrepliedMaxAgeMs,
+} from "./prune.js";
 import { resolveDesignAssetPath, serve } from "./server.js";
 import { canonicalFile, canonicalSessionFile, sessionKey, SessionStore } from "./session-store.js";
 import { initDefaultTelemetry } from "./telemetry.js";
@@ -769,11 +779,15 @@ async function serverCommand(args) {
 async function pruneCommand(args) {
   const olderThan = flagValue(args, "--older-than") || DEFAULT_PRUNE_MAX_AGE;
   let maxAgeMs;
+  let unrepliedMaxAgeMs;
+  let openMaxAgeMs;
   try {
     maxAgeMs = parseDuration(olderThan);
+    unrepliedMaxAgeMs = pruneWindow(flagValue(args, "--unreplied-older-than"), resolvePruneUnrepliedMaxAgeMs);
+    openMaxAgeMs = pruneWindow(flagValue(args, "--open-older-than"), resolvePruneOpenMaxAgeMs);
   } catch (error) {
     throw new AxiError(error instanceof Error ? error.message : String(error), "VALIDATION_ERROR", [
-      "Run `lavish-axi prune --older-than 30d` (units: d, h, m)",
+      `Run \`lavish-axi prune --older-than ${DEFAULT_PRUNE_MAX_AGE} --unreplied-older-than ${DEFAULT_PRUNE_UNREPLIED_MAX_AGE} --open-older-than ${DEFAULT_PRUNE_OPEN_MAX_AGE}\` (units: d, h, m; 0 or off disables a window)`,
     ]);
   }
   const cwd = flagValue(args, "--cwd");
@@ -781,9 +795,18 @@ async function pruneCommand(args) {
     store: new SessionStore(stateFile()),
     artifactDirs: cwd ? [path.join(path.resolve(cwd), ARTIFACT_DIR_NAME)] : undefined,
     maxAgeMs,
+    unrepliedMaxAgeMs,
+    openMaxAgeMs,
     dryRun: args.includes("--dry-run"),
   });
   return formatPruneSummary(result);
+}
+
+// A flag beats the environment, and both accept `0` or `off` to switch that window off.
+function pruneWindow(flag, resolveFromEnv) {
+  if (flag === null) return resolveFromEnv();
+  if (flag === "0" || flag.toLowerCase() === "off") return null;
+  return parseDuration(flag);
 }
 
 async function visibleSessions() {
@@ -1153,7 +1176,7 @@ export function getCommandHelp(command) {
 // last three syncs each paid. The bodies stay the fork's de-branded text: no ht-ml.app, no
 // `lavish-axi share` or `setup hooks` in the usage block, and disabled notices for both commands.
 function createTopLevelHelp() {
-  return `lavish-axi - Lavish Editor AXI (askzy fork: share + setup hooks disabled)\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--agent-reply "..."]\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi stop\n  lavish-axi prune [--older-than 30d] [--dry-run] [--cwd <dir>]\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback, ends the session, or closes the review page, staying silent while it waits - never kill it. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance()} ${POLL_SEND_AND_END_RULE}\n\n`;
+  return `lavish-axi - Lavish Editor AXI (askzy fork: share + setup hooks disabled)\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--agent-reply "..."]\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi stop\n  lavish-axi prune [--older-than 30d] [--unreplied-older-than 14d] [--open-older-than 60d] [--dry-run] [--cwd <dir>]\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback, ends the session, or closes the review page, staying silent while it waits - never kill it. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance()} ${POLL_SEND_AND_END_RULE}\n\n`;
 }
 
 function createCommandHelp() {
@@ -1164,7 +1187,7 @@ function createCommandHelp() {
     export: `Usage: lavish-axi export <html-file> [--out <path>]\n\nWrite a portable copy of an artifact: one HTML file with its LOCAL assets inlined (relative-path stylesheets, scripts, images, and fonts become inline <style>/<script> blocks and data URIs). Remote CDN/font references (https URLs) are left as links for the browser to load, so the file needs network to render those. Lavish makes no outbound requests - it only reads local files, confined to the artifact's directory. Defaults to writing <name>.export.html next to the source; pass --out to choose a path. The Lavish annotation SDK is never included in an export.\n`,
     share: `The \`share\` command is disabled in this fork (askzy/lavish-axi). Use \`lavish-axi export\` for a portable local file instead.\n`,
     stop: `Usage: lavish-axi stop [--port <port>]\n\nShut down the background Lavish Editor server. The server also stops itself when no browser or poll has been connected for a while (LAVISH_AXI_IDLE_TIMEOUT_MS, default 30m) and immediately when the last session ends with nothing connected.\n`,
-    prune: `Usage: lavish-axi prune [--older-than <duration>] [--dry-run] [--cwd <dir>]\n\nRemove stale review state. Sessions go when they are ended and last updated before the cutoff, or when their artifact file no longer exists; an open session with a live file is kept whatever its age. Then \`.lavish/*.html\` files older than the cutoff are deleted from every .lavish/ directory the store has a session in, except files an open session still points at. --cwd <dir> narrows that sweep to <dir>/.lavish/ alone; sessions are still pruned store-wide. The cutoff defaults to 30d and accepts d, h, or m units. --dry-run prints the same summary and changes nothing.\n\nThe server runs this same store-wide prune once with the default cutoff each time it starts. LAVISH_AXI_PRUNE_MAX_AGE overrides that cutoff; 0 or off disables it.\n`,
+    prune: `Usage: lavish-axi prune [--older-than <duration>] [--unreplied-older-than <duration>] [--open-older-than <duration>] [--dry-run] [--cwd <dir>]\n\nRemove stale review state. Sessions go when they are ended and last updated before the cutoff, when their artifact file no longer exists, when they are open with no message from the user in the chat and last updated more than --unreplied-older-than ago (default 14d), or when they are open and last updated more than --open-older-than ago (default 60d). An open session with queued or unacknowledged feedback is kept whatever its age. Then \`.lavish/*.html\` files older than the cutoff are deleted from every .lavish/ directory the store has a session in, except files an open session still points at. --cwd <dir> narrows that sweep to <dir>/.lavish/ alone; sessions are still pruned store-wide. The cutoff defaults to 30d; every duration accepts d, h, or m units, and the two open-session windows accept 0 or off to disable them. --dry-run prints the same summary and changes nothing.\n\nThe server runs this same store-wide prune once with the default cutoffs each time it starts. LAVISH_AXI_PRUNE_MAX_AGE overrides the cutoff; 0 or off disables the prune. LAVISH_AXI_PRUNE_UNREPLIED_MAX_AGE and LAVISH_AXI_PRUNE_OPEN_MAX_AGE override the two open-session windows the same way.\n`,
     playbook: `Usage: lavish-axi playbook [playbook_id]\n\nList focused artifact guidance playbooks, or show one playbook by ID. Known IDs: diagram, table, comparison, plan, code, input, slides.\n\n${PLAYBOOK_ROUTER_HELP}\n\nExamples:\n  lavish-axi playbook\n  lavish-axi playbook diagram\n  lavish-axi playbook input\n`,
     design: `Usage: lavish-axi design\n\nShow a copy-pasteable CDN snippet for Tailwind CSS browser runtime v4 + DaisyUI v5 + themes, Mermaid diagram tooling, a content-to-playbook router, an optional layout safety CSS snippet, plus technical reference for DaisyUI components. ${PLAYBOOK_ROUTER_HELP} Lavish artifacts stay portable HTML. This CDN snippet is the design fallback, not the default: inspect the subject project before falling back, and paste the layout safety CSS only when useful for dense nested grid/flex layouts, badges, wide fonts, or local media. ${DESIGN_PRIORITY_RULE}\n`,
     setup: `The \`setup hooks\` command is disabled in this fork (askzy/lavish-axi). Wire up any lavish-axi ambient context manually in your agent settings if desired.\n`,

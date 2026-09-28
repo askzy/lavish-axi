@@ -4,6 +4,11 @@ import path from "node:path";
 /** @typedef {import("./session-store.js").SessionStore} SessionStore */
 
 export const DEFAULT_PRUNE_MAX_AGE = "30d";
+// An open session nobody ever wrote back to is a page the user read and closed: the poll only
+// learns `browser_disconnected` and leaves the session open. Two windows catch those and the
+// rest: a short one for sessions with no user message, a long one for any open session.
+export const DEFAULT_PRUNE_UNREPLIED_MAX_AGE = "14d";
+export const DEFAULT_PRUNE_OPEN_MAX_AGE = "60d";
 export const ARTIFACT_DIR_NAME = ".lavish";
 
 const DURATION_UNIT_MS = { d: 24 * 60 * 60_000, h: 60 * 60_000, m: 60_000 };
@@ -21,17 +26,34 @@ export function parseDuration(text) {
 // LAVISH_AXI_PRUNE_MAX_AGE controls the prune the server runs at start. Unset means the default
 // cutoff; `0` or `off` disables it. Returns the cutoff age in milliseconds, or null when disabled.
 export function resolvePruneMaxAgeMs(env = process.env) {
-  const raw = env.LAVISH_AXI_PRUNE_MAX_AGE?.trim();
-  if (raw === undefined || raw === "") return parseDuration(DEFAULT_PRUNE_MAX_AGE);
+  return resolveDurationMs(env.LAVISH_AXI_PRUNE_MAX_AGE, DEFAULT_PRUNE_MAX_AGE);
+}
+
+// The two open-session windows follow the same rules as LAVISH_AXI_PRUNE_MAX_AGE, each under its
+// own variable, so either can be tuned or switched off without touching the other.
+export function resolvePruneUnrepliedMaxAgeMs(env = process.env) {
+  return resolveDurationMs(env.LAVISH_AXI_PRUNE_UNREPLIED_MAX_AGE, DEFAULT_PRUNE_UNREPLIED_MAX_AGE);
+}
+
+export function resolvePruneOpenMaxAgeMs(env = process.env) {
+  return resolveDurationMs(env.LAVISH_AXI_PRUNE_OPEN_MAX_AGE, DEFAULT_PRUNE_OPEN_MAX_AGE);
+}
+
+function resolveDurationMs(value, fallback) {
+  const raw = value?.trim();
+  if (raw === undefined || raw === "") return parseDuration(fallback);
   if (raw === "0" || raw.toLowerCase() === "off") return null;
   return parseDuration(raw);
 }
 
 /**
- * Remove stale review state. A session goes when its artifact file no longer exists, or when it
- * is ended and its last update is older than the cutoff. An open session with a live file stays
- * whatever its age. Then every `.html` file directly inside each artifact directory that is older
- * than the cutoff is deleted, unless a session that is still open points at it.
+ * Remove stale review state. A session goes when its artifact file no longer exists, when it is
+ * ended and its last update is older than the cutoff, or when it is open and its last update is
+ * older than `openMaxAgeMs`, or older than `unrepliedMaxAgeMs` while the user never wrote in its
+ * chat. An open session holding undelivered or unacknowledged feedback is kept whatever its age.
+ * Then every `.html` file directly inside each artifact directory that is older than the cutoff is
+ * deleted, unless a session that is still open points at it; the file of an open session removed
+ * here is swept by that same cutoff.
  *
  * Without `artifactDirs` the sweep covers every `.lavish/` directory the store has a session in,
  * resolved before any session is removed so a directory whose last session goes is still swept.
@@ -44,11 +66,24 @@ export function resolvePruneMaxAgeMs(env = process.env) {
  * @param {SessionStore} options.store
  * @param {string[]} [options.artifactDirs] directories to sweep instead of the store-wide set
  * @param {number} options.maxAgeMs
+ * @param {number | null} [options.unrepliedMaxAgeMs] null disables the unreplied rule
+ * @param {number | null} [options.openMaxAgeMs] null disables the open-age rule
  * @param {boolean} [options.dryRun]
  * @param {() => number} [options.now]
  */
-export async function prune({ store, artifactDirs, maxAgeMs, dryRun = false, now = () => Date.now() }) {
-  const cutoff = now() - maxAgeMs;
+export async function prune({
+  store,
+  artifactDirs,
+  maxAgeMs,
+  unrepliedMaxAgeMs = parseDuration(DEFAULT_PRUNE_UNREPLIED_MAX_AGE),
+  openMaxAgeMs = parseDuration(DEFAULT_PRUNE_OPEN_MAX_AGE),
+  dryRun = false,
+  now = () => Date.now(),
+}) {
+  const current = now();
+  const cutoff = current - maxAgeMs;
+  const unrepliedCutoff = unrepliedMaxAgeMs === null ? null : current - unrepliedMaxAgeMs;
+  const openCutoff = openMaxAgeMs === null ? null : current - openMaxAgeMs;
   const sweepDirs = artifactDirs ?? (await knownArtifactDirs(store));
   const {
     removed: removedSessions,
@@ -57,7 +92,11 @@ export async function prune({ store, artifactDirs, maxAgeMs, dryRun = false, now
   } = await store.removeSessions(
     async (session) => {
       if (!(await pathExists(session.file))) return true;
-      return session.status === "ended" && timestampMs(session.updated_at) < cutoff;
+      const updatedAt = timestampMs(session.updated_at);
+      if (session.status === "ended") return updatedAt < cutoff;
+      if (hasPendingFeedback(session)) return false;
+      if (openCutoff !== null && updatedAt < openCutoff) return true;
+      return unrepliedCutoff !== null && !hasUserMessage(session) && updatedAt < unrepliedCutoff;
     },
     { dryRun },
   );
@@ -82,6 +121,21 @@ export async function prune({ store, artifactDirs, maxAgeMs, dryRun = false, now
     removedSessions: removedSessions.map((session) => session.file),
     removedFiles,
   };
+}
+
+// Queued prompts wait for the next poll; a lease, live or expired, holds a batch a poll took but
+// never acknowledged, which is redelivered rather than dropped. Either is work an agent still owes.
+function hasPendingFeedback(session) {
+  return (
+    session.status === "feedback" ||
+    (session.pending_prompts || 0) > 0 ||
+    (session.prompts || []).length > 0 ||
+    (session.leases || []).length > 0
+  );
+}
+
+function hasUserMessage(session) {
+  return (session.chat || []).some((message) => message?.role === "user");
 }
 
 // The artifact directories the store knows about: every `.lavish/` that holds a recorded session.
