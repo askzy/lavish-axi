@@ -31,10 +31,10 @@ HTML is the new markdown. Lavish is the new editor for your HTML artifacts.
 Agents are good at producing rich HTML artifacts, but the human-agent collaboration loop on such artifacts is lacking and falls back into screenshots and long responses for “tell me what to change.”
 That loses the thing HTML is best at: interactivity.
 
-Lavish Editor opens agent-generated HTML files in a local browser, lets you pinpoint elements, selected text, or Mermaid diagram nodes and send feedback to the agent to address.
+Lavish Editor opens agent-generated HTML files in a local browser, lets you pinpoint elements and selected text, edit diagrams your agent authored as Mermaid whiteboards, and send feedback to the agent to address.
 
 - **Local-first** - Review local HTML artifacts with a local CLI and no cloud dependency in the core feedback loop.
-- **Human-AI collaboration** - Annotate elements, selected text ranges, and Mermaid diagram nodes, and send messages to the agent without leaving Lavish Editor.
+- **Human-AI collaboration** - Annotate elements and selected text ranges, edit Mermaid whiteboard diagrams, and send messages to the agent without leaving Lavish Editor.
 - **Battery included** - Lavish Editor teaches your agent good visualization for common use cases such as product or technical plans, design explorations and more out of the box.
 
 Lavish Editor is an [AXI](https://axi.md), which means -
@@ -149,7 +149,7 @@ To put the `lavish-axi` binary on your `PATH` (for a session hook, for example),
 - **Portable artifacts** - The artifact runs in a sandboxed iframe while Lavish injects a small SDK for annotations, snapshots, feedback controls, and render-time layout checks.
   Author-defined links and popups can open in top-level tabs, while artifact documents remain sandboxed without same-origin access.
   Lavish does not inject any design system, so the saved HTML file renders identically whether you open it through `lavish-axi` or directly in a browser.
-  Run `lavish-axi design` for the single source of agent-facing design guidance, including optional CDN snippets and the Mermaid opt-in snippet.
+  Run `lavish-axi design` for the single source of agent-facing design guidance, including optional CDN snippets and the whiteboard (Mermaid) opt-in snippet.
 - **Open-time layout gate** - The browser chrome masks an artifact only while the real in-iframe audit waits for fonts and final geometry.
   The first completed client-side check reveals the artifact, whatever it found and even if reporting that check to the server fails; the gate never holds the review hostage waiting for a repair or a network round-trip.
   The user can click **Show anyway**, and a bounded safety timeout fails open from every gate state.
@@ -193,7 +193,15 @@ To put the `lavish-axi` binary on your `PATH` (for a session hook, for example),
   Clicking an element inside a table also carries the cell's visible row and column names alongside the exact CSS locator, so filtered or sorted rows do not make feedback look misdirected.
   When merged cells make either name ambiguous, Lavish leaves that name out rather than guessing; an explicit `<th scope="row">` remains authoritative even when a `rowspan` makes the row's position ambiguous.
   The CSS locator still points at the exact element you clicked, so an annotation with an omitted name is only less descriptive, never mislabelled.
-- **Mermaid diagrams** - Rendered Mermaid diagrams become pannable and zoomable while you explore (drag to pan, scroll to zoom) and freeze when you turn on annotation so a click lands on a single node. Clicking a node annotates the whole node and sends the agent its diagram id, node id, and rendered label instead of just a CSS selector. Lavish only enhances the live render, so the saved HTML still opens identically anywhere.
+- **Mermaid diagrams** - Whiteboards are an opt-in: agents author a diagram as Mermaid only when you ask for an editable whiteboard, and hand-authored inline SVG illustrations are the default figure medium otherwise.
+  In the Lavish browser, every rendered Mermaid diagram in a `.mermaid` container becomes an embedded editable Excalidraw whiteboard.
+  Click a diagram to unlock editing, and use its Fullscreen action to edit it over the whole viewport.
+  Whiteboard scenes autosave locally.
+  If a live reload changes the Mermaid source, an unmodified whiteboard silently re-converts to the new diagram. If the reviewer had edited the scene, reopening it lets them re-convert and discard the saved edits or keep editing the saved scene.
+  Use **Queue feedback** to add a bounded edit summary plus local `.excalidraw` scene and PNG preview paths to the Conversation panel, then click **Send to Agent** to deliver it.
+  The agent updates the artifact's Mermaid source, which remains authoritative.
+  Flowchart, sequence, class, ER, and state diagrams convert to editable shapes; other diagram types are images that reviewers can draw and annotate.
+  Lavish changes only the browser view, so saved, standalone, and exported artifacts still render plain Mermaid.
 - **Server cleanup** - The detached server stops after the last session ends when nothing is connected, or after `LAVISH_AXI_IDLE_TIMEOUT_MS` (default 30 minutes) with no browser or poll connections.
   Set `LAVISH_AXI_IDLE_TIMEOUT_MS=0` or `off` to disable idle self-shutdown.
 - **Server upgrades** - One background server serves every session, so upgrading `lavish-axi` while reviews are open makes the next `lavish-axi <html-file>` replace that server. Only the review page for the artifact being opened reloads itself once the replacement answers - and not even that one while you have unsent annotation text open, which gets a banner instead so the reload is yours to make. Every other open review page keeps working and shows a banner saying what happened (updated, restarted for a local build, or stopped) with **Check and reload** and **Dismiss** buttons, so no page you are reading reloads on its own.
@@ -225,13 +233,13 @@ To put the `lavish-axi` binary on your `PATH` (for a session hook, for example),
 | `lavish-axi stop`               | Shut down the background server.                                                                                                                                                                                                                                                                                                                                                                                   |
 | `lavish-axi prune`              | Remove ended sessions older than the cutoff (default 30 days), open sessions nobody replied to after 14 days or any open session after 60 days, sessions whose artifact file is gone, and stale `.lavish/*.html` files in every `.lavish/` directory the store has a session in. Open sessions with pending feedback are always kept. Prints one summary line. The server runs the same prune each time it starts. |
 | `lavish-axi playbook [id]`      | List focused artifact guidance or show one playbook; agents must open each matching playbook before writing HTML.                                                                                                                                                                                                                                                                                                  |
-| `lavish-axi design`             | Show agent-facing design guidance, including optional CDN snippets and the Mermaid opt-in snippet.                                                                                                                                                                                                                                                                                                                 |
+| `lavish-axi design`             | Show agent-facing design guidance, including optional CDN snippets and the whiteboard (Mermaid) opt-in snippet.                                                                                                                                                                                                                                                                                                    |
 | `lavish-axi setup hooks`        | **Disabled in this fork.** Rejects with a validation error instead of writing agent hooks; add the `SessionStart` hook by hand (see [Session hook](#session-hook)).                                                                                                                                                                                                                                                |
 | `lavish-axi server`             | Run the local Lavish Editor server.                                                                                                                                                                                                                                                                                                                                                                                |
 
 Known playbook IDs: `diagram`, `table`, `comparison`, `plan`, `code`, `input`, `explanation`, `slides`.
 One artifact often combines several playbooks, such as a plan that includes a comparison and a diagram, so agents must match against each `use_when` trigger and open every matching playbook before writing HTML.
-Figures are hand-authored inline SVG by default; open the diagram playbook before drawing. Mermaid is the opt-in for when you ask for a Mermaid diagram.
+Figures are hand-authored inline SVG by default; open the diagram playbook before drawing. Mermaid is the opt-in for when you ask for an editable whiteboard.
 
 ### Flags
 
