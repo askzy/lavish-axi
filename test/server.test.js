@@ -35,7 +35,7 @@ import {
   resolveWatchTarget,
   serve,
 } from "../src/server.js";
-import { canonicalFile, sessionKey } from "../src/session-store.js";
+import { canonicalFile, SessionStore, sessionKey } from "../src/session-store.js";
 
 async function chromeClientSource() {
   return readFile(new URL("../src/chrome-client.js", import.meta.url), "utf8");
@@ -4481,6 +4481,8 @@ test("send-and-end prompt submissions wake active polls with ended attribution",
       assert.equal(feedback.session_ended, true);
       assert.equal(feedback.ended_by, "user");
       assert.equal(feedback.prompts.length, 1);
+      assert.equal(await presence.next(), "working");
+      assert.equal(await presence.next(), "waiting");
 
       const ended = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
       const endedBody = await ended.json();
@@ -5813,6 +5815,606 @@ test("the live transcript carries rendered html for agent replies and never for 
     assert.match(page, /"html":"\\u003cp\\u003eDone\.\\u003c\/p\\u003e\\u003cul\\u003e/);
   } finally {
     await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Exclusive poll listeners (upstream #358), adapted to the fork's lease model.
+test("exclusive listener ownership rejects a loser and reports a takeover", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const stateFile = path.join(dir, "state.json");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile, version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const poll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-7`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const health = await fetch(`${base}/health`).then((response) => response.json());
+    assert.deepEqual(
+      health.listeners.map((listener) => listener.label),
+      ["worker-7"],
+    );
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.equal("listener" in state.sessions[key], false);
+    const refused = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-8`);
+    assert.equal(refused.status, 409);
+    const refusedBody = await refused.json();
+    assert.equal(refusedBody.code, "LISTENER_ACTIVE");
+    assert.equal(refusedBody.holder.label, "worker-7");
+    assert.equal(typeof refusedBody.holder.age_ms, "number");
+
+    const rejectedGet = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-8&takeover=1`);
+    assert.equal(rejectedGet.status, 405);
+    assert.deepEqual(await rejectedGet.json(), { error: "poll takeover requires POST" });
+    const stillHeld = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-9`);
+    assert.equal((await stillHeld.json()).holder.label, "worker-7");
+
+    const takeover = new AbortController();
+    const replacement = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-8&takeover=1`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+      signal: takeover.signal,
+    }).catch((error) => error);
+    const first = await poll;
+    const replaced = await first.json();
+    assert.equal(replaced.code, "LISTENER_REPLACED");
+    assert.equal(replaced.holder.label, "worker-7");
+    const afterTakeover = await fetch(`${base}/health`).then((response) => response.json());
+    assert.deepEqual(
+      afterTakeover.listeners.map((listener) => listener.label),
+      ["worker-8"],
+    );
+    takeover.abort();
+    await replacement;
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("owner-labeled listeners publish external presence instead of an idle user turn", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const stream = await startEventStream(base, key, "agent-presence");
+    try {
+      assert.deepEqual(await stream.next(), { state: "waiting" });
+      const controller = new AbortController();
+      const poll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-7`, {
+        signal: controller.signal,
+      }).catch((error) => error);
+      assert.deepEqual(await stream.next(), { state: "listening", mode: "external-listener" });
+      // A reconnecting chrome learns the mode from the handshake snapshot as well.
+      const late = await startEventStream(base, key, "agent-presence");
+      try {
+        assert.deepEqual(await late.next(), { state: "listening", mode: "external-listener" });
+      } finally {
+        await late.close();
+      }
+      controller.abort();
+      await poll;
+    } finally {
+      await stream.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("bare polls have a visible agent listener identity and none is reserved", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const controller = new AbortController();
+    const poll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`, { signal: controller.signal }).catch(
+      (error) => error,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const health = await fetch(`${base}/health`).then((response) => response.json());
+    assert.equal(health.listeners.find((listener) => listener.key === key).label, "agent-listener");
+    const conflict = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-8`);
+    assert.equal((await conflict.json()).holder.label, "agent-listener");
+    const reserved = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=none&timeoutMs=0`);
+    assert.equal(reserved.status, 400);
+    assert.equal((await reserved.json()).code, "VALIDATION_ERROR");
+    controller.abort();
+    await poll;
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a refused reply poll does not publish its reply before takeover", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const stateFile = path.join(dir, "state.json");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile, version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const firstController = new AbortController();
+    const firstPoll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-7`, {
+      signal: firstController.signal,
+    }).catch((error) => error);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const refused = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-8`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agent_reply: "must not publish" }),
+    });
+    assert.equal(refused.status, 409);
+    const stateAfterRefusal = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.equal(
+      stateAfterRefusal.sessions[key].chat?.some((entry) => entry.role === "agent"),
+      false,
+    );
+
+    const takeover = await fetch(
+      `${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-8&takeover=1&timeoutMs=1`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agent_reply: "published once" }),
+      },
+    );
+    assert.deepEqual(await takeover.json(), { status: "waiting" });
+    const replaced = await (await firstPoll).json();
+    assert.equal(replaced.code, "LISTENER_REPLACED");
+    const stateAfterTakeover = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.deepEqual(
+      stateAfterTakeover.sessions[key].chat.filter((entry) => entry.role === "agent").map((entry) => entry.text),
+      ["published once"],
+    );
+    firstController.abort();
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a zero-timeout drain is never refused, claims no listener, and cannot take over", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const presence = await startEventStream(base, key, "agent-presence");
+    try {
+      assert.deepEqual(await presence.next(), { state: "waiting" });
+      let settled = false;
+      const holder = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-7`)
+        .then((response) => response.json())
+        .finally(() => {
+          settled = true;
+        });
+      assert.deepEqual(await presence.next(), { state: "listening", mode: "external-listener" });
+
+      // The /check-lavish drain: answered, not refused, while worker-7 keeps the session.
+      const drained = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0&owner=other`);
+      assert.equal(drained.status, 200);
+      assert.deepEqual(await drained.json(), { status: "waiting" });
+      const health = await fetch(`${base}/health`).then((response) => response.json());
+      assert.deepEqual(
+        health.listeners.map((listener) => listener.label),
+        ["worker-7"],
+      );
+      assert.equal(settled, false, "the drain must not displace or wake the holder");
+
+      // Nothing to take over: a drain never listens.
+      const rejected = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0&takeover=1`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      assert.equal(rejected.status, 400);
+      assert.equal((await rejected.json()).code, "VALIDATION_ERROR");
+
+      // The holder still receives the next batch; the drain emitted no presence of its own, so
+      // the next presence event is the delivery.
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
+      });
+      const delivered = await holder;
+      assert.equal(delivered.status, "feedback");
+      assert.deepEqual(await presence.next(), { state: "working", mode: "agent-busy" });
+    } finally {
+      await presence.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a takeover racing an immediate batch releases the displaced poll's lease to the successor", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const stateFile = path.join(dir, "state.json");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  // A TTL far longer than the test: only releaseFeedback can hand the batch over in time.
+  const server = await serve({ port: 0, stateFile, version: "9.9.9-test", feedbackLeaseTtlMs: 60_000 });
+  const originalTakeFeedback = SessionStore.prototype.takeFeedback;
+  let releaseFirstTake = () => {};
+  const firstTakeReleased = new Promise((resolve) => {
+    releaseFirstTake = () => resolve();
+  });
+  let firstTakeDone;
+  const firstTakeLeased = new Promise((resolve) => {
+    firstTakeDone = resolve;
+  });
+  let gated = false;
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    // The first take that leases a batch is held after the lease is written and before the
+    // poll can act on it: the window in which a takeover lands.
+    SessionStore.prototype.takeFeedback = async function (sessionKey) {
+      const result = await originalTakeFeedback.call(this, sessionKey);
+      if (sessionKey === key && result.status === "feedback" && !gated) {
+        gated = true;
+        firstTakeDone();
+        await firstTakeReleased;
+      }
+      return result;
+    };
+
+    const first = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-7`).then((response) =>
+      response.json(),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ prompts: [{ prompt: "racing note", tag: "message" }] }),
+    });
+    await firstTakeLeased;
+
+    const successor = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-8&takeover=1`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    }).then((response) => response.json());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseFirstTake();
+
+    const replaced = await first;
+    assert.equal(replaced.code, "LISTENER_REPLACED");
+    const delivered = await Promise.race([
+      successor,
+      new Promise((resolve) => {
+        setTimeout(() => resolve({ status: "never-woken" }), 3000).unref?.();
+      }),
+    ]);
+    assert.equal(delivered.status, "feedback");
+    assert.deepEqual(
+      delivered.prompts.map((prompt) => prompt.prompt),
+      ["racing note"],
+    );
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.equal(state.sessions[key].leases.length, 1, "the released lease is replaced, not duplicated");
+    assert.equal(state.sessions[key].leases[0].delivery_id, delivered.delivery_id);
+  } finally {
+    releaseFirstTake();
+    SessionStore.prototype.takeFeedback = originalTakeFeedback;
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a reaped poll releases the listener when its socket drops", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+      // A raw socket stands in for a CLI process the harness killed: no abort, no close frame,
+      // just a connection that goes away.
+      const socket = await new Promise((resolve, reject) => {
+        const client = netConnect(server.port, "127.0.0.1", () => {
+          client.write(
+            `GET /api/poll?file=${encodeURIComponent(artifact)}&owner=reaped HTTP/1.1\r\nHost: 127.0.0.1:${server.port}\r\n\r\n`,
+            () => resolve(client),
+          );
+        });
+        client.on("error", reject);
+      });
+      assert.equal(await presence.next(), "listening");
+      const held = await fetch(`${base}/health`).then((response) => response.json());
+      assert.deepEqual(
+        held.listeners.map((listener) => listener.label),
+        ["reaped"],
+      );
+
+      socket.on("error", () => {});
+      socket.destroy();
+      assert.equal(await presence.next(), "waiting");
+      const released = await fetch(`${base}/health`).then((response) => response.json());
+      assert.deepEqual(released.listeners, []);
+
+      const next = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=1`);
+      assert.equal(next.status, 200, "a fresh poll after the reap is accepted, not LISTENER_ACTIVE");
+      assert.deepEqual(await next.json(), { status: "waiting" });
+    } finally {
+      await presence.close();
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a drain that leases while a poll waits arms that poll's lease timer through the lease event", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    feedbackLeaseTtlMs: 300,
+  });
+  const originalTakeFeedback = SessionStore.prototype.takeFeedback;
+  let releaseWokenTake = () => {};
+  const wokenTakeReleased = new Promise((resolve) => {
+    releaseWokenTake = () => resolve();
+  });
+  let wokenTakeStarted;
+  const wokenTakePending = new Promise((resolve) => {
+    wokenTakeStarted = resolve;
+  });
+  let takes = 0;
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const holder = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`).then((response) => response.json());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // The holder's event-driven take (the second take on this key) is held open; a drain slips
+    // in, leases the batch, and never acks. The held take then reports bare "waiting" - as if it
+    // had run before the drain's lease existed - so only the `lease` event can time the lease.
+    SessionStore.prototype.takeFeedback = async function (sessionKey) {
+      if (sessionKey !== key) return originalTakeFeedback.call(this, sessionKey);
+      takes += 1;
+      if (takes === 1) {
+        wokenTakeStarted();
+        await wokenTakeReleased;
+        return { status: "waiting" };
+      }
+      return originalTakeFeedback.call(this, sessionKey);
+    };
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ prompts: [{ prompt: "drained note", tag: "message" }] }),
+    });
+    await wokenTakePending;
+    const started = Date.now();
+    const drained = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then((response) =>
+      response.json(),
+    );
+    assert.equal(drained.status, "feedback");
+    releaseWokenTake();
+
+    const redelivered = await Promise.race([
+      holder,
+      new Promise((resolve) => {
+        setTimeout(() => resolve({ status: "never-woken" }), 2000).unref?.();
+      }),
+    ]);
+    assert.equal(redelivered.status, "feedback");
+    assert.deepEqual(
+      redelivered.prompts.map((prompt) => prompt.prompt),
+      ["drained note"],
+    );
+    assert.notEqual(redelivered.delivery_id, drained.delivery_id);
+    assert.ok(Date.now() - started >= 250, "woke at lease expiry, not immediately");
+  } finally {
+    releaseWokenTake();
+    SessionStore.prototype.takeFeedback = originalTakeFeedback;
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a waiting poll keeps waiting when its lease timer finds the lease acked", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    feedbackLeaseTtlMs: 200,
+  });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const post = (route, body) =>
+      fetch(`${base}/api/${key}/${route}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify(body),
+      });
+    await post("prompts", { prompts: [{ prompt: "first", tag: "message" }] });
+    const taken = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then((response) =>
+      response.json(),
+    );
+    assert.equal(taken.status, "feedback");
+
+    const holder = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`).then((response) => response.json());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal((await post("ack", { delivery_id: taken.delivery_id })).status, 200);
+    // Past the lease expiry the timer fires, finds nothing, and the poll stays open.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await post("prompts", { prompts: [{ prompt: "second", tag: "message" }] });
+    const delivered = await holder;
+    assert.equal(delivered.status, "feedback");
+    assert.deepEqual(
+      delivered.prompts.map((prompt) => prompt.prompt),
+      ["second"],
+    );
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("--takeover --agent-reply retires outstanding leases and --takeover alone does not", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  const stateFile = path.join(dir, "state.json");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile, version: "9.9.9-test", feedbackLeaseTtlMs: 60_000 });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ prompts: [{ prompt: "leased note", tag: "message" }] }),
+    });
+    const taken = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then((response) =>
+      response.json(),
+    );
+    assert.equal(taken.status, "feedback");
+    const leasesOnDisk = async () => JSON.parse(await readFile(stateFile, "utf8")).sessions[key].leases.length;
+    assert.equal(await leasesOnDisk(), 1);
+
+    const holder = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-7`).then((response) =>
+      response.json(),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const bareTakeover = await fetch(
+      `${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-8&takeover=1&timeoutMs=1`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) },
+    ).then((response) => response.json());
+    assert.equal(bareTakeover.status, "waiting");
+    assert.ok(bareTakeover.retry_after_ms > 0, "the successor sees the lease the displaced poll never held");
+    assert.equal((await holder).code, "LISTENER_REPLACED");
+    assert.equal(await leasesOnDisk(), 1, "--takeover alone touches no lease");
+
+    const replyTakeover = await fetch(
+      `${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-9&takeover=1&timeoutMs=1`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agent_reply: "applied everything" }),
+      },
+    ).then((response) => response.json());
+    assert.deepEqual(replyTakeover, { status: "waiting" });
+    assert.equal(await leasesOnDisk(), 0, "a reply retires every lease, takeover or not");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("releaseFeedback expires one lease now and leaves the others timed", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  try {
+    const store = new SessionStore(path.join(dir, "state.json"), { feedbackLeaseTtlMs: 60_000 });
+    const session = await store.upsertSession(artifact, "http://127.0.0.1:1/session/x");
+    const key = session.key;
+    await store.queuePrompts(key, { prompts: [{ prompt: "one", tag: "message" }] });
+    const first = await store.takeFeedback(key);
+    await store.queuePrompts(key, { prompts: [{ prompt: "two", tag: "message" }] });
+    const second = await store.takeFeedback(key);
+    assert.equal(first.status, "feedback");
+    assert.equal(second.status, "feedback");
+
+    assert.deepEqual((await store.releaseFeedback(key, "nope")).released, false);
+    assert.equal(await store.releaseFeedback("missing-key", first.delivery_id), null);
+    assert.equal((await store.releaseFeedback(key, first.delivery_id)).released, true);
+
+    const redelivered = await store.takeFeedback(key);
+    assert.equal(redelivered.status, "feedback");
+    assert.deepEqual(
+      redelivered.prompts.map((prompt) => prompt.prompt),
+      ["one"],
+    );
+    assert.notEqual(redelivered.delivery_id, first.delivery_id);
+    const stored = await store.findByKey(key);
+    assert.deepEqual(
+      stored.leases.map((lease) => lease.delivery_id).sort(),
+      [second.delivery_id, redelivered.delivery_id].sort(),
+    );
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });

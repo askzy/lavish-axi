@@ -716,3 +716,105 @@ test("fork: both skills tell the agent when to end a session instead of leaving 
   const check = skill.createCheckSkillMarkdown();
   assert.match(check, /this conversation will not poll again, run `npx -y lavish-axi end <html-file>`/);
 });
+
+// Exclusive poll listeners (upstream #358): the CLI side of the fork's adaptation.
+test("fork: poll rejects a takeover on a zero-timeout drain and a reserved or empty owner before touching the server", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "lavish-fork-poll-flags-"));
+  const artifact = path.join(dir, "report.html");
+  await writeFile(artifact, "<!doctype html><html><body><h1>Hi</h1></body></html>", "utf8");
+  try {
+    /** @type {[string[], RegExp][]} */
+    const cases = [
+      [[artifact, "--takeover", "--timeout-ms", "0"], /--takeover needs a waiting poll/],
+      [[artifact, "--owner", "none"], /--owner none is reserved/],
+      [[artifact, "--owner", ""], /--owner requires a non-empty label/],
+      [[artifact, "--owner"], /--owner requires a non-empty label/],
+    ];
+    for (const [args, message] of cases) {
+      await assert.rejects(
+        () => cli.pollCommand(args),
+        (error) => {
+          assert.ok(error instanceof AxiError, `expected an AxiError, got ${error}`);
+          assert.equal(error.code, "VALIDATION_ERROR");
+          assert.match(error.message, message);
+          return true;
+        },
+      );
+    }
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("fork: a LISTENER_ACTIVE refusal becomes a typed error that points at the drain, not at a retry", async () => {
+  const server = createServer((req, res) => {
+    res.writeHead(409, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        status: "error",
+        code: "LISTENER_ACTIVE",
+        error: "Lavish Editor already has an active poll listener",
+        holder: { label: "worker-7", age_ms: 1234 },
+      }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server did not bind to a TCP port");
+    await assert.rejects(
+      () => cli.fetchJson(`http://127.0.0.1:${address.port}/api/poll`),
+      (error) => {
+        assert.ok(error instanceof AxiError, `expected an AxiError, got ${error}`);
+        assert.equal(error.code, "LISTENER_ACTIVE");
+        assert.match(error.message, /current listener: worker-7; active for 1234ms/);
+        assert.deepEqual(/** @type {any} */ (error).holder, { label: "worker-7", age_ms: 1234 });
+        const steps = error.suggestions.join("\n");
+        assert.match(steps, /--timeout-ms 0/);
+        assert.match(steps, /--takeover/);
+        assert.doesNotMatch(steps, /re-run the last/i);
+        return true;
+      },
+    );
+  } finally {
+    await new Promise((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("fork: the home session listing carries the listener label and defaults to none", () => {
+  const home = cli.createHomeOutput({
+    bin: "lavish-axi",
+    sessions: [
+      {
+        file: "/tmp/a.html",
+        status: "open",
+        url: "http://127.0.0.1:4387/session/a",
+        pending_prompts: 1,
+        listener: "worker-7",
+      },
+      { file: "/tmp/b.html", status: "open", url: "http://127.0.0.1:4387/session/b" },
+    ],
+  });
+  assert.deepEqual(
+    home.sessions.map((session) => session.listener),
+    ["worker-7", "none"],
+  );
+});
+
+test("fork: both skills say how to handle LISTENER_ACTIVE and that the drain is never refused", () => {
+  const rule = cli.POLL_LISTENER_RULE;
+  assert.match(rule, /LISTENER_ACTIVE/);
+  assert.match(rule, /--timeout-ms 0/);
+  assert.match(rule, /never refused/);
+  assert.match(rule, /--takeover/);
+  assert.match(rule, /LISTENER_REPLACED/);
+
+  const lavish = skill.createSkillMarkdown();
+  const check = skill.createCheckSkillMarkdown();
+  const rendered = rule.replaceAll("`lavish-axi", `\`${skill.NPX_INVOCATION}`);
+  assert.ok(lavish.includes(rendered), "the /lavish skill renders the listener rule");
+  assert.ok(check.includes(rendered), "the /check-lavish skill renders the listener rule");
+  assert.match(check, /it is never refused: a drain claims no listener/);
+  assert.match(cli.getCommandHelp("poll"), /LISTENER_ACTIVE/);
+  assert.match(cli.getCommandHelp("poll"), /\[--owner <label>\] \[--takeover\]/);
+});
