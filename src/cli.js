@@ -102,7 +102,20 @@ export function pollExecutionGuidance() {
   return POLL_WAKE_PATH_RULES.join(" ");
 }
 
+// Mirrors the SDK's own version-flag detection so the fast path below prints exactly
+// what `runAxiCli` would have printed, for exactly the same argv shapes.
+export function isVersionOnlyArgv(argv) {
+  return argv.length === 1 && (argv[0] === "--version" || argv[0] === "-v" || argv[0] === "-V");
+}
+
 export async function run(argv) {
+  // `--version` sits on the agent-startup hot path (harnesses probe every tool's version
+  // at session start), so it must never pay for state-dir creation or the telemetry
+  // request drain in the `finally` below - that drain alone costs up to a full second.
+  if (isVersionOnlyArgv(argv)) {
+    process.stdout.write(`${VERSION}\n`);
+    return;
+  }
   await ensureStateDir();
   const normalizedArgv = normalizeArgv(argv);
   const isTopLevelHelp = argv.length === 1 && argv[0] === "--help";
