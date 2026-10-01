@@ -3678,6 +3678,13 @@ test("annotation card queues and sends immediately on Ctrl+Enter or Cmd+Enter", 
   assert.match(js, /\.lavish-annotation-card \.lavish-hint\{/);
 });
 
+test("annotation card closes on Escape only while empty and outside IME composition", () => {
+  const js = createSdkJs("abc");
+
+  assert.match(js, /event\.key === ["']Escape["'] && !event\.isComposing/);
+  assert.match(js, /if \(textarea\.value\.trim\(\)\) return;\s*event\.preventDefault\(\);\s*closeCard\(\);/);
+});
+
 test("chrome client chat input sends on Enter and inserts newline on Shift+Enter", async () => {
   const js = await chromeClientSource();
 
