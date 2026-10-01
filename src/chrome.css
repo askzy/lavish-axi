@@ -756,6 +756,22 @@ body.lavish {
   background: transparent;
   border-color: var(--border-subtle);
 }
+.bubble.note {
+  align-self: stretch;
+  max-width: 100%;
+  background: transparent;
+  border-color: var(--border-strong);
+  border-style: dashed;
+}
+.bubble.note .note-draft {
+  margin-top: 6px;
+  white-space: pre-wrap;
+  user-select: text;
+}
+.bubble.note .note-warning {
+  margin-top: 6px;
+  color: var(--danger);
+}
 .bubble.agent-working {
   display: flex;
   align-items: center;
@@ -832,6 +848,11 @@ body.lavish {
 }
 .handoff-takeover:hover {
   color: var(--fg);
+}
+.outdated-actions {
+  align-items: center;
+  display: flex;
+  gap: 10px;
 }
 .annotation-pills {
   display: flex;
@@ -1005,6 +1026,9 @@ body.lavish {
 }
 .ended-action {
   margin-top: var(--space-8);
+}
+.layout-gate-bypass {
+  margin-left: var(--space-4);
 }
 iframe {
   width: 100%;

@@ -35,6 +35,7 @@ import {
   resolveCopilotHookDir,
   resolveHookHomeDir,
   resolveServerEntry,
+  serverReplacementReason,
   shutdownServerOnPort,
   shouldForceRestartForLocalBuild,
   shouldKillProcessOnPort,
@@ -1488,6 +1489,80 @@ test("shouldRestartServer does not restart when /health was unreachable", () => 
   // null = fetch failed; the caller should fall through to startServer instead of trying
   // to POST /shutdown against nothing.
   assert.equal(shouldRestartServer("0.1.4", null), false);
+});
+
+// Every other open review page is told why its server went away, so the reason has to name the
+// branch that actually fired: a local-build force replaces a server of the same version, and
+// calling that an update is false on both counts.
+test("serverReplacementReason names a local-build force apart from a real version change", () => {
+  assert.equal(serverReplacementReason("0.1.4", { ok: true, app: "lavish-axi", version: "0.1.3" }), "upgrade");
+  assert.equal(serverReplacementReason("0.1.4", { ok: true, app: "lavish-axi" }), "upgrade");
+  assert.equal(
+    serverReplacementReason("0.1.4", { ok: true, app: "lavish-axi", version: "0.1.4" }, true),
+    "local-build",
+  );
+  assert.equal(
+    serverReplacementReason("0.1.4", { ok: true, app: "lavish-axi", version: "0.1.4", build: "old" }, true, "new"),
+    "local-build",
+  );
+  // A version difference is an upgrade even when the local-build force is also set.
+  assert.equal(serverReplacementReason("0.1.4", { ok: true, app: "lavish-axi", version: "0.1.3" }, true), "upgrade");
+});
+
+test("serverReplacementReason names nothing when no replacement is warranted", () => {
+  assert.equal(serverReplacementReason("0.1.4", { ok: true, app: "lavish-axi", version: "0.1.4" }), "");
+  // The fork's build-id guard: a forced restart against the same build is not a replacement.
+  assert.equal(
+    serverReplacementReason("0.1.4", { ok: true, app: "lavish-axi", version: "0.1.4", build: "same" }, true, "same"),
+    "",
+  );
+  assert.equal(serverReplacementReason("0.1.4", null), "");
+});
+
+// A stand-in for a running server of another version: it answers /health, records what the CLI
+// actually puts on the wire at /shutdown, and then frees the port like a real one.
+async function startShutdownRecorder(version = "0.0.0-previous") {
+  const bodies = [];
+  const server = createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, app: "lavish-axi", version }));
+      return;
+    }
+    if (req.url === "/shutdown" && req.method === "POST") {
+      let raw = "";
+      req.on("data", (chunk) => {
+        raw += chunk;
+      });
+      req.on("end", () => {
+        bodies.push(raw ? JSON.parse(raw) : {});
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "shutting-down" }));
+        server.close();
+        server.closeAllConnections?.();
+      });
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(undefined)));
+  const address = /** @type {import("node:net").AddressInfo} */ (server.address());
+  return { bodies, port: address.port, close: () => server.close() };
+}
+
+test("lavish-axi stop tells the server it was stopped, and names no session to reload", async () => {
+  const recorder = await startShutdownRecorder();
+  try {
+    const output = await shutdownServerOnPort(recorder.port, {
+      baseUrl: `http://127.0.0.1:${recorder.port}`,
+      currentVersion: "0.1.4",
+    });
+
+    assert.deepEqual(recorder.bodies, [{ reason: "stop" }]);
+    assert.equal(output.server.status, "stopped");
+  } finally {
+    recorder.close();
+  }
 });
 
 test("shouldKillProcessOnPort does not kill unidentified health responders", () => {

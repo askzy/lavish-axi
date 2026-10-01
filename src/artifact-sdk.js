@@ -723,6 +723,7 @@ export function createArtifactSdk(
   let layoutAuditTimer = 0;
   let layoutAuditRun = 0;
   let lastLayoutAuditSignature = null;
+  let layoutAuditPublishRequested = false;
   let layoutAuditPassSequence = 0;
 
   function toPixelNumber(value) {
@@ -1564,7 +1565,12 @@ export function createArtifactSdk(
       new Promise((resolve) => window.setTimeout(resolve, layoutAuditAnimationMaxWaitMs)),
     ]);
     if (!settled) {
-      for (const animation of finite) animation.finished.then(scheduleLayoutAudit, scheduleLayoutAudit);
+      for (const animation of finite) {
+        animation.finished.then(
+          () => scheduleLayoutAudit(),
+          () => scheduleLayoutAudit(),
+        );
+      }
     }
     return settled;
   }
@@ -1576,7 +1582,8 @@ export function createArtifactSdk(
     const severe = findings.filter((finding) => finding?.severity === "error");
     const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
     const signature = JSON.stringify({ complete, targetPresenceComplete, viewportWidth, severe });
-    if (signature === lastLayoutAuditSignature) return;
+    if (!layoutAuditPublishRequested && signature === lastLayoutAuditSignature) return;
+    layoutAuditPublishRequested = false;
     lastLayoutAuditSignature = signature;
     postArtifactMessage("lavish:layoutDiagnostics", {
       complete,
@@ -1611,7 +1618,8 @@ export function createArtifactSdk(
     );
   }
 
-  function scheduleLayoutAudit() {
+  function scheduleLayoutAudit(publishRequested = false) {
+    if (publishRequested) layoutAuditPublishRequested = true;
     if (layoutAuditTimer) window.clearTimeout(layoutAuditTimer);
     const runId = ++layoutAuditRun;
     layoutAuditTimer = window.setTimeout(() => {
@@ -1623,10 +1631,10 @@ export function createArtifactSdk(
 
   function startLayoutAudit() {
     scheduleLayoutAudit();
-    window.addEventListener("load", scheduleLayoutAudit, { once: true });
-    window.addEventListener("resize", scheduleLayoutAudit, { passive: true });
-    window.addEventListener("animationend", scheduleLayoutAudit, { passive: true });
-    window.addEventListener("transitionend", scheduleLayoutAudit, { passive: true });
+    window.addEventListener("load", () => scheduleLayoutAudit(), { once: true });
+    window.addEventListener("resize", () => scheduleLayoutAudit(), { passive: true });
+    window.addEventListener("animationend", () => scheduleLayoutAudit(), { passive: true });
+    window.addEventListener("transitionend", () => scheduleLayoutAudit(), { passive: true });
   }
 
   // The narrow fatal path. A local subresource the artifact declares but the server cannot serve
@@ -1664,6 +1672,18 @@ export function createArtifactSdk(
 
   let activeCardContext = null;
   let reviewStateTimer = 0;
+  let draftRestoreTimer = 0;
+  const REVIEW_DRAFT_ANCHOR_SETTLE_MS = 1500;
+
+  // A card the user opened ends the pending late restore for good, not just for the instant the
+  // settle timer happens to fire: closing that card reports `card: null`, which retires the stored
+  // draft, so a restore landing afterwards would put text the chrome no longer holds back on
+  // screen and back into persistence over a card the user already dismissed.
+  function cancelPendingDraftRestore() {
+    if (!draftRestoreTimer) return;
+    window.clearTimeout(draftRestoreTimer);
+    draftRestoreTimer = 0;
+  }
 
   function safeQuerySelector(selector) {
     try {
@@ -1751,7 +1771,29 @@ export function createArtifactSdk(
     const card = state.card;
     if (!card || !card.selector || !String(card.text || "").trim()) return;
     const target = safeQuerySelector(card.selector);
-    if (!target) return;
+    if (!target) {
+      // The load event says the document parsed, not that it finished rendering: a section this
+      // page builds in script, or a Mermaid diagram, arrives later. Ask again once it has had
+      // time to appear, and restore the card if it did. Only then is the anchor's absence an
+      // answer worth reporting - the chrome cannot see into this document, and a draft it is
+      // never told about is retried against every later load.
+      cancelPendingDraftRestore();
+      draftRestoreTimer = window.setTimeout(() => {
+        draftRestoreTimer = 0;
+        // The user may have opened a card of their own inside the settle window, and
+        // `showAnnotationCard` closes whatever is open before it draws. Restoring over live
+        // typing destroys text nothing has carried to the chrome yet, so a card on screen ends
+        // this attempt: the draft is still stored, and the next load tries again.
+        if (activeCardContext) return;
+        const late = safeQuerySelector(card.selector);
+        if (late) {
+          showAnnotationCard(late, { restoreText: String(card.text) });
+          return;
+        }
+        postArtifactMessage("lavish:reviewDraftUnrestorable", { selector: String(card.selector) });
+      }, REVIEW_DRAFT_ANCHOR_SETTLE_MS);
+      return;
+    }
     showAnnotationCard(target, { restoreText: String(card.text) });
   }
 
@@ -1793,6 +1835,7 @@ export function createArtifactSdk(
   }
 
   function showAnnotationCard(target, options = {}) {
+    cancelPendingDraftRestore();
     const root = ensureShadow();
     closeCard();
 
@@ -1894,6 +1937,7 @@ export function createArtifactSdk(
       window.scrollTo(Number(msg.x) || 0, Number(msg.y) || 0);
     }
     if (msg.type === "lavish:restoreReviewState") restoreReviewState(msg.state);
+    if (msg.type === "lavish:requestLayoutDiagnostics") scheduleLayoutAudit(true);
     if (msg.type === "lavish:revealElement") revealElement(msg.selector);
   });
 

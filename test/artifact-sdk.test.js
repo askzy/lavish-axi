@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -447,4 +448,29 @@ test("classifyUnreadableContrast stays silent when either color is unusable", ()
   assert.equal(classifyUnreadableContrast({ textColor: null, backdrop: dim.base200 }), null);
   assert.equal(classifyUnreadableContrast({ textColor: dim.warningContent, backdrop: null }), null);
   assert.equal(classifyUnreadableContrast({ textColor: ["x"], backdrop: dim.base200 }), null);
+});
+
+async function sdkSource() {
+  return readFile(new URL("../src/artifact-sdk.js", import.meta.url), "utf8");
+}
+
+test("the SDK re-queries a missing draft anchor before reporting it unrestorable", async () => {
+  const js = await sdkSource();
+
+  assert.match(js, /const REVIEW_DRAFT_ANCHOR_SETTLE_MS = 1500;/);
+  assert.match(js, /if \(activeCardContext\) return;\s*const late = safeQuerySelector\(card\.selector\);/);
+  assert.match(js, /postArtifactMessage\("lavish:reviewDraftUnrestorable", \{ selector: String\(card\.selector\) \}\)/);
+  // Opening a card ends the pending late restore outright.
+  assert.match(js, /function showAnnotationCard\(target, options = \{\}\) \{\s*cancelPendingDraftRestore\(\);/);
+});
+
+test("the SDK republishes a layout pass when the chrome asks for one, even if unchanged", async () => {
+  const js = await sdkSource();
+
+  assert.match(js, /if \(msg\.type === "lavish:requestLayoutDiagnostics"\) scheduleLayoutAudit\(true\);/);
+  assert.match(js, /if \(!layoutAuditPublishRequested && signature === lastLayoutAuditSignature\) return;/);
+  assert.match(
+    js,
+    /function scheduleLayoutAudit\(publishRequested = false\) \{\s*if \(publishRequested\) layoutAuditPublishRequested = true;/,
+  );
 });
