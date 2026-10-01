@@ -171,7 +171,7 @@ test("top-level help renders static home output without dynamic sessions", async
     );
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
-    assert.match(result.stdout, /playbooks\[7\]/);
+    assert.match(result.stdout, /playbooks\[8\]/);
     assert.match(result.stdout, /lavish-axi playbook <playbook_id>/);
     assert.match(result.stdout, /reference other filesystem assets/);
     assert.match(result.stdout, /same directory as the HTML file/);
@@ -193,7 +193,7 @@ test("design output prints copy-pasteable CDN URLs so agents can opt in to Daisy
   const output = createDesignOutput();
 
   assert.match(output.playbook_router.instruction, /MUST open each matching playbook before writing HTML/);
-  assert.equal(output.playbook_router.playbooks.length, 7);
+  assert.equal(output.playbook_router.playbooks.length, 8);
   assert.equal(
     output.playbook_router.playbooks.find((playbook) => playbook.id === "diagram")?.use_when,
     "Explain relationships, flows, state, architecture, and concepts with illustrations",
@@ -283,10 +283,10 @@ test("design output recommends luxury as the default theme and warns against @ap
 test("playbook index output lists known playbooks with concise descriptions", () => {
   const output = createPlaybookOutput([]);
 
-  assert.equal(output.playbooks.length, 7);
+  assert.equal(output.playbooks.length, 8);
   assert.deepEqual(
     output.playbooks.map((playbook) => playbook.id),
-    ["diagram", "table", "comparison", "plan", "code", "input", "slides"],
+    ["diagram", "table", "comparison", "plan", "code", "input", "explanation", "slides"],
   );
   assert.equal(
     output.playbooks.find((playbook) => playbook.id === "plan")?.use_when,
@@ -302,6 +302,24 @@ test("playbook index output lists known playbooks with concise descriptions", ()
   assert.ok(output.help.some((item) => item.includes("MUST open each matching playbook")));
 });
 
+test("explanation playbook routes understanding of existing things and separates itself from plan and comparison", () => {
+  const output = createPlaybookOutput(["explanation"]);
+
+  assert.match(output.playbook.use_when, /Explain an existing system, PR, incident, or decision/i);
+  assert.match(output.playbook.use_when, /not choosing a direction or inspecting a plan/);
+  assert.ok(
+    output.playbook.choose.some((item) => /plan playbook when the reader must inspect and approve/i.test(item)),
+  );
+  assert.ok(output.playbook.structure.some((item) => /one-sentence answer/i.test(item)));
+  assert.ok(output.playbook.structure.some((item) => /what was deliberately left out/i.test(item)));
+  assert.ok(output.playbook.pitfalls.some((item) => /restate the PR body, diff, or ticket file-by-file/i.test(item)));
+  assert.ok(
+    output.playbook.design_rules.some((item) => /diagram playbook's assume-nothing rule/i.test(item)),
+    "reader starting point is owned by the diagram playbook and only pointed at here",
+  );
+  assert.ok(output.playbook.pitfalls.some((item) => /inferred reasoning as verified fact/i.test(item)));
+});
+
 test("diagram playbook owns assume-nothing and one-concept-per-diagram guidance", async () => {
   const output = createPlaybookOutput(["diagram"]);
   assert.ok(
@@ -313,14 +331,17 @@ test("diagram playbook owns assume-nothing and one-concept-per-diagram guidance"
     "the diagram playbook must prefer one concept per diagram",
   );
 
+  const playbookIds = createPlaybookOutput([]).playbooks.map((playbook) => playbook.id);
   const otherSurfaces = [
     JSON.stringify(createHomeOutput({ bin: "lavish-axi", sessions: [] })),
     JSON.stringify(createDesignOutput()),
     createSkillMarkdown(),
+    ...playbookIds.filter((id) => id !== "diagram").map((id) => JSON.stringify(createPlaybookOutput([id]).playbook)),
   ];
   for (const surface of otherSurfaces) {
     assert.doesNotMatch(surface, /one concept per diagram/i);
     assert.doesNotMatch(surface, /knows nothing/i);
+    assert.doesNotMatch(surface, /presume/i);
   }
 
   const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-playbook-diagram-`);
@@ -597,6 +618,40 @@ test("playbook detail output returns focused Lavish-native guidance", () => {
   assert.ok(output.playbook.pitfalls.some((item) => item.includes("unclear")));
   assert.ok(output.playbook.pitfalls.some((item) => item.includes("radio change")));
   assert.ok(output.playbook.lavish_notes.some((item) => item.includes("Lavish")));
+});
+
+test("input playbook defines an opt-in tracked batch handoff", () => {
+  const output = createPlaybookOutput(["input"]);
+  const guidance = JSON.stringify(output.playbook);
+  const example = output.playbook.lavish_notes.find((item) => /tag: ['"]tracked-batch/.test(item));
+
+  assert.match(guidance, /multi-item/);
+  assert.match(guidance, /stable, visible ID/);
+  assert.match(guidance, /selected set/);
+  assert.match(guidance, /account for every submitted ID/);
+  assert.match(guidance, /addressed/);
+  assert.match(guidance, /deferred/);
+  assert.match(guidance, /rejected/);
+  assert.match(guidance, /receipt ID set/);
+  assert.ok(example, "the tracked-batch pattern includes a copyable example");
+  assert.match(example, /<form/);
+  assert.match(example, /type="checkbox"/);
+  assert.match(example, /onsubmit=/);
+  assert.equal(example.match(/window\.lavish\.queuePrompt/g)?.length, 1);
+  assert.match(example, /items: selected/);
+  assert.match(example, /id:/);
+  assert.match(example, /label:/);
+  assert.match(example, /disposition:/);
+});
+
+test("table playbook routes multi-row actions to the input tracked-batch pattern", () => {
+  const output = createPlaybookOutput(["table"]);
+
+  assert.ok(
+    output.playbook.lavish_notes.some(
+      (item) => item.includes("multiple rows") && item.includes("input") && item.includes("tracked batch"),
+    ),
+  );
 });
 
 test("code playbook detail output requires verified @pierre/diffs rendering", () => {
