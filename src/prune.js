@@ -1,6 +1,8 @@
 import { readdir, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 
+import { attachmentsDir } from "./attachment-store.js";
+
 /** @typedef {import("./session-store.js").SessionStore} SessionStore */
 
 export const DEFAULT_PRUNE_MAX_AGE = "30d";
@@ -51,9 +53,11 @@ function resolveDurationMs(value, fallback) {
  * ended and its last update is older than the cutoff, or when it is open and its last update is
  * older than `openMaxAgeMs`, or older than `unrepliedMaxAgeMs` while the user never wrote in its
  * chat. An open session holding undelivered or unacknowledged feedback is kept whatever its age.
- * Then every `.html` file directly inside each artifact directory that is older than the cutoff is
- * deleted, unless a session that is still open points at it; the file of an open session removed
- * here is swept by that same cutoff.
+ * A removed session's image attachments (`<state-dir>/attachments/<key>/`) go with it: nothing
+ * can reference them once the record is gone, and the hourly sweep would otherwise hold them
+ * until their own TTL. Then every `.html` file directly inside each artifact directory that is
+ * older than the cutoff is deleted, unless a session that is still open points at it; the file of
+ * an open session removed here is swept by that same cutoff.
  *
  * Without `artifactDirs` the sweep covers every `.lavish/` directory the store has a session in,
  * resolved before any session is removed so a directory whose last session goes is still swept.
@@ -101,6 +105,11 @@ export async function prune({
     { dryRun },
   );
 
+  let attachmentBytesFreed = 0;
+  for (const session of removedSessions) {
+    attachmentBytesFreed += await removeSessionAttachments(path.dirname(store.file), session.key, dryRun);
+  }
+
   const protectedFiles = new Set(kept.filter((session) => session.status !== "ended").map((session) => session.file));
   const removedFiles = [];
   let fileBytesFreed = 0;
@@ -117,7 +126,7 @@ export async function prune({
     dryRun,
     sessionsRemoved: removedSessions.length,
     filesRemoved: removedFiles.length,
-    bytesFreed: stateBytesFreed + fileBytesFreed,
+    bytesFreed: stateBytesFreed + attachmentBytesFreed + fileBytesFreed,
     removedSessions: removedSessions.map((session) => session.file),
     removedFiles,
   };
@@ -132,6 +141,30 @@ function hasPendingFeedback(session) {
     (session.prompts || []).length > 0 ||
     (session.leases || []).length > 0
   );
+}
+
+// Returns the bytes the session's attachment dir held. The dir is removed whole: every file in it
+// belongs to this session alone, and the store no longer has a record that could reference one.
+async function removeSessionAttachments(stateDir, key, dryRun) {
+  const dir = attachmentsDir(stateDir, key);
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return 0;
+    throw error;
+  }
+  let bytes = 0;
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    try {
+      bytes += (await stat(path.join(dir, entry.name))).size;
+    } catch {
+      // Raced with the sweep; the file is gone either way.
+    }
+  }
+  if (!dryRun) await rm(dir, { recursive: true, force: true });
+  return bytes;
 }
 
 function hasUserMessage(session) {

@@ -14,6 +14,7 @@ import {
   queueLayoutWarnings as queueWarningRecords,
   serializeLayoutWarnings,
 } from "./layout-warnings.js";
+import { AsyncMutex } from "./async-mutex.js";
 import { normalizeMermaidNodeTarget } from "./mermaid-node.js";
 
 export const LAYOUT_WARNINGS_TARGET_TYPE = "layout-warnings";
@@ -22,14 +23,40 @@ const MAX_ARTIFACT_FAILURES = 20;
 // before acknowledging (reaped harness job, background process nobody reads) leaves the lease to
 // expire, after which the batch is delivered again instead of being lost.
 export const FEEDBACK_LEASE_TTL_MS = 60_000;
+// How long a delivered attachment stays referenced after its lease is retired (ack or agent
+// reply). While the batch is leased the lease itself keeps the attachment referenced; this window
+// covers the agent that acked the batch and is still opening the paths it was handed. It is a
+// bounded read window, not a second lifetime: the TTL and the disk cap must still be able to
+// reclaim delivered bytes eventually.
+export const ATTACHMENT_DELIVERY_GRACE_MS = 60 * 60 * 1000; // 1 hour
+
+// A whole POST /prompts batch is one user's queued annotations, so its total image
+// count is small in every real use. Bounding it is what keeps the resolver work
+// below O(payload size) while the store's global lock is held. It bounds ONE
+// request; prompts accumulate across requests until a poll drains them, so it says
+// nothing about how much a single delivery carries.
+export const MAX_REQUEST_ATTACHMENT_REFS = 256;
+
+// Bounds only the retained HISTORY of earlier deliveries - state.json is rewritten
+// wholesale on every store operation, so the list cannot grow forever.
+//
+// It deliberately does NOT bound the current delivery. The invariant is structural,
+// not numeric: whatever `takeFeedback` just handed the agent is retained in full,
+// however large, and this cap only decides how much older history rides along. Any
+// number chosen here would be wrong, because pending prompts accumulate across an
+// unbounded number of accepted requests - so a single poll can legitimately deliver
+// far more than any one request may queue. Trimming the current delivery to fit a
+// constant is what reopens the hole this retention exists to close.
+export const MAX_DELIVERED_ATTACHMENTS = 256;
 
 export class SessionStore {
   constructor(file, { feedbackLeaseTtlMs = FEEDBACK_LEASE_TTL_MS, now = () => Date.now() } = {}) {
     this.file = file;
     this.feedbackLeaseTtlMs = feedbackLeaseTtlMs;
     this.now = now;
-    /** @type {Promise<unknown>} */
-    this.stateOperationQueue = Promise.resolve();
+    // One mutex serializes every state.json read-modify-write and the server's
+    // attachment disk lifecycle sections through runExclusive.
+    this.lock = new AsyncMutex();
     this.artifactLoads = new Map();
     this.chromeLoadContexts = new Map();
   }
@@ -77,6 +104,12 @@ export class SessionStore {
         layout_warnings: normalizeStoredWarnings(existing.layout_warnings),
         artifact_revision: normalizeRevision(existing.artifact_revision),
         artifact_failures: Array.isArray(existing.artifact_failures) ? existing.artifact_failures : [],
+        // Carried across a reopen on purpose: this list is what keeps a just-delivered
+        // attachment out of the sweeper's reach, and re-opening the artifact during the
+        // grace window would otherwise erase that protection while the agent is still
+        // reading the path. Every field this constructor omits is silently dropped, so
+        // any new session field must be added here too.
+        delivered_attachments: Array.isArray(existing.delivered_attachments) ? existing.delivered_attachments : [],
         dom_snapshot: existing.dom_snapshot || "",
         chat: existing.chat || [],
         updated_at: new Date().toISOString(),
@@ -87,7 +120,18 @@ export class SessionStore {
     });
   }
 
-  async queuePrompts(key, payload) {
+  // `options.resolveAttachment(key, id) => Promise<metadata|null>` is the trust
+  // boundary for image attachments: a prompt only ever carries the client's
+  // claimed `id` (and display `name`); every authoritative field (absolute path,
+  // mime, byte size, dimensions) is re-derived from disk here, so a crafted
+  // `/prompts` POST cannot point an attachment at an arbitrary file. Without a
+  // resolver, unresolved attachments are dropped rather than trusted.
+  //
+  // The whole read -> resolve -> write path runs under the store's single lock so
+  // it is atomic against a concurrent poll's `takeFeedback` AND against the sweeper's
+  // reference snapshot + delete and upload finalize, which the server runs under the
+  // same lock via `runExclusive`.
+  async queuePrompts(key, payload, options = {}) {
     return this.runExclusive(async () => {
       const state = await this.readState();
       const session = state.sessions[key];
@@ -104,7 +148,35 @@ export class SessionStore {
       if (session.status === "ended") {
         return { ended: true, ended_by: session.ended_by };
       }
-      const normalizedPrompts = prompts.map(normalizePrompt);
+      const normalized = prompts.map(normalizePrompt);
+      const normalizedPrompts = normalized.map((entry) => entry.prompt);
+      // Resolve every attachment BEFORE mutating anything. If any prompt's images
+      // can't be fully honored - malformed, an unknown id, or over the per-prompt
+      // count/byte cap - reject the WHOLE batch and persist nothing. Silently
+      // truncating here while returning success would drop images the user attached,
+      // and the chrome would clear its queue believing they were delivered.
+      const rejected = boundAttachmentRefs(normalized, options);
+      if (!rejected.length) {
+        for (const prompt of normalizedPrompts) {
+          const { resolved, rejected: promptRejected } = await resolvePromptAttachments(
+            prompt.attachments,
+            key,
+            options,
+          );
+          if (promptRejected.length) rejected.push(...promptRejected);
+          if (resolved.length > 0) prompt.attachments = resolved;
+          else delete prompt.attachments;
+        }
+      }
+      if (rejected.length) {
+        return {
+          rejected: rejected.slice(0, MAX_REPORTED_ATTACHMENT_REJECTIONS),
+          caps: {
+            maxPerPrompt: Number.isFinite(options.maxPerPrompt) ? options.maxPerPrompt : null,
+            maxPromptBytes: Number.isFinite(options.maxPromptBytes) ? options.maxPromptBytes : null,
+          },
+        };
+      }
       const revision = normalizeRevision(session.artifact_revision);
       const at = new Date().toISOString();
       let warnings = normalizeStoredWarnings(session.layout_warnings);
@@ -481,6 +553,24 @@ export class SessionStore {
         // knows not to expect (or force) a reopened browser afterward.
         ...(alreadyEnded ? { session_ended: true, ended_by: session.ended_by } : {}),
       };
+      // The lease keeps these attachments referenced until it is retired; the grace list takes
+      // over from there while the agent that acked is still opening the paths it received.
+      const deliveredIds = new Set();
+      for (const prompt of prompts) {
+        for (const attachment of prompt.attachments || []) {
+          if (attachment?.id) deliveredIds.add(attachment.id);
+        }
+      }
+      const carried = (session.delivered_attachments || [])
+        .filter(
+          (entry) =>
+            entry && entry.id && !deliveredIds.has(entry.id) && now - Number(entry.at) <= ATTACHMENT_DELIVERY_GRACE_MS,
+        )
+        .map((entry) => ({ id: entry.id, at: Number(entry.at) }))
+        .sort((a, b) => a.at - b.at);
+      const current = [...deliveredIds].map((id) => ({ id, at: now }));
+      const historyRoom = Math.max(0, MAX_DELIVERED_ATTACHMENTS - current.length);
+      session.delivered_attachments = [...carried.slice(-historyRoom), ...current];
       session.leases = [...live, lease];
       session.prompts = [];
       session.artifact_failures = [];
@@ -599,9 +689,33 @@ export class SessionStore {
    * @returns {Promise<T>}
    */
   runExclusive(operation) {
-    const result = this.stateOperationQueue.then(operation);
-    this.stateOperationQueue = result.catch(() => {});
-    return result;
+    return this.lock.runExclusive(operation);
+  }
+
+  // `key/id` strings for every attachment the sweeper and delete must not touch, across all
+  // sessions: those on a pending prompt, those on a leased batch (live or expired, since an
+  // expired lease is redelivered with the same resolved paths), and those delivered within the
+  // read grace. This is a pure read and must NOT take `this.lock`: the server calls it from
+  // inside `runExclusive`, so self-locking would deadlock; running it there keeps its snapshot
+  // atomic with the subsequent disk delete.
+  async referencedAttachmentIds({ now = this.now() } = {}) {
+    const state = await this.readState();
+    const referenced = new Set();
+    for (const session of Object.values(state.sessions)) {
+      const leasedPrompts = normalizeLeases(session.leases).flatMap((lease) => lease.prompts);
+      for (const prompt of [...(session.prompts || []), ...leasedPrompts]) {
+        for (const attachment of prompt?.attachments || []) {
+          if (attachment && attachment.id) referenced.add(`${session.key}/${attachment.id}`);
+        }
+      }
+      for (const delivered of session.delivered_attachments || []) {
+        if (!delivered || !delivered.id) continue;
+        if (now - Number(delivered.at) <= ATTACHMENT_DELIVERY_GRACE_MS) {
+          referenced.add(`${session.key}/${delivered.id}`);
+        }
+      }
+    }
+    return referenced;
   }
 
   async readState() {
@@ -706,6 +820,9 @@ export function sessionKey(file) {
   return crypto.createHash("sha256").update(file).digest("hex").slice(0, 16);
 }
 
+// Returns `{ prompt, malformed }`: `malformed` is non-empty when the payload's
+// `attachments` field exists but cannot be honored as written, which fails the
+// whole batch rather than being normalized away (see queuePrompts).
 function normalizePrompt(prompt) {
   const normalized = {
     uid: String(prompt.uid || ""),
@@ -716,7 +833,9 @@ function normalizePrompt(prompt) {
   };
   const target = normalizeTarget(prompt.target);
   if (target) normalized.target = target;
-  return normalized;
+  const { refs, malformed } = normalizeAttachmentRefs(prompt.attachments);
+  if (refs.length > 0) normalized.attachments = refs;
+  return { prompt: normalized, malformed };
 }
 
 function layoutWarningPromptIds(prompt) {
@@ -724,6 +843,108 @@ function layoutWarningPromptIds(prompt) {
   return Array.isArray(prompt.target.warnings)
     ? prompt.target.warnings.map((warning) => String(warning?.id || "")).filter(Boolean)
     : [];
+}
+
+// Client-supplied attachment refs are stripped to just the fields the client is
+// allowed to influence: the content-hash `id` and a display-only `name`. Path,
+// mime, size, and dimensions are never taken from the payload (see queuePrompts).
+//
+// Anything that cannot be read as a ref is reported as `malformed` rather than
+// skipped: dropping it here would let the POST succeed while the images the user
+// attached never arrive, and the chrome would clear its queue believing they were
+// delivered. An ABSENT field is not malformed - it just means no images.
+function normalizeAttachmentRefs(value) {
+  if (value === undefined) return { refs: [], malformed: [] };
+  if (!Array.isArray(value)) return { refs: [], malformed: [{ id: "", name: "", reason: "malformed" }] };
+  const refs = [];
+  const malformed = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      malformed.push({ id: "", name: "", reason: "malformed" });
+      continue;
+    }
+    const name = item.name === undefined || item.name === null ? "" : String(item.name).slice(0, 200);
+    const id = String(item.id || "");
+    if (!id) {
+      malformed.push({ id: "", name, reason: "malformed" });
+      continue;
+    }
+    refs.push(name ? { id, name } : { id });
+  }
+  return { refs, malformed };
+}
+
+// Rejections are reported back to the chrome, so the list must not itself become
+// a payload amplifier for a crafted batch.
+const MAX_REPORTED_ATTACHMENT_REJECTIONS = 4;
+
+// The cheap gate that must run BEFORE `resolvePromptAttachments` touches the
+// filesystem: every check here is pure arithmetic over the parsed payload.
+//
+// The per-prompt cap inside the resolver counts RESOLVED refs, which a crafted
+// batch never advances - thousands of well-formed ids for files that don't exist
+// each cost a sequential `stat` and the count stays at zero. Because the whole
+// path runs under the store's single mutex, that stalls polling and every
+// state mutation. Counting the RAW refs first bounds the work a caller can buy.
+function boundAttachmentRefs(normalized, options) {
+  const maxPerPrompt = Number.isFinite(options.maxPerPrompt) ? options.maxPerPrompt : Infinity;
+  const malformed = normalized.flatMap((entry) => entry.malformed);
+  if (malformed.length) return malformed;
+
+  // Per-prompt first: it is the more specific diagnosis, and the chrome turns it
+  // into actionable wording ("more than N images on one annotation"). A single
+  // crafted prompt trips both caps, and that message is the useful one.
+  const rejected = [];
+  for (const { prompt } of normalized) {
+    const refs = prompt.attachments || [];
+    // One rejection per over-cap prompt, not one per crafted ref.
+    if (refs.length > maxPerPrompt) {
+      rejected.push({ id: refs[0]?.id || "", name: refs[0]?.name || "", reason: "too-many" });
+    }
+  }
+  if (rejected.length) return rejected;
+
+  let requestRefs = 0;
+  for (const { prompt } of normalized) requestRefs += prompt.attachments?.length || 0;
+  if (requestRefs > MAX_REQUEST_ATTACHMENT_REFS) {
+    return [{ id: "", name: "", reason: "too-many-in-request" }];
+  }
+  return rejected;
+}
+
+// Replace each client ref with server-vetted metadata, enforcing the per-prompt
+// count and total-byte caps. Returns `{ resolved, rejected }`: every ref that
+// can't be honored (unknown id, over the count cap, or over the total-byte cap)
+// is reported in `rejected` with a machine-readable `reason` rather than silently
+// dropped, so the caller can fail the batch atomically. The display `name` is
+// the only client value carried through (it never touches a filesystem path).
+async function resolvePromptAttachments(refs, key, options = {}) {
+  const { resolveAttachment, maxPerPrompt = Infinity, maxPromptBytes = Infinity } = options;
+  if (!Array.isArray(refs) || refs.length === 0 || typeof resolveAttachment !== "function") {
+    return { resolved: [], rejected: [] };
+  }
+  const resolved = [];
+  const rejected = [];
+  let totalBytes = 0;
+  for (const ref of refs) {
+    if (resolved.length >= maxPerPrompt) {
+      rejected.push({ id: ref.id, name: ref.name || "", reason: "too-many" });
+      continue;
+    }
+    const metadata = await resolveAttachment(key, ref.id);
+    if (!metadata) {
+      rejected.push({ id: ref.id, name: ref.name || "", reason: "not-found" });
+      continue;
+    }
+    const bytes = Number(metadata.bytes) || 0;
+    if (totalBytes + bytes > maxPromptBytes) {
+      rejected.push({ id: ref.id, name: ref.name || "", reason: "prompt-bytes-exceeded" });
+      continue;
+    }
+    totalBytes += bytes;
+    resolved.push(ref.name ? { ...metadata, name: ref.name } : metadata);
+  }
+  return { resolved, rejected };
 }
 
 function planLayoutWarningPrompt(warnings, prompt, revision) {
