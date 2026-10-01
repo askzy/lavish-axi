@@ -235,7 +235,7 @@ async function probeChromeLoad(cdp, sessionUrl) {
   await cdp.send("Page.enable", {}, sessionId);
   await cdp.send("Page.navigate", { url: sessionUrl }, sessionId);
   await load;
-  // Let the module's async tails settle: EventSource open, the chrome-load beacon, iframe load.
+  // Let the module's async tails settle: WebSocket open, the chrome-load beacon, iframe load.
   await sleep(3000);
 
   /** @param {string} expression */

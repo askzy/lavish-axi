@@ -1,4 +1,4 @@
-/* global EventSource, document, location, window */
+/* global document, location, window */
 
 const sessionDataElement = document.getElementById("lavish-session");
 const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
@@ -172,6 +172,16 @@ const layoutGateMaxHoldMs =
 let chromeOutdatedReason = "";
 let chromeOutdatedGeneration = 0;
 let outdatedReloadInFlight = false;
+// The live-event socket reconnects forever on a 5s cap. Silence there is indistinguishable from a
+// healthy idle stream, so a page whose server has gone away keeps rendering its last state and
+// tells the user nothing until they reload into a connection error. Past this many consecutive
+// failures the banner says so, with the health-probed reload the banner already offers.
+const LIVE_EVENT_UNREACHABLE_FAILURES = 5;
+let liveEventFailures = 0;
+// Only a banner this path raised may be hidden by this path: a `chrome-outdated` event means the
+// server was replaced, which a reconnect does not disprove.
+let unreachableBannerOwned = false;
+let unreachableDismissed = false;
 /** @type {{ selector: string, revision: number } | null} */
 let unrestorableDraftMiss = null;
 let retiredDrafts = loadRetiredDrafts();
@@ -196,12 +206,21 @@ let warningsDrawerOpen = false;
 const SNAPSHOT_REQUEST_TIMEOUT_MS = 5000;
 const SEND_EMPTY_COPY = "Write a message or annotate an element first.";
 const SNAPSHOT_SKIPPED_COPY = "Sent without a page snapshot because the artifact did not answer in time.";
-const SEND_FAILED_COPY = "Could not send. Your feedback is still queued in this tab. Click Send to Agent to retry.";
+const SEND_FAILED_COPY =
+  "Could not send. Your feedback is still queued in this tab. Check that Lavish is running, then click Send to Agent to retry.";
+// A send starts before the artifact snapshot arrives and ends only when /prompts acknowledges the
+// batch. Bound that whole wait so a missing SDK response or a browser/network stall can never look
+// like a dead button while the user's queue remains safely stored in this tab.
+const SEND_ACKNOWLEDGEMENT_WARNING_MS = 10_000;
+const SEND_STALLED_COPY =
+  "Still trying to send. Your feedback is saved in this tab. Keep this tab open while Lavish catches up, and check that the server is running.";
 const snapshotRequests = [];
 let endAfterSubmit = false;
 let workingBubble = null;
 let submitQueuedPromise = null;
 let submitQueuedAgain = false;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let sendAcknowledgementTimer;
 let lastScroll = { x: 0, y: 0 };
 // In-iframe review context (an open annotation card's unsent text, Lavish-owned question
 // answers). The sandbox means the chrome cannot read it back after a reload, so the SDK reports
@@ -248,6 +267,7 @@ let artifactSilenceTimer;
 let copyHintTimer;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendHintTimer;
+let sendHintPersistent = false;
 
 function artifactFrameSrcForLoad(load) {
   const separator = artifactSrc.includes("?") ? "&" : "?";
@@ -458,25 +478,52 @@ function pillAttachmentsHtml(prompt) {
   );
 }
 
-function showSendHint(copy = SEND_EMPTY_COPY, holdMs = 2600) {
+// `holdMs === null` keeps the hint up until a send succeeds or the queue empties; typing does not
+// clear a persistent hint, only `hideSendHint(true)` does.
+function showSendHint(copy = SEND_EMPTY_COPY, holdMs = 2600, focusInput = true) {
   sendHint.textContent = copy;
   sendHint.hidden = false;
   clearTimeout(sendHintTimer);
+  sendHintPersistent = holdMs === null;
+  sendHint.classList.toggle("persistent", sendHintPersistent);
+  if (sendHintPersistent) {
+    sendHintTimer = undefined;
+    if (focusInput) chatInput.focus();
+    return;
+  }
   sendHintTimer = setTimeout(() => {
     sendHint.hidden = true;
+    sendHint.textContent = SEND_EMPTY_COPY;
+    sendHintPersistent = false;
   }, holdMs);
-  chatInput.focus();
+  if (focusInput) chatInput.focus();
 }
 
-function showSendError(copy) {
-  clearTimeout(sendHintTimer);
-  sendHint.textContent = copy;
-  sendHint.hidden = false;
-}
-
-function hideSendHint() {
+function hideSendHint(force = false) {
+  if (sendHintPersistent && force !== true) return;
   clearTimeout(sendHintTimer);
   sendHint.hidden = true;
+  sendHint.textContent = SEND_EMPTY_COPY;
+  sendHint.classList.remove("persistent");
+  sendHintPersistent = false;
+}
+
+function armSendAcknowledgementWarning() {
+  if (sendAcknowledgementTimer || !queued.length) return;
+  sendAcknowledgementTimer = setTimeout(() => {
+    sendAcknowledgementTimer = undefined;
+    if (queued.length) showSendHint(SEND_STALLED_COPY, null, false);
+  }, SEND_ACKNOWLEDGEMENT_WARNING_MS);
+}
+
+function clearSendAcknowledgementWarning() {
+  clearTimeout(sendAcknowledgementTimer);
+  sendAcknowledgementTimer = undefined;
+}
+
+function showQueuedSendFailure(copy = SEND_FAILED_COPY) {
+  clearSendAcknowledgementWarning();
+  if (queued.length) showSendHint(copy, null, false);
 }
 
 function setMenuOpen(button, menu, open) {
@@ -569,14 +616,6 @@ function setHandoffSuperseded(visible) {
 // The server this page was connected to went away. What is true beyond that depends on why, so
 // the shutdown names its reason and each one gets its own line - a page told "Lavish was updated"
 // after a deliberate stop is being told something false. An unnamed reason claims neither.
-function shutdownEventReason(event) {
-  try {
-    return String(JSON.parse(event?.data || "{}").reason || "");
-  } catch {
-    return "";
-  }
-}
-
 function chromeOutdatedCopy(reason) {
   if (reason === "upgrade") return "Lavish was updated. This page is running the previous version.";
   if (reason === "local-build") {
@@ -894,6 +933,10 @@ function removeQueuedPrompt(index, event) {
   if (event) event.stopPropagation();
   queued.splice(index, 1);
   persistQueuedPrompts();
+  if (!queued.length) {
+    clearSendAcknowledgementWarning();
+    hideSendHint(true);
+  }
   render();
 }
 
@@ -1171,17 +1214,20 @@ function sendQueued(endAfter) {
       if (attachments.length) prompt.attachments = attachments;
       queued.push(prompt);
       persistQueuedPrompts();
+      // Render the durable queue pill before clearing the editor. If anything after this point
+      // fails, the user's words are already both stored and visibly recoverable in the tab.
+      render();
       addChat("user", text || "Image message");
       chatInput.value = "";
       chatAttachmentController.reset();
-      render();
     }
   }
   if (!queued.length) {
     if (!chipsBlocked) showSendHint();
     return;
   }
-  hideSendHint();
+  hideSendHint(true);
+  armSendAcknowledgementWarning();
 
   if (endAfter && !chipsBlocked) endAfterSubmit = true;
   requestSnapshot("submit");
@@ -1238,15 +1284,19 @@ async function submitQueuedOnce() {
     if (response?.status === 409) {
       const data = await response.json().catch(() => null);
       // The session already ended before this batch arrived - most likely this chrome missed the
-      // SSE `ended` event (a dropped connection). Go read-only now instead of leaving Send enabled
+      // live `ended` event (a dropped connection). Go read-only now instead of leaving Send enabled
       // for another attempt that will be refused the same way.
       if (data?.status === "ended") {
+        clearSendAcknowledgementWarning();
         endAfterSubmit = false;
         markSessionEnded();
         return false;
       }
       if (Array.isArray(data?.warnings)) setLayoutWarnings(data.warnings);
       endAfterSubmit = false;
+      showQueuedSendFailure(
+        "Could not send because the layout issue selection changed. Your feedback is still queued. Review the current issues, then click Send to Agent to retry.",
+      );
       return false;
     }
     // The server persisted nothing (atomic reject) - the queue below is left intact
@@ -1255,12 +1305,12 @@ async function submitQueuedOnce() {
     if (response?.status === 400) {
       const detail = await response.json().catch(() => ({}));
       if (Array.isArray(detail.rejected) && detail.rejected.length) {
-        showSendHint(describeAttachmentRejection(detail.rejected, detail.caps), 6000);
+        showQueuedSendFailure(describeAttachmentRejection(detail.rejected, detail.caps));
         endAfterSubmit = false;
         return false;
       }
     }
-    showSendError(SEND_FAILED_COPY);
+    showQueuedSendFailure();
     return false;
   }
   for (const prompt of prompts) {
@@ -1269,6 +1319,11 @@ async function submitQueuedOnce() {
   }
   persistQueuedPrompts();
   render();
+  clearSendAcknowledgementWarning();
+  // A stalled or failed notice is answered by this success; a transient hint (such as "sent
+  // without a page snapshot") keeps its own timer.
+  if (sendHintPersistent) hideSendHint(true);
+  if (queued.length) armSendAcknowledgementWarning();
   if (shouldEndSession) {
     endAfterSubmit = false;
     markSessionEnded();
@@ -2998,7 +3053,7 @@ chatComposer.addEventListener("drop", (event) => {
   chatAttachmentController.rejectUnsupported(files);
 });
 // A file drop that misses the composer must not navigate the chrome away from
-// the session (losing chips, uploads, and the SSE connection). Text drags stay
+// the session (losing chips, uploads, and the live-event connection). Text drags stay
 // untouched so dropping text into the textarea keeps working.
 document.addEventListener("dragover", (event) => {
   if (Array.from(event.dataTransfer?.types || []).includes("Files")) event.preventDefault();
@@ -3019,7 +3074,7 @@ chatInput.addEventListener("keydown", (event) => {
     sendQueued(false);
   }
 });
-chatInput.addEventListener("input", hideSendHint);
+chatInput.addEventListener("input", () => hideSendHint());
 copyPathButton.onclick = copyFilePath;
 reloadArtifactButton.onclick = reloadArtifact;
 copySnapshotButton.onclick = copyDomSnapshot;
@@ -3030,7 +3085,17 @@ endButton.onclick = () => {
 };
 handoffTakeoverButton.onclick = () => location.reload();
 if (outdatedReloadButton) outdatedReloadButton.onclick = () => reloadChromeForOutdatedBanner();
-if (outdatedDismissButton) outdatedDismissButton.onclick = () => setChromeOutdated(false);
+if (outdatedDismissButton) {
+  outdatedDismissButton.onclick = () => {
+    // A dismissed unreachable banner stays dismissed until the stream actually recovers; without
+    // this the next failed reconnect puts it straight back on screen.
+    if (unreachableBannerOwned) {
+      unreachableBannerOwned = false;
+      unreachableDismissed = true;
+    }
+    setChromeOutdated(false);
+  };
+}
 document.addEventListener("mousedown", (event) => {
   const target = /** @type {Node} */ (event.target);
   if (!moreMenu.hidden && !moreWrap.contains(target)) setMenuOpen(moreButton, moreMenu, false);
@@ -3085,27 +3150,68 @@ frame.addEventListener("load", () => {
 
 initializeLayoutGate();
 
-const events = new EventSource("/events/" + key);
-events.addEventListener("reload", () => {
+// WebSockets leave the browser's HTTP connection pool free for sends and artifact loads. Each
+// frame is `{ type, data }`; handlers are keyed by type.
+const events = new Map();
+let eventReconnectDelayMs = 500;
+function connectLiveEvents() {
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(protocol + "//" + location.host + "/events/" + encodeURIComponent(key));
+  socket.addEventListener("open", () => {
+    eventReconnectDelayMs = 500;
+    liveEventFailures = 0;
+    unreachableDismissed = false;
+    if (unreachableBannerOwned) {
+      unreachableBannerOwned = false;
+      setChromeOutdated(false);
+    }
+    // A reconnecting stream means this chrome may have missed updates while it was away.
+    refreshLayoutWarnings();
+  });
+  socket.addEventListener("message", (message) => {
+    try {
+      const { type, data } = JSON.parse(message.data);
+      return events.get(type)?.(data || {});
+    } catch {
+      // Ignore malformed frames; a later event or reconnect can recover the stream.
+    }
+  });
+  socket.addEventListener("close", () => {
+    liveEventFailures += 1;
+    noteLiveEventsUnreachable();
+    setTimeout(connectLiveEvents, eventReconnectDelayMs);
+    eventReconnectDelayMs = Math.min(eventReconnectDelayMs * 2, 5000);
+  });
+}
+
+// Raise the existing banner once the stream has been down long enough to mean it, and never
+// against an ended session or a banner someone else owns. Reconnecting retires it.
+function noteLiveEventsUnreachable() {
+  if (liveEventFailures < LIVE_EVENT_UNREACHABLE_FAILURES) return;
+  if (ended || unreachableDismissed || unreachableBannerOwned) return;
+  if (outdatedBanner && !outdatedBanner.hidden) return;
+  unreachableBannerOwned = true;
+  setChromeOutdated(true, "");
+}
+
+events.set("reload", () => {
   resetFrame().then((reloaded) => {
     if (reloaded) refreshWhiteboardSource();
   });
 });
-events.addEventListener("chrome-reload", (event) => reloadAfterServerRestart(shutdownEventReason(event)));
+events.set("chrome-reload", (data) => reloadAfterServerRestart(String(data.reason || "")));
 // The replacement server serves a different artifact's review. This page keeps working against
 // it; it is only running the previous version of the chrome, which is the user's to act on.
-events.addEventListener("chrome-outdated", (event) => setChromeOutdated(true, shutdownEventReason(event)));
-events.addEventListener("agent-reply", (event) => {
-  const text = JSON.parse(event.data).text;
+events.set("chrome-outdated", (data) => setChromeOutdated(true, String(data.reason || "")));
+events.set("agent-reply", ({ text }) => {
   addChat("agent", text);
   noteAgentReply(text);
 });
-events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
-events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
-events.addEventListener("layout-warnings", (event) => setLayoutWarnings(JSON.parse(event.data).warnings || []));
-events.addEventListener("ended", () => markSessionEnded());
-// A reconnecting stream means this chrome may have missed updates while it was away.
-events.addEventListener("open", () => refreshLayoutWarnings());
+events.set("chat-sync", (data) => syncChat(data.chat || []));
+events.set("agent-presence", (data) => setAgentPresence(data.state));
+events.set("layout-warnings", (data) => setLayoutWarnings(data.warnings || []));
+events.set("ended", () => markSessionEnded());
+connectLiveEvents();
 
 applySheetState();
 render();
@@ -3115,7 +3221,7 @@ renderWarnings();
 initialChat.forEach((item) => addChat(item.role, item.text));
 retiredDrafts.forEach((text) => renderRetiredDraft(text));
 setAgentPresence("waiting");
-// The session already ended before this page (re)loaded, so there is no future SSE `ended` event
+// The session already ended before this page (re)loaded, so there is no future live `ended` event
 // to wait for - start read-only instead of looking live until a Send gets silently refused.
 if (sessionData.initialEnded) markSessionEnded();
 

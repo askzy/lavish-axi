@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import WebSocket from "ws";
 
 import { run, stopCommand, VERSION } from "../src/cli.js";
 import { localBuildId } from "../src/cli.js";
@@ -358,6 +359,88 @@ test("a bind that cannot succeed anywhere still fails loudly and names the cause
 
 // The WebSocket ping/pong heartbeat tests from upstream #353 are not here: this fork still serves
 // live events over SSE, so a half-open socket is not reaped (AGENTS.md records the gap).
+
+// A bounded timeout, because the pre-fix behaviour is not a wrong value but an absent event:
+// the mute socket simply stays open forever, so without this a regression hangs the suite.
+test(
+  "an unresponsive live-event client is reaped so the server stops counting a reviewer who is gone",
+  { timeout: 5000 },
+  async () => {
+    await withTempDir(async (dir) => {
+      const artifact = await writeArtifact(dir);
+      const server = await serve({
+        port: 0,
+        stateFile: path.join(dir, "state.json"),
+        version: "9.9.9-test",
+        env: {},
+        hosts: ["127.0.0.1"],
+        log: () => {},
+        idleTimeoutMs: null,
+        liveEventHeartbeatMs: 60,
+      });
+      const base = `http://127.0.0.1:${server.port}`;
+      try {
+        const opened = await fetch(`${base}/api/sessions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ file: artifact }),
+        }).then((response) => response.json());
+
+        // A slept laptop or a dropped tailnet path leaves a socket that answers nothing and never
+        // emits `close`. `autoPong: false` reproduces exactly that: the connection is open at the
+        // TCP level and silent at the application level.
+        const mute = new WebSocket(`${base.replace(/^http/, "ws")}/events/${opened.key}`, {
+          origin: base,
+          autoPong: false,
+        });
+        await once(mute, "open");
+        await once(mute, "close");
+        assert.equal(mute.readyState, WebSocket.CLOSED);
+      } finally {
+        await server.close();
+      }
+    });
+  },
+);
+
+test("a live-event client that answers its pings is left connected", async () => {
+  await withTempDir(async (dir) => {
+    const artifact = await writeArtifact(dir);
+    const server = await serve({
+      port: 0,
+      stateFile: path.join(dir, "state.json"),
+      version: "9.9.9-test",
+      env: {},
+      hosts: ["127.0.0.1"],
+      log: () => {},
+      idleTimeoutMs: null,
+      liveEventHeartbeatMs: 40,
+    });
+    const base = `http://127.0.0.1:${server.port}`;
+    try {
+      const opened = await fetch(`${base}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: artifact }),
+      }).then((response) => response.json());
+
+      const healthy = new WebSocket(`${base.replace(/^http/, "ws")}/events/${opened.key}`, { origin: base });
+      await once(healthy, "open");
+      let closed = false;
+      healthy.once("close", () => {
+        closed = true;
+      });
+      // Several heartbeat rounds: a reviewer sitting quietly on a board must never be reaped as
+      // absent, which is the failure mode a liveness check most easily introduces.
+      await new Promise((resolve) => setTimeout(resolve, 260));
+      assert.equal(closed, false);
+      assert.equal(healthy.readyState, WebSocket.OPEN);
+      healthy.close();
+    } finally {
+      await server.close();
+    }
+  });
+});
 
 test("a module-load failure after the stdio writer is installed is timestamped", async () => {
   await withTempDir(async (dir) => {
