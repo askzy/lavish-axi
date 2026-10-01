@@ -881,6 +881,74 @@ test("a poll reporting the session ended by the user tells the agent to stop and
   assert.match(output.next_step, /lavish-axi \/tmp\/report\.html --reopen/);
 });
 
+test("poll feedback and the next step are emitted before the bulky DOM snapshot", async () => {
+  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-poll-output-test-`);
+  const artifact = `${stateDir}/artifact.html`;
+  await writeFile(artifact, "<html><body>hello</body></html>", "utf8");
+  const response = {
+    status: "feedback",
+    prompts: [{ prompt: "Ship it", tag: "message" }],
+    artifact_failures: [{ kind: "artifact-unavailable", detail: "HTTP 404", severity: "fatal" }],
+    dom_snapshot: "large snapshot",
+  };
+  const server = createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, app: "lavish-axi", version: VERSION }));
+      return;
+    }
+    if (req.url?.startsWith("/api/poll?")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(response));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const child = spawn(
+      process.execPath,
+      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "poll", artifact, "--timeout-ms", "1000"],
+      {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        env: { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_PORT: String(address.port) },
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    assert.ok(child.stdout);
+    assert.ok(child.stderr);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    const result = await new Promise((resolve) => {
+      child.on("close", (status, signal) => resolve({ status, signal }));
+    });
+
+    assert.equal(result.status, 0, stderr);
+    const promptsIndex = stdout.indexOf("prompts[");
+    const failuresIndex = stdout.indexOf("artifact_failures[");
+    const nextStepIndex = stdout.indexOf("next_step:");
+    const snapshotIndex = stdout.indexOf("dom_snapshot:");
+    assert.ok(promptsIndex >= 0, "poll stdout contains prompts");
+    assert.ok(failuresIndex >= 0, "poll stdout contains artifact_failures");
+    assert.ok(nextStepIndex >= 0, "poll stdout contains next_step");
+    assert.ok(snapshotIndex >= 0, "poll stdout contains dom_snapshot");
+    assert.ok(promptsIndex < failuresIndex, "prompts precede artifact_failures in poll stdout");
+    assert.ok(failuresIndex < nextStepIndex, "artifact_failures precede next_step in poll stdout");
+    assert.ok(nextStepIndex < snapshotIndex, "next_step precedes dom_snapshot in poll stdout");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(stateDir, { force: true, recursive: true });
+  }
+});
+
 test("a poll reporting an agent-ended session allows a plain reopen if still needed", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
