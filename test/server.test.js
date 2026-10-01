@@ -120,6 +120,15 @@ test("server delegates artifact SDK generation to a dedicated source module", as
   assert.match(source, /from "\.\/artifact-sdk\.js"/);
 });
 
+test("artifact iframe sandbox lets popups escape without granting same-origin", () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const match = html.match(/<iframe id="artifact" sandbox="([^"]+)"/);
+  assert.ok(match, "artifact iframe must declare a sandbox");
+  const tokens = new Set(match[1].split(/\s+/).filter(Boolean));
+  assert.equal(tokens.has("allow-popups-to-escape-sandbox"), true);
+  assert.equal(tokens.has("allow-same-origin"), false);
+});
+
 test("server serves chrome browser behavior from a dedicated source file", async () => {
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
@@ -1361,6 +1370,10 @@ test("/artifact serves files copied under the artifact directory", async () => {
     '<!doctype html><html><head><link rel="stylesheet" href="assets/style.css"></head><body><img src="./assets/icon.svg"></body></html>',
   );
   await writeFile(path.join(assetDir, "style.css"), "body { color: rgb(1 2 3); }\n");
+  await writeFile(
+    path.join(assetDir, "popup.html"),
+    "<!doctype html><script>document.title = 'artifact popup'</script>",
+  );
   await writeFile(path.join(assetDir, "icon.svg"), '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>');
   const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
   try {
@@ -1371,13 +1384,23 @@ test("/artifact serves files copied under the artifact directory", async () => {
       body: JSON.stringify({ file: artifact }),
     });
     const session = await sessionRes.json();
+    const load = await beginArtifactLoad(base, session.key);
+    const documentResponse = await fetch(artifactLoadUrl(base, session.key, load));
+    const popup = await fetch(`${base}/artifact/${session.key}/assets/popup.html`);
     const css = await fetch(`${base}/artifact/${session.key}/assets/style.css`);
     const svg = await fetch(`${base}/artifact/${session.key}/assets/icon.svg`);
+    const expectedSandbox =
+      "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads";
 
+    assert.equal(documentResponse.status, 200);
+    assert.equal(documentResponse.headers.get("content-security-policy"), expectedSandbox);
+    assert.equal(popup.status, 200);
+    assert.equal(popup.headers.get("content-security-policy"), expectedSandbox);
     assert.equal(css.status, 200);
     assert.match(css.headers.get("content-type") || "", /text\/css/);
     assert.equal(await css.text(), "body { color: rgb(1 2 3); }\n");
     assert.equal(svg.status, 200);
+    assert.equal(svg.headers.get("content-security-policy"), expectedSandbox);
     assert.match(svg.headers.get("content-type") || "", /image\/svg\+xml/);
     assert.match(await svg.text(), /<svg/);
   } finally {
@@ -2404,6 +2427,10 @@ test("GET /api/:key/export inlines local assets and leaves remote references int
 
     const exportRes = await fetch(`${base}/api/${session.key}/export`);
     assert.equal(exportRes.status, 200);
+    assert.equal(
+      exportRes.headers.get("content-security-policy"),
+      "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads",
+    );
     assert.match(exportRes.headers.get("content-disposition") || "", /attachment; filename="artifact\.export\.html"/);
     const body = await exportRes.text();
     // local stylesheet + image inlined
@@ -3617,7 +3644,7 @@ test("layout gate curtain reuses the ended overlay card styling", async () => {
   assert.match(html, /<body class="lavish layout-gate-active">/);
   assert.match(
     html,
-    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="\/artifact\/abc\/index\.html"><\/iframe>/,
+    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="\/artifact\/abc\/index\.html"><\/iframe>/,
   );
   assert.doesNotMatch(html, /<iframe id="artifact"[^>]* src=/);
   assert.match(html, /class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"/);
