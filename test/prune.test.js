@@ -114,6 +114,43 @@ test("resolvers for the open-session windows read their own env vars with 0/off 
   assert.throws(() => resolvePruneOpenMaxAgeMs({ LAVISH_AXI_PRUNE_OPEN_MAX_AGE: "1w" }), /Invalid duration/);
 });
 
+test("prune removes a pruned session's attachment dir and leaves live sessions' attachments alone", async () => {
+  const dir = await makeTemp();
+  try {
+    const stale = await writeArtifact(dir, "stale.html", OLD);
+    const live = await writeArtifact(dir, "live.html", RECENT);
+    const staleRecord = sessionRecord(stale, "ended", OLD);
+    const liveRecord = sessionRecord(live, "open", RECENT, USER_REPLY);
+    const stateFile = await writeStore(dir, [staleRecord, liveRecord]);
+    const id = "a".repeat(64) + ".png";
+    const staleDir = path.join(dir, "attachments", staleRecord.key);
+    const liveDir = path.join(dir, "attachments", liveRecord.key);
+    await mkdir(staleDir, { recursive: true });
+    await mkdir(liveDir, { recursive: true });
+    await writeFile(path.join(staleDir, id), Buffer.alloc(100));
+    await writeFile(path.join(staleDir, `${id}.meta`), "{}");
+    await writeFile(path.join(liveDir, id), Buffer.alloc(100));
+
+    const dryRun = await prune({
+      store: new SessionStore(stateFile),
+      maxAgeMs: 30 * DAY_MS,
+      dryRun: true,
+      now: () => NOW,
+    });
+    assert.deepEqual(dryRun.removedSessions, [stale]);
+    assert.ok(await exists(path.join(staleDir, id)), "a dry run deletes nothing");
+
+    const result = await prune({ store: new SessionStore(stateFile), maxAgeMs: 30 * DAY_MS, now: () => NOW });
+    assert.deepEqual(result.removedSessions, [stale]);
+    assert.equal(await exists(staleDir), false, "the pruned session's attachment dir is gone");
+    assert.ok(await exists(path.join(liveDir, id)), "the live session's attachment survives");
+    assert.ok(result.bytesFreed >= 102, "freed bytes count the attachment files");
+    assert.equal(dryRun.bytesFreed, result.bytesFreed, "a dry run reports the same total it would free");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("prune removes abandoned open sessions by the unreplied and open windows", async () => {
   const dir = await makeTemp();
   try {

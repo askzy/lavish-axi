@@ -4,6 +4,7 @@ import { request as httpRequest } from "node:http";
 import { connect as netConnect } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 
@@ -25,6 +26,7 @@ import {
   hostnameFromHostHeader,
   isAllowedHostHeader,
   isAllowedRequestHost,
+  readAttachmentUploadBody,
   resolveArtifactAsset,
   resolveDesignAssetPath,
   resolveIdleTimeoutMs,
@@ -4987,5 +4989,85 @@ test("a timed poll shorter than the lease does not wake for it", async () => {
     assert.equal(timed.status, "waiting");
   } finally {
     await fixture.close();
+  }
+});
+
+test("createChromeHtml exposes the attachment caps so the chrome can pre-check uploads", () => {
+  const html = createChromeHtml(
+    { key: "abc", file: "/tmp/artifact.html" },
+    { attachmentMaxBytes: 12345, attachmentMaxCount: 7 },
+  );
+  assert.match(html, /"attachmentMaxBytes":12345/);
+  assert.match(html, /"attachmentMaxCount":7/);
+  assert.match(html, /"attachmentAcceptedMime":\["image\/png","image\/jpeg","image\/webp"\]/);
+});
+
+test("createSdkJs hands the server's attachment caps and the session key to the SDK", () => {
+  const js = createSdkJs("0123456789abcdef", 3, "tok", { maxAttachmentCount: 4, maxAttachmentBytes: 1024 });
+  assert.match(js, /const key="0123456789abcdef";/);
+  assert.match(
+    js,
+    /artifactRevision, artifactLoadToken, key, \{"maxAttachmentCount":4,"maxAttachmentBytes":1024,"acceptedImageMime":\["image\/png","image\/jpeg","image\/webp"\]\}\);/,
+  );
+});
+
+test("readAttachmentUploadBody buffers under the cap and drains the stream when over it", async () => {
+  const under = await readAttachmentUploadBody(Readable.from([Buffer.from("ab"), Buffer.from("c")]), 10);
+  assert.equal(under.tooLarge, false);
+  assert.equal(under.buffer.toString(), "abc");
+
+  // Over the cap: it must consume every chunk (drain to end) and report tooLarge
+  // without buffering, so the route can send a clean 413 after the body is read.
+  let drained = 0;
+  const chunks = [Buffer.alloc(6), Buffer.alloc(8), Buffer.alloc(4)];
+  const stream = Readable.from(chunks);
+  stream.on("data", (chunk) => {
+    drained += chunk.length;
+  });
+  const over = await readAttachmentUploadBody(stream, 10);
+  assert.equal(over.tooLarge, true);
+  assert.equal(over.buffer, null);
+  assert.equal(drained, 18);
+});
+
+// Fork: the chrome retries a 413 on /prompts without the DOM snapshot. That retry only works if
+// the server actually answers 413 - the old error handler flattened the body-parser error to 500.
+test("POST /api/:key/prompts answers a real over-2MB body with 413, not 500", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body><h1>hi</h1></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const { key } = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((res) => res.json());
+
+    const oversized = await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({
+        domSnapshot: "x".repeat(2 * 1024 * 1024 + 1),
+        prompts: [{ uid: "1", prompt: "too big", selector: "h1", tag: "h1", text: "hi" }],
+      }),
+    });
+    assert.equal(oversized.status, 413);
+
+    // Nothing was queued; the retry without the snapshot then lands normally.
+    const idle = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then((res) =>
+      res.json(),
+    );
+    assert.equal(idle.status, "waiting");
+    const retried = await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ prompts: [{ uid: "1", prompt: "too big", selector: "h1", tag: "h1", text: "hi" }] }),
+    });
+    assert.equal(retried.status, 200);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });
