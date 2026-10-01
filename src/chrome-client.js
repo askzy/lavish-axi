@@ -791,15 +791,22 @@ function parseChatRevision(value) {
   return Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
 }
 
-// A sync at the same revision is applied only when it still carries, in order, everything this
-// tab already shows: a stale snapshot must not wipe a newer tail.
+// A sync at the same revision is applied only when it still carries, in order, what this tab
+// already shows. The server bounds the stored transcript, so a sync may have dropped a prefix of
+// the displayed entries; the remaining displayed suffix must still appear in order, and a stale
+// snapshot that is missing a newer tail (including an empty wipe) is rejected.
 function chatContainsEntries(candidate, entries) {
-  if (candidate.length < entries.length) return false;
-  let matched = 0;
-  for (const entry of candidate) {
-    if (matched < entries.length && chatEntriesMatch(entry, entries[matched])) matched += 1;
+  if (!Array.isArray(candidate) || !Array.isArray(entries)) return false;
+  if (entries.length === 0) return true;
+  for (let start = 0; start < entries.length; start += 1) {
+    const suffix = entries.slice(start);
+    let matched = 0;
+    for (const entry of candidate) {
+      if (matched < suffix.length && chatEntriesMatch(entry, suffix[matched])) matched += 1;
+    }
+    if (matched === suffix.length) return true;
   }
-  return matched === entries.length;
+  return false;
 }
 
 function chatStartsWith(candidate, prefix) {
@@ -814,11 +821,21 @@ function chatStartsWith(candidate, prefix) {
 // The /prompts response carries the transcript as of the accept. Anything this tab showed since
 // the request started (a live agent reply, another tab's send) that the response does not carry
 // yet is kept after it rather than dropped.
+// The accepted transcript may have been bounded while the request was in flight, so it may start
+// partway through `chatAtRequest`; the overlap is found by offset rather than demanded whole.
 function mergeAcceptedChat(accepted, chatAtRequest) {
-  if (!chatStartsWith(accepted, chatAtRequest) || !chatStartsWith(displayedChat, chatAtRequest)) return null;
+  if (!Array.isArray(accepted) || !Array.isArray(chatAtRequest)) return null;
+  if (!chatStartsWith(displayedChat, chatAtRequest)) return null;
+  let requestOffset = chatAtRequest.length;
+  for (let i = 0; i <= chatAtRequest.length; i += 1) {
+    if (chatStartsWith(accepted, chatAtRequest.slice(i))) {
+      requestOffset = i;
+      break;
+    }
+  }
   const displayedTail = displayedChat.slice(chatAtRequest.length);
   const unmatchedDisplayed = [];
-  let acceptedIndex = chatAtRequest.length;
+  let acceptedIndex = chatAtRequest.length - requestOffset;
   for (const displayedEntry of displayedTail) {
     while (acceptedIndex < accepted.length && !chatEntriesMatch(accepted[acceptedIndex], displayedEntry)) {
       acceptedIndex += 1;

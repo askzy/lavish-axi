@@ -13,6 +13,7 @@ import {
   SessionStore,
   sessionKey,
 } from "../src/session-store.js";
+import { MAX_CHAT_STORED_BYTES, storedChatBytes } from "../src/chat-messages.js";
 
 let beginRequestSequence = 0;
 
@@ -1988,7 +1989,7 @@ async function withStore(run) {
     await writeFile(artifact, "<h1>Hello</h1>");
     const store = new SessionStore(stateFile);
     const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
-    await run({ store, session });
+    await run({ store, session, stateFile, artifact });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -2789,5 +2790,115 @@ test("reopening a session keeps its chat revision and acknowledged identities", 
     assert.equal(reopened.chat_revision, 2);
     assert.deepEqual(reopened.chat_ack_ids, []);
     assert.equal(reopened.chat.length, 2);
+  });
+});
+
+test("evicting chat past 5 MiB keeps prompt_id settlement and the remaining stored bytes in bound", async () => {
+  await withStore(async ({ store, session }) => {
+    const olderId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const newerId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    const payload = "x".repeat(Math.ceil(MAX_CHAT_STORED_BYTES / 2) + 1024);
+    const note = (id) => ({
+      uid: "",
+      prompt: payload,
+      selector: "",
+      tag: "message",
+      text: "Freeform message",
+      prompt_id: id,
+    });
+    await store.queuePrompts(session.key, { prompts: [note(olderId)] });
+    await store.queuePrompts(session.key, { prompts: [note(newerId)] });
+    const bounded = await store.findByKey(session.key);
+    assert.ok(storedChatBytes(bounded.chat) <= MAX_CHAT_STORED_BYTES);
+    assert.equal(
+      bounded.chat.some((entry) => entry.prompt_id === olderId),
+      false,
+    );
+    assert.equal(
+      bounded.chat.some((entry) => entry.prompt_id === newerId),
+      true,
+    );
+    assert.deepEqual(bounded.chat_ack_ids, [olderId]);
+    assert.equal(bounded.prompts.length, 2);
+
+    await store.queuePrompts(session.key, { prompts: [note(olderId)] });
+    const afterRetry = await store.findByKey(session.key);
+    assert.equal(afterRetry.prompts.length, 2, "an evicted identity must not re-queue for the agent");
+    assert.deepEqual(afterRetry.chat_ack_ids, [olderId]);
+    assert.equal(
+      afterRetry.chat.some((entry) => entry.prompt_id === olderId),
+      false,
+    );
+
+    const reopened = await store.upsertSession(session.file, session.url);
+    assert.deepEqual(reopened.chat_ack_ids, [olderId]);
+  });
+});
+
+test("loading bounds and persists a legacy transcript without reopening it", async () => {
+  await withStore(async ({ store, session, stateFile }) => {
+    const olderId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const newerId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    state.sessions[session.key].chat = [
+      { role: "user", text: "x".repeat(Math.ceil(MAX_CHAT_STORED_BYTES / 2)), prompt_id: olderId },
+      { role: "user", text: "y".repeat(Math.ceil(MAX_CHAT_STORED_BYTES / 2)), prompt_id: newerId },
+    ];
+    await writeFile(stateFile, JSON.stringify(state));
+
+    const loaded = await store.findByKey(session.key);
+    assert.ok(storedChatBytes(loaded.chat) <= MAX_CHAT_STORED_BYTES);
+    assert.deepEqual(
+      loaded.chat.map((entry) => entry.prompt_id),
+      [newerId],
+    );
+    assert.deepEqual(loaded.chat_ack_ids, [olderId]);
+    assert.equal(loaded.chat_revision, 1);
+
+    const persisted = JSON.parse(await readFile(stateFile, "utf8")).sessions[session.key];
+    assert.deepEqual(persisted.chat, loaded.chat);
+    assert.deepEqual(persisted.chat_ack_ids, [olderId]);
+    assert.equal(persisted.chat_revision, 1);
+
+    await store.queuePrompts(session.key, {
+      prompts: [
+        {
+          uid: "",
+          prompt: "Do not send twice",
+          selector: "",
+          tag: "message",
+          text: "Freeform message",
+          prompt_id: olderId,
+        },
+      ],
+    });
+    const afterRetry = await store.findByKey(session.key);
+    assert.deepEqual(afterRetry.prompts, []);
+    assert.deepEqual(afterRetry.chat_ack_ids, [olderId]);
+    assert.equal(afterRetry.chat_revision, 1);
+  });
+});
+
+test("an oversized agent reply preserves evicted prompt acks without exceeding the hard cap", async () => {
+  await withStore(async ({ store, session }) => {
+    const olderId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const note = {
+      uid: "",
+      prompt: "Keep this note",
+      selector: "",
+      tag: "message",
+      text: "Freeform message",
+      prompt_id: olderId,
+    };
+    await store.queuePrompts(session.key, { prompts: [note] });
+    const replied = await store.addAgentReply(session.key, "y".repeat(MAX_CHAT_STORED_BYTES));
+    assert.deepEqual(replied.leases, [], "a reply still retires every lease");
+    const updated = await store.findByKey(session.key);
+    assert.deepEqual(updated.chat, []);
+    assert.ok(storedChatBytes(updated.chat) <= MAX_CHAT_STORED_BYTES);
+    assert.deepEqual(updated.chat_ack_ids, [olderId]);
+    await store.queuePrompts(session.key, { prompts: [note] });
+    const afterRetry = await store.findByKey(session.key);
+    assert.equal(afterRetry.prompts.length, 1, "the evicted note must not be delivered twice");
   });
 });
