@@ -717,13 +717,16 @@ export class SessionStore {
     });
   }
 
-  async addAgentReply(key, text) {
+  async addAgentReply(key, text, { requireOpen = false } = {}) {
     return this.runExclusive(async () => {
       const state = await this.readState();
       const session = state.sessions[key];
       if (!session) {
         return null;
       }
+      // Refused before the lease clear below: an ended session's final batch stays leased so the
+      // next drain still delivers it.
+      if (requireOpen && session.status === "ended") return session;
       const at = new Date().toISOString();
       session.chat = [...(session.chat || []), { role: "agent", text: String(text || ""), at }];
       applyTranscriptBound(session);
