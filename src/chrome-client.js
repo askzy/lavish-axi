@@ -18,7 +18,12 @@ const retiredDraftStorageKey = "lavish-axi:retired-drafts:" + key;
 /** @type {any[]} */
 const retiredDraftNodes = [];
 const internalQueueKeyField = "_lavishQueueKey";
+const promptIdentityField = "prompt_id";
+const PROMPT_IDENTITY_MAX = 128;
+const PROMPT_IDENTITY_RE = /^[A-Za-z0-9_-]+$/;
 const initialChat = Array.isArray(sessionData.initialChat) ? sessionData.initialChat : [];
+const initialChatAckIds = Array.isArray(sessionData.initialChatAckIds) ? sessionData.initialChatAckIds : [];
+const initialChatRevision = parseChatRevision(sessionData.initialChatRevision) || 0;
 const MODE_TOGGLE_HOTKEY_KEY = String(sessionData.modeToggleHotkeyKey || "").toLowerCase();
 const attachmentMaxBytes = Number(sessionData.attachmentMaxBytes) || 0;
 const attachmentMaxCount = Number(sessionData.attachmentMaxCount) || 4;
@@ -100,7 +105,7 @@ function isModeToggleHotkeyEvent(event) {
 
 const frame = /** @type {HTMLIFrameElement} */ (document.getElementById("artifact"));
 const panelScroll = /** @type {HTMLDivElement} */ (document.getElementById("panelScroll"));
-const annotationPills = /** @type {HTMLDivElement} */ (document.getElementById("annotationPills"));
+const queuedLog = /** @type {HTMLDivElement} */ (document.getElementById("queuedLog"));
 const chatLog = /** @type {HTMLDivElement} */ (document.getElementById("chatLog"));
 const chatInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("chatInput"));
 const chatComposer = /** @type {HTMLDivElement} */ (document.getElementById("chatComposer"));
@@ -214,11 +219,21 @@ const SEND_FAILED_COPY =
 const SEND_ACKNOWLEDGEMENT_WARNING_MS = 10_000;
 const SEND_STALLED_COPY =
   "Still trying to send. Your feedback is saved in this tab. Keep this tab open while Lavish catches up, and check that the server is running.";
+/** @type {{ action: "copy" | "submit", prompts?: any[], timeout: ReturnType<typeof setTimeout> }[]} */
 const snapshotRequests = [];
 let endAfterSubmit = false;
 let workingBubble = null;
+// The transcript as this tab last showed it, in the server's serialized shape. Settlement is by
+// per-submission identity, not displayed content: two tabs can queue notes whose chat projection
+// is identical (same selected text under one container, different range boundaries) without
+// settling each other, and a reload after a lost POST response still recognizes an
+// already-accepted note.
+let displayedChat = initialChat.slice();
+let chatRevision = initialChatRevision;
 let submitQueuedPromise = null;
 let submitQueuedAgain = false;
+/** @type {any[] | null} */
+let activeSubmission = null;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendAcknowledgementTimer;
 let lastScroll = { x: 0, y: 0 };
@@ -340,6 +355,49 @@ function sanitizeAttachmentRefs(value) {
   return refs;
 }
 
+function isPromptIdentity(value) {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= PROMPT_IDENTITY_MAX &&
+    PROMPT_IDENTITY_RE.test(value)
+  );
+}
+
+function promptIdentity(value) {
+  return isPromptIdentity(value?.[promptIdentityField]) ? value[promptIdentityField] : "";
+}
+
+// Identities the server acknowledged but no longer shows as a transcript entry. Empty until a
+// transcript bound exists; kept so a settle check never depends on the entry still being visible.
+const chatAckIds = new Set();
+function rememberChatAckIds(ids) {
+  if (!Array.isArray(ids)) return;
+  for (const value of ids) {
+    if (isPromptIdentity(value)) chatAckIds.add(value);
+  }
+}
+rememberChatAckIds(initialChatAckIds);
+
+function createPromptIdentity() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
+}
+
+function assignPromptIdentity(prompt, keepExisting) {
+  if (keepExisting && promptIdentity(prompt)) return prompt;
+  prompt[promptIdentityField] = createPromptIdentity();
+  return prompt;
+}
+
+function adoptQueuedPrompt(rawPrompt, keepIdentity) {
+  const prompt = sanitizeQueuedPrompt(rawPrompt);
+  if (!prompt) return null;
+  if (!keepIdentity) delete prompt[promptIdentityField];
+  assignPromptIdentity(prompt, true);
+  return prompt;
+}
+
 function sanitizeQueuedPrompt(prompt) {
   if (!prompt || typeof prompt !== "object") return null;
   if (!("attachments" in prompt)) return prompt;
@@ -355,7 +413,9 @@ function loadQueuedPrompts() {
     const parsed = JSON.parse(sessionStorage.getItem(queueStorageKey) || "[]");
     // Also sanitize on restore: a tab poisoned before this guard existed still has
     // the bad prompt on disk and would otherwise stay wedged after an upgrade.
-    return Array.isArray(parsed) ? parsed.map(sanitizeQueuedPrompt).filter(Boolean) : [];
+    // Keep a stored identity so a reload can settle an already-accepted note; mint
+    // one only when the restored prompt predates identity.
+    return Array.isArray(parsed) ? parsed.map((item) => adoptQueuedPrompt(item, true)).filter(Boolean) : [];
   } catch {
     return [];
   }
@@ -373,50 +433,147 @@ function persistQueuedPrompts() {
   }
 }
 
-function promptTargetLabel(prompt) {
-  if (prompt?.target?.type === "table-cell") {
-    const semantic = [prompt.target.rowLabel, prompt.target.columnLabel].filter(Boolean).join(" → ");
-    if (semantic) return semantic;
+const REMOVE_ICON_SVG =
+  '<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+const ANCHOR_EXCERPT_MAX = 120;
+const ANCHOR_SELECTOR_MAX = 512;
+const ANCHOR_LABEL_MAX = 40;
+
+function boundAnchorText(value, max) {
+  const text = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length <= max) return text;
+  return text.slice(0, max - 1) + "…";
+}
+
+// What a queued note is attached to, in the annotation card's own words. This is the same rule
+// as the server's `chatEntryForPrompt` (src/chat-messages.js), which derives the anchor for the
+// note once it is sent: a queued prompt has not reached the server yet and this file cannot
+// import modules, so the rule is duplicated here and test/chrome-client-queue.test.js pins the
+// two against the same fixtures. A bubble must not change its anchor when it settles.
+function promptAnchor(prompt) {
+  const tag = String(prompt?.tag || "");
+  if (tag === "message") return null;
+  const target = prompt?.target && typeof prompt.target === "object" ? prompt.target : null;
+  const selector = boundAnchorText(prompt?.selector, ANCHOR_SELECTOR_MAX);
+  const withSelector = (anchor) => (selector ? { ...anchor, selector } : anchor);
+  if (tag === "whiteboard") {
+    const index = Number(target?.diagramIndex);
+    const excerpt = Number.isInteger(index) && index >= 0 ? "Diagram " + (index + 1) : prompt.text;
+    return { kind: "whiteboard", label: "whiteboard", excerpt: boundAnchorText(excerpt, ANCHOR_EXCERPT_MAX) };
   }
-  return String(prompt?.selector || "");
+  if (tag === "layout-warnings") {
+    const count = Array.isArray(target?.warnings) ? target.warnings.length : 0;
+    const excerpt = count > 0 ? count + (count === 1 ? " issue" : " issues") : prompt.text;
+    return { kind: "layout", label: "layout", excerpt: boundAnchorText(excerpt, ANCHOR_EXCERPT_MAX) };
+  }
+  const type = String(target?.type || "");
+  if (type === "text-range") {
+    return withSelector({
+      kind: "text",
+      label: "text",
+      excerpt: boundAnchorText(target.text || prompt.text, ANCHOR_EXCERPT_MAX),
+    });
+  }
+  if (type === "table-cell") {
+    const semantic = [target.rowLabel, target.columnLabel]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+      .join(" → ");
+    if (semantic)
+      return withSelector({ kind: "cell", label: "cell", excerpt: boundAnchorText(semantic, ANCHOR_EXCERPT_MAX) });
+  }
+  if (type === "mermaid-node") {
+    return withSelector({
+      kind: "node",
+      label: "node",
+      excerpt: boundAnchorText(target.label || prompt.text, ANCHOR_EXCERPT_MAX),
+    });
+  }
+  const elementTag = tag.trim();
+  if (!elementTag) return null;
+  return withSelector({
+    kind: "element",
+    label: boundAnchorText("<" + elementTag + ">", ANCHOR_LABEL_MAX),
+    excerpt: boundAnchorText(prompt.text, ANCHOR_EXCERPT_MAX),
+  });
+}
+
+// The anchor line: a mono chip naming the kind (`<h2>`, `text`, `cell`, ...) and a quoted
+// excerpt, with the full excerpt and selector on hover.
+function anchorHtml(anchor) {
+  if (!anchor || typeof anchor !== "object") return "";
+  const excerpt = String(anchor.excerpt || "");
+  const title = [excerpt, anchor.selector].filter(Boolean).join("\n");
+  return (
+    '<div class="anchor" title="' +
+    escapeHtml(title) +
+    '"><span class="anchor-kind">' +
+    escapeHtml(anchor.label || "") +
+    "</span>" +
+    (excerpt
+      ? '<span class="anchor-excerpt' +
+        (anchor.kind === "text" ? " text" : "") +
+        '">“' +
+        escapeHtml(excerpt) +
+        "”</span>"
+      : "") +
+    "</div>"
+  );
+}
+
+// What a note with images and no words says for itself. A queued prompt keeps its words in
+// `prompt` (`text` is the element's excerpt); a transcript entry keeps them in `text`.
+function attachmentOnlyText(entry) {
+  if (!attachmentCount(entry)) return "";
+  return entry.tag === "message" || entry.kind === "message" ? "Image message" : "Image annotation";
+}
+
+function userBubbleTextHtml(entry, text) {
+  const displayText = String(text || attachmentOnlyText(entry));
+  return displayText ? '<div class="bubble-text">' + escapeHtml(displayText) + "</div>" : "";
+}
+
+// A queued note is the user bubble in its not-yet-sent state: dashed, labelled Queued (Sending
+// while its batch is in flight), and removable until then. It settles in place as a sent bubble
+// once the server's transcript carries it, so nothing moves between regions.
+function queuedBubbleHtml(prompt, index) {
+  const sending = isPromptSending(prompt);
+  return (
+    '<div class="bubble user queued"><small>' +
+    (sending ? "Sending…" : "Queued") +
+    ' <button class="queued-remove" type="button" aria-label="Remove queued prompt" data-index="' +
+    index +
+    '">' +
+    REMOVE_ICON_SVG +
+    "</button></small>" +
+    anchorHtml(promptAnchor(prompt)) +
+    userBubbleTextHtml(prompt, prompt.prompt) +
+    bubbleAttachmentsHtml(prompt) +
+    "</div>"
+  );
+}
+
+// Whether a queued prompt is committed to a send that has not been answered yet: waiting for its
+// snapshot or in flight. Derived from the existing send bookkeeping rather than tracked
+// separately, so no failure path can strand a note labelled Sending with its remove control
+// disabled.
+function isPromptSending(prompt) {
+  for (const request of snapshotRequests) {
+    if (request.action === "submit" && Array.isArray(request.prompts) && request.prompts.includes(prompt)) return true;
+  }
+  return Boolean(activeSubmission && activeSubmission.includes(prompt));
 }
 
 function render() {
-  annotationPills.innerHTML = queued
-    .map((prompt, index) => {
-      const targetLabel = promptTargetLabel(prompt);
-      const showLocator = targetLabel && prompt.selector && targetLabel !== prompt.selector;
-      return (
-        '<div class="pill-wrap"><div class="pill"><span class="pill-preview">' +
-        escapeHtml(
-          prompt.prompt ||
-            (attachmentCount(prompt) ? (prompt.tag === "message" ? "Image message" : "Image annotation") : ""),
-        ) +
-        "</span>" +
-        pillAttachmentsHtml(prompt) +
-        '<button class="pill-close" type="button" aria-label="Remove queued prompt" data-index="' +
-        index +
-        '"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><div class="pill-tooltip">' +
-        (targetLabel
-          ? '<div class="tooltip-label">Target</div><div class="pill-tooltip-target">' +
-            escapeHtml(targetLabel) +
-            "</div>"
-          : "") +
-        (showLocator
-          ? '<div class="tooltip-label">Locator</div><div class="pill-tooltip-target">' +
-            escapeHtml(prompt.selector) +
-            "</div>"
-          : "") +
-        '<div class="tooltip-label">Prompt</div><div class="pill-tooltip-prompt">' +
-        escapeHtml(prompt.prompt) +
-        "</div></div></div>"
-      );
-    })
-    .join("");
+  queuedLog.innerHTML = queued.map((prompt, index) => queuedBubbleHtml(prompt, index)).join("");
 
-  for (const button of annotationPills.querySelectorAll(".pill-close")) {
-    const closeButton = /** @type {HTMLButtonElement} */ (button);
-    closeButton.addEventListener("click", (event) => removeQueuedPrompt(Number(closeButton.dataset.index), event));
+  for (const button of queuedLog.querySelectorAll(".queued-remove")) {
+    const removeButton = /** @type {HTMLButtonElement} */ (button);
+    const prompt = queued[Number(removeButton.dataset.index)];
+    removeButton.disabled = isPromptSending(prompt);
+    removeButton.addEventListener("click", (event) => removeQueuedPrompt(Number(removeButton.dataset.index), event));
   }
   updateSendState();
   scrollPanelToBottom();
@@ -433,27 +590,26 @@ function attachmentCount(prompt) {
   return Array.isArray(prompt.attachments) ? prompt.attachments.length : 0;
 }
 
-// How many thumbnails the compact pill shows before the rest collapse into a badge.
-const PILL_THUMBNAIL_LIMIT = 4;
+// How many thumbnails a bubble shows before the rest collapse into a badge.
+const BUBBLE_THUMBNAIL_LIMIT = 4;
 
-// Thumbnails for a queued prompt's images, served straight from the same-origin
-// attachment endpoint (the ids are already server-vetted at upload time). The pill
-// has room for only a few, but the per-prompt cap is configurable
-// (LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT), so a prompt can legitimately carry more
-// than fit: the remainder collapses into a +N badge rather than being dropped from
-// the preview, which would make the queue look like it lost the extra images.
-function pillAttachmentsHtml(prompt) {
-  const count = attachmentCount(prompt);
+// Thumbnails for a note's images, served straight from the same-origin attachment endpoint (the
+// ids are already server-vetted at upload time). The bubble has room for only a few, but the
+// per-prompt cap is configurable (LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT), so a note can
+// legitimately carry more than fit: the remainder collapses into a +N badge rather than being
+// dropped from the preview, which would make the queue look like it lost the extra images.
+function bubbleAttachmentsHtml(entry) {
+  const count = attachmentCount(entry);
   if (!count) return "";
-  const hidden = count - PILL_THUMBNAIL_LIMIT;
+  const hidden = count - BUBBLE_THUMBNAIL_LIMIT;
   return (
-    '<span class="pill-attachments">' +
-    prompt.attachments
-      .slice(0, PILL_THUMBNAIL_LIMIT)
+    '<span class="bubble-attachments">' +
+    entry.attachments
+      .slice(0, BUBBLE_THUMBNAIL_LIMIT)
       .map((attachment) => {
         const alt = escapeHtml(attachment.name || "image");
         return (
-          '<img class="pill-attachment" src="/api/' +
+          '<img class="bubble-attachment" src="/api/' +
           encodeURIComponent(key) +
           "/attachments/" +
           encodeURIComponent(attachment.id) +
@@ -466,7 +622,7 @@ function pillAttachmentsHtml(prompt) {
       })
       .join("") +
     (hidden > 0
-      ? '<span class="pill-attachment-more" title="' +
+      ? '<span class="bubble-attachment-more" title="' +
         hidden +
         " more image" +
         (hidden === 1 ? "" : "s") +
@@ -477,6 +633,24 @@ function pillAttachmentsHtml(prompt) {
     "</span>"
   );
 }
+
+function replaceExpiredThumbnail(event) {
+  const image = event.target;
+  if (
+    String(image?.tagName || "").toUpperCase() !== "IMG" ||
+    !String(image.className || "")
+      .split(/\s+/)
+      .includes("bubble-attachment")
+  )
+    return;
+  const expired = document.createElement("span");
+  expired.className = "bubble-attachment bubble-attachment-expired";
+  expired.textContent = "Image expired";
+  expired.title = String(image.alt || "image");
+  image.replaceWith(expired);
+}
+
+chatLog.addEventListener("error", replaceExpiredThumbnail, true);
 
 // `holdMs === null` keeps the hint up until a send succeeds or the queue empties; typing does not
 // clear a persistent hint, only `hideSendHint(true)` does.
@@ -561,24 +735,155 @@ async function copyText(text) {
   return true;
 }
 
-function addChat(role, text, shouldScroll = true) {
-  if (!text) return;
+// One transcript entry, as the server serialized it (src/chat-messages.js). An agent entry's
+// `html` is the server's rendering of the agent's text and is the only html ever set here; a
+// user entry is always escaped text, with its anchor line and thumbnails when it carries them.
+function chatBubbleHtml(entry) {
+  if (entry.role === "agent") {
+    return (
+      "<small>Agent</small>" +
+      (typeof entry.html === "string" && entry.html
+        ? '<div class="chat-md">' + entry.html + "</div>"
+        : '<div class="bubble-text">' + escapeHtml(entry.text) + "</div>")
+    );
+  }
+  return (
+    "<small>You</small>" +
+    anchorHtml(entry.anchor) +
+    userBubbleTextHtml(entry, entry.text) +
+    bubbleAttachmentsHtml(entry)
+  );
+}
+
+function addChat(entry, shouldScroll = true) {
+  if (!entry || typeof entry !== "object") return;
+  const role = entry.role === "agent" ? "agent" : "user";
+  const text = String(entry.text || "");
+  if (!text && !(role === "agent" ? entry.html : attachmentCount(entry) || entry.anchor)) return;
 
   const el = document.createElement("div");
   el.className = "bubble " + role;
-  el.innerHTML = "<small>" + (role === "agent" ? "Agent" : "You") + "</small><div>" + escapeHtml(text) + "</div>";
+  el.innerHTML = chatBubbleHtml({ ...entry, role, text });
   chatLog.appendChild(el);
   if (shouldScroll) scrollElementIntoView(el);
   return el;
 }
 
-function syncChat(chat) {
+function chatEntryDisplayKey(entry) {
+  return JSON.stringify({
+    role: entry?.role === "agent" ? "agent" : "user",
+    kind: entry?.kind,
+    text: String(entry?.text || ""),
+    anchor: entry?.anchor,
+    attachments: Array.isArray(entry?.attachments) ? entry.attachments.map((item) => String(item?.id || "")) : [],
+  });
+}
+
+function chatEntriesMatch(left, right) {
+  if (chatEntryDisplayKey(left) !== chatEntryDisplayKey(right)) return false;
+  const leftAt = String(left?.at || "");
+  const rightAt = String(right?.at || "");
+  return !leftAt || !rightAt || leftAt === rightAt;
+}
+
+function parseChatRevision(value) {
+  const revision = Number(value);
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
+}
+
+// A sync at the same revision is applied only when it still carries, in order, everything this
+// tab already shows: a stale snapshot must not wipe a newer tail.
+function chatContainsEntries(candidate, entries) {
+  if (candidate.length < entries.length) return false;
+  let matched = 0;
+  for (const entry of candidate) {
+    if (matched < entries.length && chatEntriesMatch(entry, entries[matched])) matched += 1;
+  }
+  return matched === entries.length;
+}
+
+function chatStartsWith(candidate, prefix) {
+  return (
+    Array.isArray(candidate) &&
+    Array.isArray(prefix) &&
+    candidate.length >= prefix.length &&
+    prefix.every((entry, index) => chatEntriesMatch(candidate[index], entry))
+  );
+}
+
+// The /prompts response carries the transcript as of the accept. Anything this tab showed since
+// the request started (a live agent reply, another tab's send) that the response does not carry
+// yet is kept after it rather than dropped.
+function mergeAcceptedChat(accepted, chatAtRequest) {
+  if (!chatStartsWith(accepted, chatAtRequest) || !chatStartsWith(displayedChat, chatAtRequest)) return null;
+  const displayedTail = displayedChat.slice(chatAtRequest.length);
+  const unmatchedDisplayed = [];
+  let acceptedIndex = chatAtRequest.length;
+  for (const displayedEntry of displayedTail) {
+    while (acceptedIndex < accepted.length && !chatEntriesMatch(accepted[acceptedIndex], displayedEntry)) {
+      acceptedIndex += 1;
+    }
+    if (acceptedIndex < accepted.length) {
+      acceptedIndex += 1;
+    } else {
+      unmatchedDisplayed.push(displayedEntry);
+    }
+  }
+  return accepted.concat(unmatchedDisplayed);
+}
+
+function queuedPromptMatchesEntry(prompt, entry) {
+  const id = promptIdentity(prompt);
+  return Boolean(id) && entry?.role === "user" && promptIdentity(entry) === id;
+}
+
+function promptAcknowledgedInChat(prompt, chat) {
+  const id = promptIdentity(prompt);
+  if (!id) return false;
+  if (chatAckIds.has(id)) return true;
+  if (!Array.isArray(chat)) return false;
+  return chat.some((entry) => queuedPromptMatchesEntry(prompt, entry));
+}
+
+// Match by the per-submission identity only. Displayed content is not identity: two tabs can
+// send the same selected text under one container with different range boundaries, and each
+// note must settle exactly once against its own acknowledgement.
+function settleQueuedFromTranscript(chat, shouldRender = true) {
+  if (!Array.isArray(chat) || !queued.length) return false;
+  const settledPrompts = new Set();
+  for (const prompt of queued) {
+    if (!promptAcknowledgedInChat(prompt, chat)) continue;
+    settledPrompts.add(prompt);
+  }
+  if (!settledPrompts.size) return false;
+  for (let i = queued.length - 1; i >= 0; i -= 1) {
+    if (settledPrompts.has(queued[i])) queued.splice(i, 1);
+  }
+  persistQueuedPrompts();
+  if (!queued.length) {
+    clearSendAcknowledgementWarning();
+    if (sendHintPersistent) hideSendHint(true);
+  }
+  if (shouldRender) render();
+  return true;
+}
+
+function syncChat(chat, revision) {
+  const nextChat = Array.isArray(chat) ? chat : [];
+  settleQueuedFromTranscript(nextChat);
+  const nextRevision = parseChatRevision(revision);
+  if (nextRevision !== null && nextRevision < chatRevision) return false;
+  if (nextRevision === null || nextRevision === chatRevision) {
+    if (!chatContainsEntries(nextChat, displayedChat)) return false;
+  }
+  if (nextRevision !== null) chatRevision = nextRevision;
+  displayedChat = nextChat.slice();
   for (const el of [...chatLog.querySelectorAll(".bubble.user,.bubble.agent:not(.agent-working)")]) {
     el.remove();
   }
 
   let lastChatBubble = null;
-  for (const item of chat) lastChatBubble = addChat(item.role, item.text, false) || lastChatBubble;
+  for (const item of nextChat) lastChatBubble = addChat(item, false) || lastChatBubble;
   if (workingBubble) chatLog.appendChild(workingBubble);
   // Handed-back drafts were written at the end of the conversation, and a rebuild re-appends the
   // whole transcript - so without this they end up above it, where the scroll below would leave
@@ -586,6 +891,7 @@ function syncChat(chat) {
   for (const note of retiredDraftNodes) chatLog.appendChild(note);
   const anchor = retiredDraftNodes[retiredDraftNodes.length - 1] || workingBubble || lastChatBubble;
   if (anchor) scrollElementIntoView(anchor);
+  return true;
 }
 
 function setAgentPresence(state) {
@@ -931,6 +1237,7 @@ function scrollElementIntoView(el) {
 
 function removeQueuedPrompt(index, event) {
   if (event) event.stopPropagation();
+  if (isPromptSending(queued[index])) return;
   queued.splice(index, 1);
   persistQueuedPrompts();
   if (!queued.length) {
@@ -945,7 +1252,8 @@ function promptQueueKey(prompt) {
 }
 
 function enqueuePrompt(rawPrompt) {
-  const prompt = sanitizeQueuedPrompt(rawPrompt);
+  // The sandboxed iframe is untrusted: never accept a caller-supplied settlement identity.
+  const prompt = adoptQueuedPrompt(rawPrompt, false);
   if (!prompt) return;
 
   const queueKey = promptQueueKey(prompt);
@@ -976,7 +1284,9 @@ function postToFrame(message) {
 }
 
 function requestSnapshot(action) {
+  /** @type {{ action: "copy" | "submit", prompts?: any[], timeout: ReturnType<typeof setTimeout> }} */
   const request = { action, timeout: setTimeout(() => expireSnapshotRequest(request), SNAPSHOT_REQUEST_TIMEOUT_MS) };
+  if (action === "submit") request.prompts = queued.slice();
   snapshotRequests.push(request);
   postToFrame({ type: "lavish:requestSnapshot" });
 }
@@ -1212,12 +1522,13 @@ function sendQueued(endAfter) {
     if (text || attachments.length) {
       const prompt = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
       if (attachments.length) prompt.attachments = attachments;
+      assignPromptIdentity(prompt, false);
       queued.push(prompt);
       persistQueuedPrompts();
-      // Render the durable queue pill before clearing the editor. If anything after this point
-      // fails, the user's words are already both stored and visibly recoverable in the tab.
+      // Render the durable queued bubble before clearing the editor. If anything after this point
+      // fails, the user's words are already both stored and visibly recoverable in the tab. It
+      // becomes a sent bubble only when the server's transcript carries it (see submitQueuedOnce).
       render();
-      addChat("user", text || "Image message");
       chatInput.value = "";
       chatAttachmentController.reset();
     }
@@ -1231,6 +1542,7 @@ function sendQueued(endAfter) {
 
   if (endAfter && !chipsBlocked) endAfterSubmit = true;
   requestSnapshot("submit");
+  render();
 }
 
 async function submitQueued() {
@@ -1271,14 +1583,33 @@ function postPrompts(body) {
 }
 
 async function submitQueuedOnce() {
-  const prompts = queued.slice();
+  settleQueuedFromTranscript(displayedChat);
+  const prompts = queued.filter((prompt) => !promptAcknowledgedInChat(prompt, displayedChat));
   const shouldEndSession = endAfterSubmit;
+  if (!prompts.length) {
+    if (shouldEndSession) {
+      endAfterSubmit = false;
+      endSession();
+    }
+    return;
+  }
+  const chatAtRequest = displayedChat.slice();
   const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: pendingSnapshot };
   if (shouldEndSession) body.endSession = true;
-  let response = await postPrompts(body);
-  if (response?.status === 413 && body.domSnapshot) {
-    body.domSnapshot = "";
+  activeSubmission = prompts;
+  render();
+  let response;
+  try {
     response = await postPrompts(body);
+    if (response?.status === 413 && body.domSnapshot) {
+      body.domSnapshot = "";
+      response = await postPrompts(body);
+    }
+  } finally {
+    // Whatever happened, the batch is no longer in flight: a failed note reads Queued again with
+    // its remove control back.
+    activeSubmission = null;
+    render();
   }
   if (!response?.ok) {
     if (response?.status === 409) {
@@ -1313,11 +1644,24 @@ async function submitQueuedOnce() {
     showQueuedSendFailure();
     return false;
   }
+  // The accepted transcript is the acknowledgement: the queued bubbles settle in place as sent
+  // bubbles, and any identity the server acknowledged without a visible entry is remembered.
+  const accepted = typeof response.json === "function" ? await response.json().catch(() => null) : null;
+  rememberChatAckIds(accepted?.ack_ids);
+  const acceptedChat = Array.isArray(accepted?.chat) ? accepted.chat : null;
+  if (acceptedChat) settleQueuedFromTranscript(acceptedChat, false);
+  const acceptedRevision = parseChatRevision(accepted?.chat_revision);
+  const reconciledChat = acceptedChat
+    ? acceptedRevision !== null && acceptedRevision > chatRevision
+      ? acceptedChat
+      : mergeAcceptedChat(acceptedChat, chatAtRequest)
+    : null;
   for (const prompt of prompts) {
     const index = queued.indexOf(prompt);
     if (index !== -1) queued.splice(index, 1);
   }
   persistQueuedPrompts();
+  if (reconciledChat) syncChat(reconciledChat, acceptedRevision);
   render();
   clearSendAcknowledgementWarning();
   // A stalled or failed notice is answered by this success; a transient hint (such as "sent
@@ -2815,6 +3159,8 @@ window.addEventListener("message", (event) => {
     } else if (queued.length) {
       pendingSnapshot = msg.snapshot || "";
       submitQueued();
+    } else if (request) {
+      render();
     }
   }
   if (msg.type === "lavish:scroll") {
@@ -3203,22 +3549,32 @@ events.set("chrome-reload", (data) => reloadAfterServerRestart(String(data.reaso
 // The replacement server serves a different artifact's review. This page keeps working against
 // it; it is only running the previous version of the chrome, which is the user's to act on.
 events.set("chrome-outdated", (data) => setChromeOutdated(true, String(data.reason || "")));
-events.set("agent-reply", ({ text }) => {
-  addChat("agent", text);
-  noteAgentReply(text);
+events.set("agent-reply", (data) => {
+  const entry = {
+    ...data,
+    role: "agent",
+    text: String(data.text || ""),
+    ...(data.at ? { at: String(data.at) } : {}),
+  };
+  if (addChat(entry)) displayedChat.push(entry);
+  noteAgentReply(entry.text);
 });
-events.set("chat-sync", (data) => syncChat(data.chat || []));
+events.set("chat-sync", (data) => {
+  rememberChatAckIds(data.ack_ids);
+  syncChat(data.chat || [], data.chat_revision);
+});
 events.set("agent-presence", (data) => setAgentPresence(data.state));
 events.set("layout-warnings", (data) => setLayoutWarnings(data.warnings || []));
 events.set("ended", () => markSessionEnded());
 connectLiveEvents();
 
 applySheetState();
+settleQueuedFromTranscript(initialChat, false);
 render();
 setChromeOutdated(false);
 setWarningsDrawerOpen(false);
 renderWarnings();
-initialChat.forEach((item) => addChat(item.role, item.text));
+initialChat.forEach((item) => addChat(item));
 retiredDrafts.forEach((text) => renderRetiredDraft(text));
 setAgentPresence("waiting");
 // The session already ended before this page (re)loaded, so there is no future live `ended` event

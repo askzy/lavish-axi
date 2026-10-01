@@ -15,6 +15,7 @@ import {
   serializeLayoutWarnings,
 } from "./layout-warnings.js";
 import { AsyncMutex } from "./async-mutex.js";
+import { chatEntryForPrompt, normalizePromptId } from "./chat-messages.js";
 import { normalizeMermaidNodeTarget } from "./mermaid-node.js";
 import { EXCALIDRAW_SCENE_TARGET_TYPE, normalizeExcalidrawSceneTarget } from "./whiteboard-core.js";
 
@@ -138,6 +139,10 @@ export class SessionStore {
         delivered_attachments: Array.isArray(existing.delivered_attachments) ? existing.delivered_attachments : [],
         dom_snapshot: existing.dom_snapshot || "",
         chat: existing.chat || [],
+        chat_revision: normalizeRevision(existing.chat_revision),
+        // Compact prompt_id acks for entries no longer in `chat`. Reopening must keep them: they
+        // are the settlement/dedup source once the visible entry is gone.
+        chat_ack_ids: Array.isArray(existing.chat_ack_ids) ? existing.chat_ack_ids : [],
         updated_at: new Date().toISOString(),
       };
       state.sessions[key] = session;
@@ -174,7 +179,22 @@ export class SessionStore {
       if (session.status === "ended") {
         return { ended: true, ended_by: session.ended_by };
       }
-      const normalized = prompts.map(normalizePrompt);
+      // A prompt whose identity the transcript already acknowledges was accepted by an earlier
+      // POST whose response was lost. Drop it here, before attachment resolution and
+      // layout-warning planning, so the retry neither re-appends chat nor wakes a poll.
+      const acknowledgedIds = new Set(
+        [
+          ...(session.chat || []).map((entry) => normalizePromptId(entry?.prompt_id)),
+          ...(session.chat_ack_ids || []).map((id) => normalizePromptId(id)),
+        ].filter(Boolean),
+      );
+      const normalized = prompts.map(normalizePrompt).filter(({ prompt }) => {
+        const promptId = normalizePromptId(prompt.prompt_id);
+        if (!promptId) return true;
+        if (acknowledgedIds.has(promptId)) return false;
+        acknowledgedIds.add(promptId);
+        return true;
+      });
       const normalizedPrompts = normalized.map((entry) => entry.prompt);
       // Resolve every attachment BEFORE mutating anything. If any prompt's images
       // can't be fully honored - malformed, an unknown id, or over the per-prompt
@@ -244,18 +264,20 @@ export class SessionStore {
         if (result.queued.length > 0 || !plan.hadKnownWarning) acceptedPrompts.push(plan.prompt);
       }
       session.layout_warnings = warnings;
-      const userMessages = acceptedPrompts
-        .filter((prompt) => prompt.tag === "message" && prompt.prompt)
-        .map((prompt) => ({ role: "user", text: prompt.prompt, at: new Date().toISOString() }));
-      session.prompts = [...(session.prompts || []), ...acceptedPrompts];
+      // Every accepted prompt with something to display joins the transcript, not only composer
+      // messages: the notes a reviewer sends are the half of the conversation the panel used to
+      // lose on send.
+      const userMessages = acceptedPrompts.map((prompt) => chatEntryForPrompt(prompt, at)).filter(Boolean);
+      session.prompts = [...(session.prompts || []), ...acceptedPrompts.map(agentFacingPrompt)];
       session.chat = [...(session.chat || []), ...userMessages];
+      if (userMessages.length > 0) session.chat_revision = normalizeRevision(session.chat_revision) + 1;
       session.pending_prompts = session.prompts.length;
       session.dom_snapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
       session.status = shouldEndSession ? "ended" : session.prompts.length > 0 ? "feedback" : "open";
       if (shouldEndSession) session.ended_by = "user";
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
-      return session;
+      return { ...session, fresh_feedback: acceptedPrompts.length > 0 };
     });
   }
 
@@ -680,14 +702,13 @@ export class SessionStore {
       if (!session) {
         return null;
       }
-      session.chat = [
-        ...(session.chat || []),
-        { role: "agent", text: String(text || ""), at: new Date().toISOString() },
-      ];
+      const at = new Date().toISOString();
+      session.chat = [...(session.chat || []), { role: "agent", text: String(text || ""), at }];
+      session.chat_revision = normalizeRevision(session.chat_revision) + 1;
       // A reply means the agent acted on everything delivered so far, so every lease is retired
       // even when the poll that took it never acked.
       session.leases = [];
-      session.updated_at = new Date().toISOString();
+      session.updated_at = at;
       await this.writeState(state);
       return session;
     });
@@ -869,9 +890,20 @@ function normalizePrompt(prompt) {
   };
   const target = normalizeTarget(prompt.target);
   if (target) normalized.target = target;
+  const promptId = normalizePromptId(prompt.prompt_id);
+  if (promptId) normalized.prompt_id = promptId;
   const { refs, malformed } = normalizeAttachmentRefs(prompt.attachments);
   if (refs.length > 0) normalized.attachments = refs;
   return { prompt: normalized, malformed };
+}
+
+// Settlement identity is transcript-owned. The agent-facing prompt list must not carry it: poll
+// output stays the reviewer's words, and a lease redelivery never touches the transcript.
+function agentFacingPrompt(prompt) {
+  if (!prompt || typeof prompt !== "object" || prompt.prompt_id === undefined) return prompt;
+  const rest = { ...prompt };
+  delete rest.prompt_id;
+  return rest;
 }
 
 function layoutWarningPromptIds(prompt) {

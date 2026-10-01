@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
+import { chatEntryForPrompt } from "../src/chat-messages.js";
 import { createChromeHtml } from "../src/server.js";
 
 const sourceUrl = new URL("../src/chrome-client.js", import.meta.url);
@@ -16,7 +17,7 @@ const servedChromeIds = new Set(
   ),
 );
 
-/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, initialEnded?: boolean, initialEndedBy?: string | null, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[] }} HarnessSessionData */
+/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialChat?: any[], initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, initialEnded?: boolean, initialEndedBy?: string | null, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[] }} HarnessSessionData */
 /** @type {HarnessSessionData} */
 const defaultSessionData = {
   key: "abc",
@@ -24,6 +25,44 @@ const defaultSessionData = {
   modeToggleHotkeyKey: "i",
   attachmentAcceptedMime: ["image/png", "image/jpeg", "image/webp"],
 };
+
+const PROMPT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+function publicQueuedPrompt(prompt) {
+  const rest = { ...prompt };
+  delete rest.prompt_id;
+  return rest;
+}
+
+function publicQueued(chrome) {
+  return chrome.queued().map(publicQueuedPrompt);
+}
+
+function publicPostedBody(body) {
+  if (!body || !Array.isArray(body.prompts)) return body;
+  return { ...body, prompts: body.prompts.map(publicQueuedPrompt) };
+}
+
+function assertPromptIdentity(id) {
+  assert.match(String(id || ""), PROMPT_ID_RE);
+}
+
+function identicalProjectionNote(offset) {
+  return {
+    prompt: "Make this phrase punchier",
+    selector: "main > p",
+    tag: "text",
+    text: "marketing site",
+    target: {
+      type: "text-range",
+      text: "marketing site",
+      selector: "main > p",
+      commonAncestorSelector: "main > p",
+      start: { selector: "main > p", path: [], offset },
+      end: { selector: "main > p", path: [], offset: offset + 14 },
+    },
+  };
+}
 
 async function createChromeHarness({
   fetchImpl = /** @type {(url?: any, init?: any) => Promise<any>} */ (
@@ -139,16 +178,26 @@ async function createChromeHarness({
         if (handler) handler(event);
       },
       querySelectorAll(selector) {
+        if (id === "queuedLog" && selector === ".queued-remove") {
+          return [...this.innerHTML.matchAll(/class="queued-remove"[^>]*data-index="(\d+)"/g)].map((match) => {
+            const close = element(`queued-remove-${match[1]}`);
+            close.dataset.index = match[1];
+            return close;
+          });
+        }
         const matches = [];
         const walk = (node) => {
           for (const child of node.children || []) {
-            if (typeof selector === "string" && selector.startsWith(".")) {
+            const childClasses = String(child.className || "").split(/\s+/);
+            if (selector === ".bubble.user,.bubble.agent:not(.agent-working)") {
               if (
-                String(child.className || "")
-                  .split(/\s+/)
-                  .includes(selector.slice(1))
+                childClasses.includes("bubble") &&
+                (childClasses.includes("user") ||
+                  (childClasses.includes("agent") && !childClasses.includes("agent-working")))
               )
                 matches.push(child);
+            } else if (typeof selector === "string" && selector.startsWith(".")) {
+              if (childClasses.includes(selector.slice(1))) matches.push(child);
             }
             walk(child);
           }
@@ -186,6 +235,8 @@ async function createChromeHarness({
       },
       click(event = {}) {
         this.clicked = true;
+        const handler = listeners.get("click");
+        if (handler) handler(event);
         if (typeof this.onclick === "function") return this.onclick(event);
         return undefined;
       },
@@ -193,6 +244,15 @@ async function createChromeHarness({
         const parent = this.parentElement;
         if (!parent) return;
         parent.children = parent.children.filter((child) => child !== this);
+        this.parentElement = null;
+      },
+      replaceWith(replacement) {
+        const parent = this.parentElement;
+        if (!parent) return;
+        const index = parent.children.indexOf(this);
+        if (index === -1) return;
+        parent.children[index] = replacement;
+        replacement.parentElement = parent;
         this.parentElement = null;
       },
       focus() {
@@ -291,6 +351,7 @@ async function createChromeHarness({
       },
       revokeObjectURL() {},
     },
+    crypto: globalThis.crypto,
     WebSocket: class FakeWebSocket {
       static OPEN = 1;
 
@@ -443,6 +504,9 @@ async function createChromeHarness({
     },
     webSocketCount() {
       return webSockets.length;
+    },
+    sendSnapshot(snapshot) {
+      this.sendFrameMessage({ type: "lavish:snapshot", snapshot });
     },
     sendFrameMessage(data) {
       const handlers = windowListeners.get("message") || [];
@@ -669,8 +733,8 @@ test("chrome client replaces queued prompts with the same internal key", async (
     chrome.queued().map((prompt) => prompt.prompt),
     ["Use plan B", "Apply dark mode"],
   );
-  assert.match(chrome.element("annotationPills").innerHTML, /Use plan B/);
-  assert.doesNotMatch(chrome.element("annotationPills").innerHTML, /Use plan A/);
+  assert.match(chrome.element("queuedLog").innerHTML, /Use plan B/);
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /Use plan A/);
 });
 
 test("chrome client shows semantic table coordinates before positional selector", async () => {
@@ -693,8 +757,8 @@ test("chrome client shows semantic table coordinates before positional selector"
     },
   });
 
-  assert.match(chrome.element("annotationPills").innerHTML, /Media &amp; Apple Music → Database evidence/);
-  assert.match(chrome.element("annotationPills").innerHTML, /tr:nth-of-type\(7\)/);
+  assert.match(chrome.element("queuedLog").innerHTML, /Media &amp; Apple Music → Database evidence/);
+  assert.match(chrome.element("queuedLog").innerHTML, /tr:nth-of-type\(7\)/);
 });
 
 test("chrome client falls back to the locator when a table cell has no row or column name", async () => {
@@ -711,7 +775,7 @@ test("chrome client falls back to the locator when a table cell has no row or co
     },
   });
 
-  const html = chrome.element("annotationPills").innerHTML;
+  const html = chrome.element("queuedLog").innerHTML;
   assert.match(html, /tr:nth-of-type\(7\)/);
   assert.doesNotMatch(html, /Locator/);
 });
@@ -2210,7 +2274,8 @@ test("chrome client strips the internal queue key before posting prompts", async
 
   assert.equal(posts.length, 1);
   assert.equal(posts[0].url, "/api/abc/prompts");
-  assert.deepEqual(posts[0].body, {
+  assertPromptIdentity(posts[0].body.prompts[0].prompt_id);
+  assert.deepEqual(publicPostedBody(posts[0].body), {
     prompts: [{ prompt: "Use plan B", selector: "input#plan-b", tag: "choice", text: "Plan B" }],
     domSnapshot: "uid=1 body",
   });
@@ -2319,7 +2384,8 @@ test("chrome send and end carries the end intent with queued prompts", async () 
     posts.map((post) => post.url),
     ["/api/abc/prompts"],
   );
-  assert.deepEqual(posts[0].body, {
+  assertPromptIdentity(posts[0].body.prompts[0].prompt_id);
+  assert.deepEqual(publicPostedBody(posts[0].body), {
     prompts: [{ prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" }],
     domSnapshot: "uid=1 body",
     endSession: true,
@@ -2365,7 +2431,7 @@ for (const stalledPost of [false, true]) {
     chrome.element("send").click();
 
     assert.equal(chrome.element("chatInput").value, "");
-    assert.match(chrome.element("annotationPills").innerHTML, /Do not lose this/);
+    assert.match(chrome.element("queuedLog").innerHTML, /Do not lose this/);
     assert.deepEqual(
       chrome.queued().map((prompt) => prompt.prompt),
       ["Do not lose this"],
@@ -2549,7 +2615,8 @@ test("chrome send and end during an in-flight submit still ends after the submit
     posts.map((post) => post.url),
     ["/api/abc/prompts", "/api/abc/end"],
   );
-  assert.deepEqual(posts[0].body, {
+  assertPromptIdentity(posts[0].body.prompts[0].prompt_id);
+  assert.deepEqual(publicPostedBody(posts[0].body), {
     prompts: [{ prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" }],
     domSnapshot: "uid=1 body",
   });
@@ -3162,8 +3229,8 @@ test("chrome renders queued-prompt attachment thumbnails from the server endpoin
     type: "lavish:queuePrompt",
     prompt: { prompt: "", selector: "h1", tag: "annotation", text: "", attachments: [{ id, name: "mock.png" }] },
   });
-  const html = chrome.element("annotationPills").innerHTML;
-  assert.match(html, /pill-attachment/);
+  const html = chrome.element("queuedLog").innerHTML;
+  assert.match(html, /bubble-attachment/);
   assert.match(html, new RegExp("/api/abc/attachments/" + id));
   // An image-only annotation still shows a readable label.
   assert.match(html, /Image annotation/);
@@ -3171,7 +3238,7 @@ test("chrome renders queued-prompt attachment thumbnails from the server endpoin
 
 test("a queued prompt over the thumbnail limit shows the hidden images as a +N badge (W-A)", async () => {
   // LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT is configurable, so a prompt can legitimately
-  // carry more images than the compact pill can show. The overflow must be counted, not
+  // carry more images than the compact bubble can show. The overflow must be counted, not
   // silently dropped - otherwise the queue looks like it lost the extra attachments.
   const chrome = await createChromeHarness();
   const attachments = Array.from({ length: 7 }, (_, i) => ({ id: String(i).repeat(64) + ".png", name: `i${i}.png` }));
@@ -3179,9 +3246,9 @@ test("a queued prompt over the thumbnail limit shows the hidden images as a +N b
     type: "lavish:queuePrompt",
     prompt: { prompt: "seven", selector: "h1", tag: "annotation", text: "", attachments },
   });
-  const html = chrome.element("annotationPills").innerHTML;
-  assert.equal(html.match(/class="pill-attachment"/g)?.length, 4, "the pill renders its four thumbnails");
-  assert.match(html, /class="pill-attachment-more"[^>]*>\+3</, "the other three are counted, not hidden");
+  const html = chrome.element("queuedLog").innerHTML;
+  assert.equal(html.match(/class="bubble-attachment"/g)?.length, 4, "the bubble renders its four thumbnails");
+  assert.match(html, /class="bubble-attachment-more"[^>]*>\+3</, "the other three are counted, not hidden");
   assert.match(html, /title="3 more images"/);
 });
 
@@ -3192,9 +3259,9 @@ test("a queued prompt at or under the thumbnail limit shows no +N badge (W-A)", 
     type: "lavish:queuePrompt",
     prompt: { prompt: "four", selector: "h1", tag: "annotation", text: "", attachments },
   });
-  const html = chrome.element("annotationPills").innerHTML;
-  assert.equal(html.match(/class="pill-attachment"/g)?.length, 4);
-  assert.doesNotMatch(html, /pill-attachment-more/);
+  const html = chrome.element("queuedLog").innerHTML;
+  assert.equal(html.match(/class="bubble-attachment"/g)?.length, 4);
+  assert.doesNotMatch(html, /bubble-attachment-more/);
 });
 
 test("the +N badge stays singular for a single hidden image (W-A)", async () => {
@@ -3204,7 +3271,7 @@ test("the +N badge stays singular for a single hidden image (W-A)", async () => 
     type: "lavish:queuePrompt",
     prompt: { prompt: "five", selector: "h1", tag: "annotation", text: "", attachments },
   });
-  assert.match(chrome.element("annotationPills").innerHTML, /title="1 more image"/);
+  assert.match(chrome.element("queuedLog").innerHTML, /title="1 more image"/);
 });
 
 test("chrome rejects an over-cap image before it hits the network", async () => {
@@ -3245,8 +3312,8 @@ test("a poisoned attachments array cannot wedge the queue or the tab (E5)", asyn
     prompt: { prompt: "poison", selector: "h1", tag: "annotation", text: "", attachments: [null] },
   });
 
-  assert.deepEqual(chrome.queued(), [{ prompt: "poison", selector: "h1", tag: "annotation", text: "" }]);
-  assert.doesNotMatch(chrome.element("annotationPills").innerHTML, /pill-attachment/);
+  assert.deepEqual(publicQueued(chrome), [{ prompt: "poison", selector: "h1", tag: "annotation", text: "" }]);
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /bubble-attachment/);
 });
 
 test("only well-formed attachment refs survive the enqueue path (E5)", async () => {
@@ -3267,7 +3334,7 @@ test("only well-formed attachment refs survive the enqueue path (E5)", async () 
   // The one real ref is kept; every malformed entry is dropped before persisting,
   // so what reaches the server (and the +N count) reflects only deliverable images.
   assert.deepEqual(chrome.queued()[0].attachments, [{ id: good, name: "ok.png" }]);
-  assert.equal(chrome.element("annotationPills").innerHTML.match(/class="pill-attachment"/g)?.length, 1);
+  assert.equal(chrome.element("queuedLog").innerHTML.match(/class="bubble-attachment"/g)?.length, 1);
 });
 
 test("a non-array attachments field cannot wedge the queue (E5)", async () => {
@@ -3278,7 +3345,7 @@ test("a non-array attachments field cannot wedge the queue (E5)", async () => {
     prompt: { prompt: "bad", selector: "h1", tag: "annotation", text: "", attachments: "not-an-array" },
   });
 
-  assert.deepEqual(chrome.queued(), [{ prompt: "bad", selector: "h1", tag: "annotation", text: "" }]);
+  assert.deepEqual(publicQueued(chrome), [{ prompt: "bad", selector: "h1", tag: "annotation", text: "" }]);
 });
 
 test("a poisoned prompt already in sessionStorage cannot wedge a reload (E5)", async () => {
@@ -3288,8 +3355,8 @@ test("a poisoned prompt already in sessionStorage cannot wedge a reload (E5)", a
 
   // A tab poisoned before this fix still has the bad prompt on disk; loading it
   // must not throw, or the tab stays wedged even after upgrading.
-  assert.doesNotMatch(chrome.element("annotationPills").innerHTML, /pill-attachment/);
-  assert.match(chrome.element("annotationPills").innerHTML, /old poison/);
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /bubble-attachment/);
+  assert.match(chrome.element("queuedLog").innerHTML, /old poison/);
 });
 
 test("the chrome never honors an attachment delete driven by the artifact iframe (E2)", async () => {
@@ -3996,7 +4063,7 @@ test("Conversation labels an image-only queued prompt as an image message", asyn
 
   chrome.element("send").click();
 
-  assert.match(chrome.element("annotationPills").innerHTML, /Image message/);
+  assert.match(chrome.element("queuedLog").innerHTML, /Image message/);
 });
 
 test("Conversation drop partial-accepts images and lets the rejected chip be removed", async () => {
@@ -4605,4 +4672,992 @@ test("whiteboard close stays responsive while overlay initialization is pending"
 
   releaseOverlaySources?.();
   await flushPromises();
+});
+
+test("a reconnect's stale initial sync cannot erase a newer reply", async () => {
+  const sent = { role: "user", kind: "message", text: "Sent note" };
+  const reply = { role: "agent", text: "New reply", html: "<p>New reply</p>" };
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialChat: [sent] },
+  });
+
+  chrome.webSocket().protocolListeners.get("close")();
+  chrome.runTimers(500);
+  const reconnectedSocket = chrome.webSocketAt(1);
+  reconnectedSocket.listeners.get("agent-reply")({ data: JSON.stringify(reply) });
+  reconnectedSocket.listeners.get("chat-sync")({ data: JSON.stringify({ chat: [sent] }) });
+
+  const bubbles = chrome.element("chatLog").children;
+  assert.equal(bubbles.length, 2);
+  assert.match(bubbles[0].innerHTML, /Sent note/);
+  assert.equal(bubbles[1].innerHTML, '<small>Agent</small><div class="chat-md"><p>New reply</p></div>');
+});
+
+test("a reconnect cannot settle an identical note this tab never submitted", async () => {
+  const postedBodies = [];
+  const identicalEntry = { role: "user", kind: "message", text: "Same note" };
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) {
+        postedBodies.push(JSON.parse(init.body));
+        return {
+          ok: true,
+          json: async () => ({ status: "queued", chat: [identicalEntry, identicalEntry] }),
+        };
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.webSocket().protocolListeners.get("close")();
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Same note", selector: "", tag: "message", text: "Freeform message" },
+  });
+  chrome.runTimers(500);
+  chrome.webSocketAt(1).listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [identicalEntry] }),
+  });
+
+  assert.equal(chrome.queued().length, 1);
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 body");
+  await flushPromises();
+
+  assert.equal(postedBodies.length, 1);
+  assert.equal(postedBodies[0].prompts[0].prompt, "Same note");
+});
+
+// ---- Queued and sent notes are one conversation ----
+// A note the reviewer queues is a bubble on their side of the transcript from the moment they
+// queue it: dashed and removable while it lives only in this tab, settled in place once the
+// server's transcript carries it. Before this, queued notes were pills in a separate region and
+// sent notes vanished from the panel entirely, so the conversation read as one-sided.
+
+test("a queued note is a dashed bubble at the end of the conversation with its anchor and a remove control", async () => {
+  const chrome = await createChromeHarness();
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Rename this", selector: "h2#phase-1", tag: "h2", text: "Phase 1: Inventory" },
+  });
+
+  const html = chrome.element("queuedLog").innerHTML;
+  assert.match(html, /^<div class="bubble user queued"><small>Queued <button class="queued-remove"[^>]*data-index="0"/);
+  assert.match(
+    html,
+    /<span class="anchor-kind">&lt;h2&gt;<\/span><span class="anchor-excerpt">“Phase 1: Inventory”<\/span>/,
+  );
+  assert.match(html, /title="Phase 1: Inventory\nh2#phase-1"/);
+  assert.match(html, /<div class="bubble-text">Rename this<\/div>/);
+  assert.equal(
+    chrome.element("chatLog").children.length,
+    0,
+    "nothing joins the transcript until the server accepts it",
+  );
+});
+
+// The chrome derives a queued note's anchor itself (the prompt has not reached the server), and the
+// server derives the sent note's anchor. A bubble must not change its anchor when it settles, so the
+// two rules are pinned against the same fixtures, one per prompt kind.
+test("a queued note's remove control clears memory, storage, and its bubble", async () => {
+  const chrome = await createChromeHarness();
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Remove this", selector: "h2", tag: "h2", text: "Heading" },
+  });
+  assert.equal(chrome.queued().length, 1);
+  assert.equal(chrome.storage.has("lavish-axi:queued:abc"), true);
+
+  const [removeButton] = chrome.element("queuedLog").querySelectorAll(".queued-remove");
+  removeButton.click({ stopPropagation() {} });
+
+  assert.deepEqual(chrome.queued(), []);
+  assert.equal(chrome.storage.has("lavish-axi:queued:abc"), false);
+  assert.equal(chrome.element("queuedLog").innerHTML, "");
+});
+
+test("the chrome's queued anchor agrees with the server's transcript anchor for every prompt kind", async () => {
+  const fixtures = [
+    { prompt: "note", selector: "h2#phase-1", tag: "h2", text: "Phase 1: Inventory" },
+    {
+      prompt: "note",
+      selector: "main > p",
+      tag: "text",
+      text: "marketing site",
+      target: {
+        type: "text-range",
+        text: "marketing site",
+        selector: "main > p",
+        commonAncestorSelector: "main > p",
+        start: { selector: "main > p", path: [], offset: 0 },
+        end: { selector: "main > p", path: [], offset: 14 },
+      },
+    },
+    {
+      prompt: "note",
+      selector: "td",
+      tag: "td",
+      text: "Annotation card",
+      target: { type: "table-cell", rowLabel: "Annotation card", columnLabel: "Risk", text: "Annotation card" },
+    },
+    {
+      prompt: "note",
+      selector: "td",
+      tag: "td",
+      text: "Drive",
+      target: { type: "table-cell", rowLabel: "", columnLabel: "", text: "Drive" },
+    },
+    {
+      prompt: "note",
+      selector: "svg g.node",
+      tag: "mermaid-node",
+      text: "Classify",
+      target: { type: "mermaid-node", diagramId: "d", nodeId: "n", label: "Classify checks", selector: "svg g.node" },
+    },
+    {
+      prompt: "note",
+      selector: "",
+      tag: "whiteboard",
+      text: "Whiteboard: diagram 2",
+      target: { type: "excalidraw-scene", diagramIndex: 1 },
+    },
+    {
+      prompt: "note",
+      selector: "",
+      tag: "layout-warnings",
+      text: "2 layout issues",
+      target: { type: "layout-warnings", warnings: [{ id: "a" }, { id: "b" }] },
+    },
+    { prompt: "note", selector: "", tag: "message", text: "Freeform message" },
+  ];
+  const unescape = (value) =>
+    value
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, "&");
+  for (const fixture of fixtures) {
+    const chrome = await createChromeHarness();
+    chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: fixture });
+    const html = chrome.element("queuedLog").innerHTML;
+    const expected = chatEntryForPrompt({ uid: "", ...fixture }, "2026-09-15T00:00:00.000Z").anchor;
+    const rendered = html.match(
+      /<div class="anchor" title="([^"]*)"><span class="anchor-kind">([^<]*)<\/span>(?:<span class="anchor-excerpt(?: text)?">([^<]*)<\/span>)?<\/div>/,
+    );
+    if (!expected) {
+      assert.equal(rendered, null, `${fixture.tag}: no anchor`);
+      continue;
+    }
+    assert.ok(rendered, `${fixture.tag}: anchor rendered`);
+    assert.equal(unescape(rendered[2]), expected.label, `${fixture.tag}: label`);
+    assert.equal(unescape(rendered[3] || ""), "“" + expected.excerpt + "”", `${fixture.tag}: excerpt`);
+    assert.equal(
+      unescape(rendered[1]),
+      [expected.excerpt, expected.selector].filter(Boolean).join("\n"),
+      `${fixture.tag}: hover`,
+    );
+  }
+});
+
+test("a sent batch settles in place: notes read Sending until the server's transcript carries them", async () => {
+  let resolvePost = () => {};
+  const transcript = [
+    {
+      role: "user",
+      kind: "annotation",
+      text: "Rename this",
+      at: "2026-09-15T00:00:00.000Z",
+      anchor: { kind: "element", label: "<h2>", excerpt: "Phase 1: Inventory", selector: "h2#phase-1" },
+    },
+    { role: "user", kind: "message", text: "Keep the table", at: "2026-09-15T00:00:01.000Z" },
+  ];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) {
+        return new Promise((resolve) => {
+          resolvePost = () =>
+            resolve({ ok: true, json: async () => ({ status: "queued", pending_prompts: 2, chat: transcript }) });
+        });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Rename this", selector: "h2#phase-1", tag: "h2", text: "Phase 1: Inventory" },
+  });
+  chrome.element("chatInput").value = "Keep the table";
+  chrome.element("send").click();
+
+  // Pressing Send commits the batch: both notes read Sending, nothing is in the transcript yet,
+  // and a committed note cannot be removed.
+  const inFlight = chrome.element("queuedLog").innerHTML;
+  assert.equal((inFlight.match(/<small>Sending… /g) || []).length, 2);
+  assert.doesNotMatch(inFlight, /<small>Queued /);
+  assert.equal(chrome.element("chatLog").children.length, 0);
+  const [removeButton] = chrome.element("queuedLog").querySelectorAll(".queued-remove");
+  assert.equal(removeButton.disabled, true);
+
+  chrome.sendSnapshot("uid=1 body");
+  await flushPromises();
+  resolvePost();
+  await flushPromises();
+
+  assert.equal(chrome.element("queuedLog").innerHTML, "");
+  assert.deepEqual(chrome.queued(), []);
+  const bubbles = chrome.element("chatLog").children;
+  assert.equal(bubbles.length, 2);
+  assert.match(
+    bubbles[0].innerHTML,
+    /^<small>You<\/small><div class="anchor" [^>]*><span class="anchor-kind">&lt;h2&gt;<\/span>/,
+  );
+  assert.match(bubbles[0].innerHTML, /<div class="bubble-text">Rename this<\/div>/);
+  assert.equal(bubbles[1].innerHTML, '<small>You</small><div class="bubble-text">Keep the table</div>');
+});
+
+test("an accepted note merges before live entries that arrived before its response", async () => {
+  for (const eventName of ["chat-sync", "agent-reply"]) {
+    let resolvePost = () => {};
+    const chrome = await createChromeHarness({
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/prompts")) {
+          return new Promise((resolve) => {
+            resolvePost = () =>
+              resolve({
+                ok: true,
+                json: async () => ({
+                  status: "queued",
+                  chat: [{ role: "user", kind: "message", text: "Sent note" }],
+                }),
+              });
+          });
+        }
+        return { ok: true, json: async () => ({}) };
+      },
+    });
+    chrome.element("chatInput").value = "Sent note";
+    chrome.element("send").click();
+    chrome.sendSnapshot("uid=1 body");
+    await flushPromises();
+
+    const reply = { role: "agent", text: "Newer reply", html: "<p>Newer reply</p>" };
+    chrome.eventSource().listeners.get(eventName)({
+      data: JSON.stringify(eventName === "chat-sync" ? { chat: [reply] } : reply),
+    });
+    resolvePost();
+    await flushPromises();
+
+    const bubbles = chrome.element("chatLog").children;
+    assert.equal(bubbles.length, 2, eventName);
+    assert.equal(bubbles[0].innerHTML, '<small>You</small><div class="bubble-text">Sent note</div>', eventName);
+    assert.equal(bubbles[1].innerHTML, '<small>Agent</small><div class="chat-md"><p>Newer reply</p></div>', eventName);
+    assert.equal(chrome.element("queuedLog").innerHTML, "", eventName);
+  }
+});
+
+test("an accepted transcript consumes live entries it already contains", async () => {
+  for (const responseIncludesReply of [true, false]) {
+    let resolvePost = () => {};
+    const base = { role: "user", kind: "message", text: "Earlier note", at: "2026-09-15T00:00:00.000Z" };
+    const sent = { role: "user", kind: "message", text: "Sent note", at: "2026-09-15T00:00:01.000Z" };
+    const reply = {
+      role: "agent",
+      text: "Newer reply",
+      html: "<p>Newer reply</p>",
+      at: "2026-09-15T00:00:02.000Z",
+    };
+    const authoritativeChat = [base, sent, reply];
+    const chrome = await createChromeHarness({
+      sessionData: { ...defaultSessionData, initialChat: [base] },
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/prompts")) {
+          return new Promise((resolve) => {
+            resolvePost = () =>
+              resolve({
+                ok: true,
+                json: async () => ({
+                  status: "queued",
+                  chat: responseIncludesReply ? authoritativeChat : [base, sent],
+                }),
+              });
+          });
+        }
+        return { ok: true, json: async () => ({}) };
+      },
+    });
+    chrome.element("chatInput").value = "Sent note";
+    chrome.element("send").click();
+    chrome.sendSnapshot("uid=1 body");
+    await flushPromises();
+    chrome.eventSource().listeners.get("agent-reply")({ data: JSON.stringify(reply) });
+
+    resolvePost();
+    await flushPromises();
+
+    let bubbles = chrome.element("chatLog").children;
+    assert.equal(bubbles.length, 3, String(responseIncludesReply));
+    assert.match(bubbles[0].innerHTML, /Earlier note/);
+    assert.match(bubbles[1].innerHTML, /Sent note/);
+    assert.match(bubbles[2].innerHTML, /Newer reply/);
+
+    chrome.eventSource().listeners.get("chat-sync")({
+      data: JSON.stringify({ chat: authoritativeChat }),
+    });
+    bubbles = chrome.element("chatLog").children;
+    assert.equal(bubbles.length, 3, String(responseIncludesReply));
+    assert.match(bubbles[2].innerHTML, /Newer reply/);
+  }
+});
+
+test("an acceptance sync settles a matching local note before the prompts response", async () => {
+  let resolvePost = () => {};
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) {
+        return new Promise((resolve) => {
+          resolvePost = () => resolve({ ok: true, json: async () => ({ status: "queued", chat: [] }) });
+        });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  const prompt = {
+    prompt: "Rename this",
+    selector: "h2#phase-1",
+    tag: "h2",
+    text: "Phase 1",
+    attachments: [{ id: "a".repeat(64) + ".png", name: "reference.png" }],
+  };
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt });
+  const promptId = chrome.queued()[0].prompt_id;
+  assertPromptIdentity(promptId);
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 body");
+  await flushPromises();
+
+  const acceptedEntry = chatEntryForPrompt({ uid: "", ...prompt, prompt_id: promptId }, "2026-09-15T00:00:00.000Z");
+  chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat: [acceptedEntry] }) });
+
+  assert.deepEqual(chrome.queued(), []);
+  assert.equal(chrome.element("queuedLog").innerHTML, "");
+  assert.equal(chrome.element("chatLog").children.length, 1);
+  resolvePost();
+  await flushPromises();
+});
+
+test("one transcript entry cannot settle a second identical queued note", async () => {
+  let resolveFirstPost = () => {};
+  const postedBodies = [];
+  const acceptedEntry = { role: "user", kind: "message", text: "Repeat this" };
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) {
+        postedBodies.push(JSON.parse(init.body));
+        if (postedBodies.length === 1) {
+          return new Promise((resolve) => {
+            resolveFirstPost = () =>
+              resolve({
+                ok: true,
+                json: async () => ({
+                  status: "queued",
+                  chat: [{ ...acceptedEntry, prompt_id: postedBodies[0].prompts[0].prompt_id }],
+                }),
+              });
+          });
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            status: "queued",
+            chat: postedBodies.map((body) => ({ ...acceptedEntry, prompt_id: body.prompts[0].prompt_id })),
+          }),
+        };
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.element("chatInput").value = "Repeat this";
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 first");
+  await flushPromises();
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Repeat this", selector: "", tag: "message", text: "Freeform message" },
+  });
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({ chat: [{ ...acceptedEntry, prompt_id: postedBodies[0].prompts[0].prompt_id }] }),
+  });
+  assert.equal(chrome.queued().length, 1);
+
+  resolveFirstPost();
+  await flushPromises();
+  assert.equal(chrome.queued().length, 1);
+
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=2 second");
+  await flushPromises();
+  assert.equal(postedBodies.length, 2);
+  assert.equal(postedBodies[1].prompts[0].prompt, "Repeat this");
+  assert.notEqual(postedBodies[0].prompts[0].prompt_id, postedBodies[1].prompts[0].prompt_id);
+});
+
+test("a restored duplicate note survives history at boot and settles only on a later sync", async () => {
+  let resolvePost = () => {};
+  /** @type {any} */
+  let postedBody;
+  const prompt = { uid: "", prompt: "Same words", selector: "", tag: "message", text: "Freeform message" };
+  const historicalEntry = { role: "user", kind: "message", text: "Same words", at: "2026-09-14T00:00:00.000Z" };
+  const acceptedEntry = { ...historicalEntry, at: "2026-09-15T00:00:00.000Z" };
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialChat: [historicalEntry] },
+    storedQueue: [prompt],
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) {
+        postedBody = JSON.parse(init.body);
+        return new Promise((resolve) => {
+          resolvePost = () =>
+            resolve({
+              ok: true,
+              json: async () => ({
+                status: "queued",
+                chat: [historicalEntry, { ...acceptedEntry, prompt_id: postedBody.prompts[0].prompt_id }],
+              }),
+            });
+        });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  assert.equal(chrome.queued().length, 1);
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 body");
+  await flushPromises();
+  assert.equal(postedBody.prompts.length, 1);
+  assert.equal(postedBody.prompts[0].prompt, "Same words");
+  assertPromptIdentity(postedBody.prompts[0].prompt_id);
+
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [historicalEntry, { ...acceptedEntry, prompt_id: postedBody.prompts[0].prompt_id }],
+    }),
+  });
+  assert.deepEqual(chrome.queued(), []);
+  assert.equal(chrome.element("queuedLog").innerHTML, "");
+
+  resolvePost();
+  await flushPromises();
+});
+
+test("retrying after a lost prompts response does not resend accepted feedback", async () => {
+  let rejectPost = () => {};
+  let postCount = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) {
+        postCount += 1;
+        return new Promise((_, reject) => {
+          rejectPost = () => reject(new Error("response lost"));
+        });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.element("chatInput").value = "Keep the accepted note";
+  chrome.element("send").click();
+  const promptId = chrome.queued()[0].prompt_id;
+  assertPromptIdentity(promptId);
+  chrome.sendSnapshot("uid=1 body");
+  await flushPromises();
+
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [{ role: "user", kind: "message", text: "Keep the accepted note", prompt_id: promptId }],
+    }),
+  });
+  rejectPost();
+  await flushPromises();
+  chrome.element("send").click();
+  await flushPromises();
+
+  assert.equal(postCount, 1);
+  assert.deepEqual(chrome.queued(), []);
+});
+
+test("a WebSocket acceptance sync settles only the note whose identity it acknowledges", async () => {
+  let resolvePost = () => {};
+  /** @type {any} */
+  let postedBody;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) {
+        postedBody = JSON.parse(init.body);
+        return new Promise((resolve) => {
+          resolvePost = () =>
+            resolve({ ok: true, json: async () => ({ status: "queued", chat: postedBody.prompts.map(() => ({})) }) });
+        });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: identicalProjectionNote(0) });
+  const promptId = chrome.queued()[0].prompt_id;
+  assertPromptIdentity(promptId);
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 body");
+  await flushPromises();
+
+  const acceptedEntry = chatEntryForPrompt(
+    { uid: "", ...identicalProjectionNote(0), prompt_id: promptId },
+    "2026-09-15T00:00:00.000Z",
+  );
+  chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat: [acceptedEntry] }) });
+
+  assert.deepEqual(chrome.queued(), []);
+  assert.equal(chrome.element("queuedLog").innerHTML, "");
+  assert.equal(postedBody.prompts[0].prompt_id, promptId);
+  resolvePost();
+  await flushPromises();
+});
+
+test("a reconnect initial sync settles this tab's in-flight note by identity", async () => {
+  let resolvePost = () => {};
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) {
+        return new Promise((resolve) => {
+          resolvePost = () => resolve({ ok: true, json: async () => ({ status: "queued", chat: [] }) });
+        });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: identicalProjectionNote(0) });
+  const promptId = chrome.queued()[0].prompt_id;
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 body");
+  await flushPromises();
+
+  chrome.webSocket().protocolListeners.get("close")();
+  chrome.runTimers(500);
+  const acceptedEntry = chatEntryForPrompt(
+    { uid: "", ...identicalProjectionNote(0), prompt_id: promptId },
+    "2026-09-15T00:00:00.000Z",
+  );
+  chrome.webSocketAt(1).listeners.get("chat-sync")({ data: JSON.stringify({ chat: [acceptedEntry] }) });
+
+  assert.deepEqual(chrome.queued(), []);
+  assert.equal(chrome.element("queuedLog").innerHTML, "");
+  resolvePost();
+  await flushPromises();
+});
+
+test("reload after a lost prompts response settles the accepted note and does not resend it", async () => {
+  const promptId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const prompt = {
+    uid: "",
+    prompt: "Keep this note",
+    selector: "h2#phase-1",
+    tag: "h2",
+    text: "Phase 1",
+    prompt_id: promptId,
+  };
+  const accepted = chatEntryForPrompt({ ...prompt }, "2026-09-15T00:00:00.000Z");
+  let postCount = 0;
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialChat: [accepted] },
+    storedQueue: [prompt],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) {
+        postCount += 1;
+        return { ok: true, json: async () => ({ status: "queued", chat: [accepted] }) };
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  assert.deepEqual(chrome.queued(), []);
+  assert.equal(chrome.element("queuedLog").innerHTML, "");
+  assert.equal(chrome.element("chatLog").children.length, 1);
+  chrome.element("send").click();
+  await flushPromises();
+  assert.equal(postCount, 0);
+});
+
+test("reload after a lost response settles an accepted anchor-only prompt exactly once", async () => {
+  const promptId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const prompt = {
+    uid: "",
+    prompt: "",
+    selector: "p#summary",
+    tag: "text",
+    text: "",
+    target: { type: "text-range", text: "selected words" },
+    prompt_id: promptId,
+  };
+  const accepted = chatEntryForPrompt(prompt, "2026-09-15T00:00:00.000Z");
+  let postCount = 0;
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialChat: [accepted] },
+    storedQueue: [prompt],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) {
+        postCount += 1;
+        return { ok: true, json: async () => ({ status: "queued", chat: [accepted] }) };
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  assert.deepEqual(chrome.queued(), []);
+  assert.equal(chrome.element("queuedLog").innerHTML, "");
+  assert.equal(chrome.element("chatLog").children.length, 1);
+  chrome.element("send").click();
+  await flushPromises();
+  assert.equal(postCount, 0);
+});
+
+test("two tabs with identical chat projections settle only their own submission", async () => {
+  let resolveA = () => {};
+  let resolveB = () => {};
+  /** @type {any[]} */
+  const postsA = [];
+  /** @type {any[]} */
+  const postsB = [];
+  const chromeA = await createChromeHarness({
+    storage: new Map(),
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) {
+        postsA.push(JSON.parse(init.body));
+        return new Promise((resolve) => {
+          resolveA = () =>
+            resolve({
+              ok: true,
+              json: async () => ({
+                status: "queued",
+                chat: [
+                  chatEntryForPrompt(
+                    { uid: "", ...identicalProjectionNote(0), prompt_id: postsA[0].prompts[0].prompt_id },
+                    "2026-09-15T00:00:00.000Z",
+                  ),
+                ],
+              }),
+            });
+        });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  const chromeB = await createChromeHarness({
+    storage: new Map(),
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) {
+        postsB.push(JSON.parse(init.body));
+        return new Promise((resolve) => {
+          resolveB = () =>
+            resolve({
+              ok: true,
+              json: async () => ({
+                status: "queued",
+                chat: [
+                  chatEntryForPrompt(
+                    { uid: "", ...identicalProjectionNote(0), prompt_id: postsA[0].prompts[0].prompt_id },
+                    "2026-09-15T00:00:00.000Z",
+                  ),
+                  chatEntryForPrompt(
+                    { uid: "", ...identicalProjectionNote(5), prompt_id: postsB[0].prompts[0].prompt_id },
+                    "2026-09-15T00:00:01.000Z",
+                  ),
+                ],
+              }),
+            });
+        });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chromeA.sendFrameMessage({ type: "lavish:queuePrompt", prompt: identicalProjectionNote(0) });
+  chromeB.sendFrameMessage({ type: "lavish:queuePrompt", prompt: identicalProjectionNote(5) });
+  const idA = chromeA.queued()[0].prompt_id;
+  const idB = chromeB.queued()[0].prompt_id;
+  assertPromptIdentity(idA);
+  assertPromptIdentity(idB);
+  assert.notEqual(idA, idB);
+  assert.deepEqual(
+    chatEntryForPrompt({ uid: "", ...identicalProjectionNote(0) }, "t").anchor,
+    chatEntryForPrompt({ uid: "", ...identicalProjectionNote(5) }, "t").anchor,
+  );
+
+  chromeA.element("send").click();
+  chromeA.sendSnapshot("uid=1 a");
+  chromeB.element("send").click();
+  chromeB.sendSnapshot("uid=1 b");
+  await flushPromises();
+
+  const entryA = chatEntryForPrompt(
+    { uid: "", ...identicalProjectionNote(0), prompt_id: idA },
+    "2026-09-15T00:00:00.000Z",
+  );
+  chromeB.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat: [entryA] }) });
+  assert.equal(chromeB.queued().length, 1, "tab B must not settle tab A's identical-projection note");
+  assert.equal(chromeB.queued()[0].prompt_id, idB);
+
+  resolveA();
+  await flushPromises();
+  assert.deepEqual(chromeA.queued(), []);
+  resolveB();
+  await flushPromises();
+  assert.deepEqual(chromeB.queued(), []);
+  assert.equal(postsA.length, 1);
+  assert.equal(postsB.length, 1);
+  assert.equal(postsA[0].prompts[0].prompt_id, idA);
+  assert.equal(postsB[0].prompts[0].prompt_id, idB);
+});
+
+test("an iframe-supplied prompt identity is replaced before the note is queued", async () => {
+  const chrome = await createChromeHarness();
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { ...identicalProjectionNote(0), prompt_id: "stolen-identity" },
+  });
+  const stored = chrome.queued()[0];
+  assertPromptIdentity(stored.prompt_id);
+  assert.notEqual(stored.prompt_id, "stolen-identity");
+});
+
+test("an older live sync does not hide the transcript accepted by the prompts response", async () => {
+  let resolvePost = () => {};
+  const acceptedChat = [{ role: "user", kind: "message", text: "Sent note" }];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) {
+        return new Promise((resolve) => {
+          resolvePost = () => resolve({ ok: true, json: async () => ({ status: "queued", chat: acceptedChat }) });
+        });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.element("chatInput").value = "Sent note";
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 body");
+  await flushPromises();
+
+  chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat: [] }) });
+  resolvePost();
+  await flushPromises();
+
+  assert.equal(chrome.element("queuedLog").innerHTML, "");
+  assert.equal(chrome.element("chatLog").children.length, 1);
+  assert.equal(
+    chrome.element("chatLog").children[0].innerHTML,
+    '<small>You</small><div class="bubble-text">Sent note</div>',
+  );
+});
+
+test("a stale prompts response cannot remove a newer concurrent note", async () => {
+  let resolvePost = () => {};
+  const first = { role: "user", kind: "message", text: "First note" };
+  const second = { role: "user", kind: "message", text: "Second note" };
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) {
+        return new Promise((resolve) => {
+          resolvePost = () => resolve({ ok: true, json: async () => ({ status: "queued", chat: [first] }) });
+        });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.element("chatInput").value = "First note";
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 body");
+  await flushPromises();
+
+  chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat: [first, second] }) });
+  resolvePost();
+  await flushPromises();
+
+  const bubbles = chrome.element("chatLog").children;
+  assert.equal(bubbles.length, 2);
+  assert.match(bubbles[0].innerHTML, /First note/);
+  assert.match(bubbles[1].innerHTML, /Second note/);
+});
+
+test("a stale live sync cannot remove a newer agent reply", async () => {
+  const sent = { role: "user", kind: "message", text: "Sent note" };
+  const reply = { role: "agent", text: "New reply", html: "<p>New reply</p>" };
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialChat: [sent] },
+  });
+
+  chrome.eventSource().listeners.get("agent-reply")({ data: JSON.stringify(reply) });
+  chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat: [sent] }) });
+
+  const bubbles = chrome.element("chatLog").children;
+  assert.equal(bubbles.length, 2);
+  assert.match(bubbles[0].innerHTML, /Sent note/);
+  assert.equal(bubbles[1].innerHTML, '<small>Agent</small><div class="chat-md"><p>New reply</p></div>');
+});
+
+test("a transcript sync accepts updated rendering for the same stored agent entry", async () => {
+  const storedReply = {
+    role: "agent",
+    text: "Structured reply",
+    html: "<p>Old rendering</p>",
+    at: "2026-09-15T00:00:00.000Z",
+  };
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialChat: [storedReply] },
+  });
+
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [{ ...storedReply, html: "<p><strong>New rendering</strong></p>" }],
+    }),
+  });
+
+  assert.equal(
+    chrome.element("chatLog").lastAppendedChild.innerHTML,
+    '<small>Agent</small><div class="chat-md"><p><strong>New rendering</strong></p></div>',
+  );
+});
+
+test("a live agent reply remains reconcilable with a later sent-note transcript", async () => {
+  for (const includeEventTimestamp of [true, false]) {
+    let resolvePost = () => {};
+    const reply = {
+      role: "agent",
+      text: "Agent reply",
+      html: "<p>Agent reply</p>",
+      at: "2026-09-15T00:00:00.000Z",
+    };
+    const sent = {
+      role: "user",
+      kind: "message",
+      text: "Reviewer note",
+      at: "2026-09-15T00:00:01.000Z",
+    };
+    const chrome = await createChromeHarness({
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/prompts")) {
+          return new Promise((resolve) => {
+            resolvePost = () => resolve({ ok: true, json: async () => ({ status: "queued", chat: [reply, sent] }) });
+          });
+        }
+        return { ok: true, json: async () => ({}) };
+      },
+    });
+    const eventReply = includeEventTimestamp ? reply : { role: reply.role, text: reply.text, html: reply.html };
+    chrome.eventSource().listeners.get("agent-reply")({ data: JSON.stringify(eventReply) });
+    chrome.element("chatInput").value = "Reviewer note";
+    chrome.element("send").click();
+    chrome.sendSnapshot("uid=1 body");
+    await flushPromises();
+
+    resolvePost();
+    await flushPromises();
+
+    assert.equal(chrome.element("queuedLog").innerHTML, "", String(includeEventTimestamp));
+    assert.match(chrome.element("chatLog").lastAppendedChild.innerHTML, /Reviewer note/, String(includeEventTimestamp));
+  }
+});
+
+test("a failed send returns its notes to Queued with the remove control back", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) throw new Error("network unavailable");
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.element("chatInput").value = "Do not lose this";
+  chrome.element("send").click();
+  assert.match(chrome.element("queuedLog").innerHTML, /<small>Sending… /);
+
+  chrome.sendSnapshot("uid=1 body");
+  await flushPromises();
+
+  assert.match(chrome.element("queuedLog").innerHTML, /<small>Queued /);
+  const [removeButton] = chrome.element("queuedLog").querySelectorAll(".queued-remove");
+  assert.equal(removeButton.disabled, false);
+  assert.equal(
+    chrome.element("chatLog").children.length,
+    0,
+    "a note that never reached the server is not in the transcript",
+  );
+});
+
+// ---- Agent prose renders as structure; user text never renders as html ----
+
+test("an agent reply renders the server's html and a text-only reply stays escaped", async () => {
+  const chrome = await createChromeHarness();
+  chrome.eventSource().listeners.get("agent-reply")({
+    data: JSON.stringify({ text: "Done.\n\n- one", html: "<p>Done.</p><ul><li>one</li></ul>" }),
+  });
+  assert.equal(
+    chrome.element("chatLog").lastAppendedChild.innerHTML,
+    '<small>Agent</small><div class="chat-md"><p>Done.</p><ul><li>one</li></ul></div>',
+  );
+
+  chrome.eventSource().listeners.get("agent-reply")({ data: JSON.stringify({ text: "<img src=x onerror=alert(1)>" }) });
+  assert.equal(
+    chrome.element("chatLog").lastAppendedChild.innerHTML,
+    '<small>Agent</small><div class="bubble-text">&lt;img src=x onerror=alert(1)&gt;</div>',
+  );
+});
+
+test("an unavailable transcript image becomes an explicit expired placeholder", async () => {
+  const chrome = await createChromeHarness();
+  const bubble = chrome.element("history-bubble");
+  const image = chrome.element("history-image");
+  image.tagName = "IMG";
+  image.className = "bubble-attachment";
+  image.alt = "checkout-reference.png";
+  bubble.appendChild(image);
+  chrome.element("chatLog").appendChild(bubble);
+
+  chrome.element("chatLog").dispatch("error", { target: image });
+
+  const [expired] = bubble.children;
+  assert.equal(expired.tagName, "SPAN");
+  assert.equal(expired.className, "bubble-attachment bubble-attachment-expired");
+  assert.equal(expired.textContent, "Image expired");
+  assert.equal(expired.title, "checkout-reference.png");
+
+  const queuedImage = chrome.element("queued-image");
+  queuedImage.tagName = "IMG";
+  queuedImage.className = "bubble-attachment";
+  chrome.element("queuedLog").appendChild(queuedImage);
+  chrome.element("queuedLog").dispatch("error", { target: queuedImage });
+  assert.equal(chrome.element("queuedLog").children[0], queuedImage);
+});
+
+test("a synced transcript renders sent notes with anchors and thumbnails and never a user entry as html", async () => {
+  const chrome = await createChromeHarness();
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [
+        { role: "user", kind: "message", text: "<b>bold</b>", html: "<b>bold</b>" },
+        {
+          role: "user",
+          kind: "annotation",
+          text: "note",
+          anchor: { kind: "text", label: "text", excerpt: "<i>sel</i>", selector: "p" },
+          attachments: Array.from({ length: 6 }, (_, i) => ({ id: String(i).repeat(64) + ".png", name: `i${i}.png` })),
+        },
+        { role: "agent", text: "ok", html: "<p>ok</p>" },
+      ],
+    }),
+  });
+  const [message, note, reply] = chrome.element("chatLog").children;
+  assert.equal(message.innerHTML, '<small>You</small><div class="bubble-text">&lt;b&gt;bold&lt;/b&gt;</div>');
+  assert.match(
+    note.innerHTML,
+    /<span class="anchor-kind">text<\/span><span class="anchor-excerpt text">“&lt;i&gt;sel&lt;\/i&gt;”<\/span>/,
+  );
+  assert.equal(note.innerHTML.match(/class="bubble-attachment"/g)?.length, 4);
+  assert.match(note.innerHTML, /class="bubble-attachment-more"[^>]*>\+2</);
+  assert.equal(reply.innerHTML, '<small>Agent</small><div class="chat-md"><p>ok</p></div>');
 });

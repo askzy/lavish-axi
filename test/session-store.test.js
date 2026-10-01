@@ -2537,3 +2537,257 @@ test("an expired-lease redelivery carries the same resolved attachment paths", a
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// Every prompt the reviewer sends is part of the conversation not only the composer messages:
+// an element note, a text selection, and a message queued together enter the chat in batch
+// order, each carrying the anchor the chrome shows. Without this the transcript only ever held
+// the agent's side and the reviewer's typed messages, and the notes that drove the changes were
+// gone from the panel the moment they were sent.
+test("every accepted prompt enters the chat history with its anchor, in batch order", async () => {
+  await withStore(async ({ store, session }) => {
+    await store.queuePrompts(session.key, {
+      prompts: [
+        { uid: "1", prompt: "Rename this", selector: "h2#phase-1", tag: "h2", text: "Phase 1: Inventory" },
+        {
+          uid: "",
+          prompt: "Say design system",
+          selector: "main > p",
+          tag: "text",
+          text: "marketing site",
+          target: {
+            type: "text-range",
+            text: "marketing site",
+            selector: "main > p",
+            commonAncestorSelector: "main > p",
+            start: { selector: "main > p", path: [], offset: 0 },
+            end: { selector: "main > p", path: [], offset: 14 },
+          },
+        },
+        { uid: "", prompt: "Keep the table", selector: "", tag: "message", text: "Freeform message" },
+      ],
+    });
+
+    const updated = await store.findByKey(session.key);
+    assert.ok(updated.chat.every((entry) => typeof entry.at === "string" && entry.at));
+    assert.deepEqual(
+      updated.chat.map(({ at: _at, ...entry }) => entry),
+      [
+        {
+          role: "user",
+          kind: "annotation",
+          text: "Rename this",
+          anchor: { kind: "element", label: "<h2>", excerpt: "Phase 1: Inventory", selector: "h2#phase-1" },
+        },
+        {
+          role: "user",
+          kind: "annotation",
+          text: "Say design system",
+          anchor: { kind: "text", label: "text", excerpt: "marketing site", selector: "main > p" },
+        },
+        { role: "user", kind: "message", text: "Keep the table" },
+      ],
+    );
+  });
+});
+
+test("queuePrompts stores the prompt identity on the transcript and not on the agent-facing prompt", async () => {
+  await withStore(async ({ store, session }) => {
+    const promptId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    await store.queuePrompts(session.key, {
+      prompts: [
+        {
+          uid: "",
+          prompt: "Rename this",
+          selector: "h2#phase-1",
+          tag: "h2",
+          text: "Phase 1: Inventory",
+          prompt_id: promptId,
+        },
+      ],
+    });
+    const updated = await store.findByKey(session.key);
+    assert.equal(updated.chat[0].prompt_id, promptId);
+    assert.equal(updated.prompts[0].prompt_id, undefined);
+    assert.equal(updated.prompts[0].prompt, "Rename this");
+  });
+});
+
+test("queuePrompts does not duplicate chat or pending prompts for an already-accepted identity", async () => {
+  await withStore(async ({ store, session }) => {
+    const promptId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    const prompt = {
+      uid: "",
+      prompt: "Keep this note",
+      selector: "",
+      tag: "message",
+      text: "Freeform message",
+      prompt_id: promptId,
+    };
+    await store.queuePrompts(session.key, { prompts: [prompt] });
+    await store.queuePrompts(session.key, { prompts: [prompt] });
+    const updated = await store.findByKey(session.key);
+    assert.equal(updated.chat.length, 1);
+    assert.equal(updated.prompts.length, 1);
+    assert.equal(updated.chat[0].prompt_id, promptId);
+  });
+});
+
+test("a queued prompt's chat entry keeps only the client-visible attachment fields", async () => {
+  await withStore(async ({ store, session }) => {
+    const id = "a".repeat(64) + ".png";
+    await store.queuePrompts(
+      session.key,
+      {
+        prompts: [
+          { uid: "", prompt: "", selector: "", tag: "message", text: "", attachments: [{ id, name: "shot.png" }] },
+        ],
+      },
+      {
+        resolveAttachment: async () => ({
+          id,
+          name: "shot.png",
+          path: "/private/shot.png",
+          mime: "image/png",
+          bytes: 12,
+        }),
+        maxPerPrompt: 4,
+        maxPromptBytes: 1024,
+      },
+    );
+    const updated = await store.findByKey(session.key);
+    assert.equal(updated.chat.length, 1);
+    assert.deepEqual(updated.chat[0].attachments, [{ id, name: "shot.png" }]);
+    assert.equal(updated.chat[0].text, "");
+  });
+});
+
+test("an acknowledged layout prompt retry bypasses a later recurring-warning conflict", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const firstLoad = await beginArtifactLoad(store, session.key);
+    const finding = { selector: "p", kind: "clipped-text", axis: "vertical", overflowPx: 27, severity: "error" };
+    const recorded = await store.recordLayoutDiagnostics(
+      session.key,
+      diagnosticPayload(firstLoad, 1, { complete: true, viewport_width: 1440, findings: [finding] }),
+    );
+    const prepared = await store.prepareLayoutWarningFixes(session.key, [recorded.warnings[0].id]);
+    const prompt = {
+      ...prepared.prompt,
+      uid: "",
+      selector: "",
+      tag: "layout-warnings",
+      prompt_id: "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa",
+    };
+    await store.queuePrompts(session.key, { prompts: [prompt] });
+    assert.equal((await store.takeFeedback(session.key)).status, "feedback");
+
+    const secondLoad = await beginArtifactLoad(store, session.key);
+    const recurring = await store.recordLayoutDiagnostics(
+      session.key,
+      diagnosticPayload(secondLoad, 1, { complete: true, viewport_width: 1440, findings: [finding] }),
+    );
+    assert.equal(recurring.warnings[0].status, "recurring");
+
+    const retry = await store.queuePrompts(session.key, { prompts: [prompt] });
+    assert.equal(retry.conflict, undefined);
+    assert.equal(retry.fresh_feedback, false);
+    assert.equal(retry.chat.length, 1);
+    assert.equal(retry.prompts.length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Fork lease model: the transcript is written once, at accept time in `queuePrompts`. Delivery
+// (`takeFeedback`), a lease that expires and redelivers, and the ack never touch `chat`, so a
+// redelivered batch never grows the conversation or moves its revision.
+test("a lease that expires and redelivers adds no chat entry and bumps no chat_revision", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    let now = Date.parse("2026-09-15T00:00:00.000Z");
+    const store = new SessionStore(path.join(dir, "state.json"), { feedbackLeaseTtlMs: 1000, now: () => now });
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await store.queuePrompts(session.key, {
+      prompts: [
+        { uid: "", prompt: "Rename this", selector: "h2", tag: "h2", text: "Heading", prompt_id: "first-note" },
+      ],
+    });
+    const queued = await store.findByKey(session.key);
+    assert.equal(queued.chat.length, 1);
+    assert.equal(queued.chat_revision, 1);
+
+    const first = await store.takeFeedback(session.key);
+    assert.equal(first.status, "feedback");
+    now += 1001;
+    const redelivered = await store.takeFeedback(session.key);
+    assert.equal(redelivered.status, "feedback");
+    assert.notEqual(redelivered.delivery_id, first.delivery_id);
+    assert.deepEqual(
+      redelivered.prompts.map((prompt) => prompt.prompt),
+      ["Rename this"],
+    );
+
+    const updated = await store.findByKey(session.key);
+    assert.equal(updated.chat.length, 1);
+    assert.equal(updated.chat_revision, 1);
+    assert.equal(updated.leases.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("poll output and leases never carry the transcript's prompt_id", async () => {
+  await withStore(async ({ store, session }) => {
+    await store.queuePrompts(session.key, {
+      prompts: [
+        { uid: "", prompt: "Rename this", selector: "h2", tag: "h2", text: "Heading", prompt_id: "first-note" },
+        {
+          uid: "",
+          prompt: "Keep the table",
+          selector: "",
+          tag: "message",
+          text: "Freeform message",
+          prompt_id: "second-note",
+        },
+      ],
+    });
+    const taken = await store.takeFeedback(session.key);
+    assert.equal(taken.status, "feedback");
+    assert.equal(taken.prompts.length, 2);
+    assert.ok(taken.prompts.every((prompt) => !("prompt_id" in prompt)));
+
+    const updated = await store.findByKey(session.key);
+    assert.equal(updated.leases.length, 1);
+    assert.ok(updated.leases[0].prompts.every((prompt) => !("prompt_id" in prompt)));
+    assert.deepEqual(
+      updated.chat.map((entry) => entry.prompt_id),
+      ["first-note", "second-note"],
+    );
+  });
+});
+
+test("reopening a session keeps its chat revision and acknowledged identities", async () => {
+  await withStore(async ({ store, session }) => {
+    await store.queuePrompts(session.key, {
+      prompts: [
+        { uid: "", prompt: "Keep this", selector: "", tag: "message", text: "Freeform message", prompt_id: "kept" },
+      ],
+    });
+    await store.addAgentReply(session.key, "Done");
+    const before = await store.findByKey(session.key);
+    assert.equal(before.chat_revision, 2);
+
+    const reopened = await store.upsertSession(session.file, session.url);
+    assert.equal(reopened.chat_revision, 2);
+    assert.deepEqual(reopened.chat_ack_ids, []);
+    assert.equal(reopened.chat.length, 2);
+  });
+});
