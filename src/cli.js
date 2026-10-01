@@ -83,6 +83,7 @@ export const POLL_WAKE_PATH_RULES = Object.freeze([
   "If the harness has no completion-aware background facility, use the foreground poll or first wire a verified wake callback into the surrounding supervisor.",
   "Do not tell the user the artifact is being monitored until that wake path is live.",
   "A reaped or timed-out poll is expected and is not a failure: harnesses reap long-lived jobs on their own schedule, so it says nothing about whether the user is still reviewing, and queued feedback is never lost either way.",
+  "Read a delivered poll response completely before truncating or filtering it: the user's `prompts`, any `artifact_failures`, and the `next_step` instruction come first, and the bulky `dom_snapshot` comes last.",
   POLL_HANDOFF_RULE,
   POLL_PICKUP_RULE,
   POLL_BROWSER_DISCONNECTED_RULE,
@@ -422,10 +423,10 @@ export function startPollWaitReporter({
 /**
  * @returns {{
  *   session: { file: string, status: string, session_ended?: boolean, ended_by?: string },
- *   next_step?: string,
- *   dom_snapshot?: string,
  *   prompts?: any[],
  *   artifact_failures?: any[],
+ *   next_step?: string,
+ *   dom_snapshot?: string,
  * }}
  */
 export function createPollOutput({ file, response }) {
@@ -444,10 +445,10 @@ export function createPollOutput({ file, response }) {
         status: "feedback",
         ...(sessionEnded ? { session_ended: true, ...(endedBy ? { ended_by: endedBy } : {}) } : {}),
       },
-      dom_snapshot: response.dom_snapshot || "",
       prompts: response.prompts || [],
       ...(artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
       next_step: createFeedbackNextStep(file, artifactFailures, sessionEnded, endedBy, response.prompts || []),
+      dom_snapshot: response.dom_snapshot || "",
     };
   }
   if (response.status === "ended") {
