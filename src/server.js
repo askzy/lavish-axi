@@ -32,6 +32,7 @@ import {
   serializeLayoutWarnings,
 } from "./layout-warnings.js";
 import * as mermaidNode from "./mermaid-node.js";
+import * as tableCellHelpers from "./table-cell.js";
 import { buildSelfContainedHtml, exportFileName, splitExportWarnings } from "./export-bundle.js";
 import { injectLavishSdk } from "./html-transform.js";
 import { bindHost, extraAllowedHosts, hostForUrl, IPV6_LOOPBACK_HOST, linkHost, LOOPBACK_HOST } from "./paths.js";
@@ -1618,14 +1619,30 @@ ${faviconTag}
 </html>`;
 }
 
+// Serialize every helper a shared module exports as a same-scope const so cross-helper calls
+// (e.g. mermaidNodeFrom → mermaidNodeElement) resolve in the browser. Deriving these from the
+// module's exports — rather than a hand-kept list — means adding a helper can never silently
+// ReferenceError at runtime.
+// Only functions survive `toString()` round-tripping: a Set, Map, or RegExp would serialize to a
+// valid-looking `{}` and reach the browser semantically empty, which is far harder to find than
+// this throw. A shared module must therefore export nothing but helpers.
+function serializeModuleHelpers(module) {
+  const entries = Object.entries(module);
+  const unsupported = entries.filter(([, value]) => typeof value !== "function").map(([name]) => name);
+  if (unsupported.length > 0) {
+    throw new TypeError(
+      `Cannot serialize non-function SDK helper export(s) into the artifact bundle: ${unsupported.join(", ")}`,
+    );
+  }
+  return {
+    declarations: entries.map(([name, fn]) => `const ${name}=${fn.toString()};`).join("\n"),
+    names: entries.map(([name]) => name),
+  };
+}
+
 export function createSdkJs(key, artifactRevision = 0, artifactLoadToken = "") {
-  // Serialize every helper exported by mermaid-node.js as a same-scope const so
-  // cross-helper calls (e.g. mermaidNodeFrom → mermaidNodeElement) resolve in the
-  // browser. Deriving this from the module's exports — rather than a hand-kept
-  // list — means adding a helper can never silently ReferenceError at runtime.
-  const mermaidHelperEntries = Object.entries(mermaidNode).filter(([, value]) => typeof value === "function");
-  const mermaidHelperDecls = mermaidHelperEntries.map(([name, fn]) => `const ${name}=${fn.toString()};`).join("\n");
-  const mermaidHelperKeys = mermaidHelperEntries.map(([name]) => name).join(", ");
+  const mermaidHelperSource = serializeModuleHelpers(mermaidNode);
+  const tableHelperSource = serializeModuleHelpers(tableCellHelpers);
   const revisionNumber = Number(artifactRevision);
   const revision = Number.isFinite(revisionNumber) && revisionNumber >= 0 ? Math.trunc(revisionNumber) : 0;
   const loadToken = String(artifactLoadToken || "").slice(0, 200);
@@ -1648,8 +1665,9 @@ const srgbContrastRatio=${srgbContrastRatio.toString()};
 const compositeSrgbOver=${compositeSrgbOver.toString()};
 const resolveTextBackdrop=${resolveTextBackdrop.toString()};
 const classifyUnreadableContrast=${classifyUnreadableContrast.toString()};
-${mermaidHelperDecls}
-const mermaidHelpers={ ${mermaidHelperKeys} };
+${mermaidHelperSource.declarations}
+const mermaidHelpers={ ${mermaidHelperSource.names.join(", ")} };
+${tableHelperSource.declarations}
 (${createArtifactSdk.toString()})(deriveQueueKey, isNativeInteractiveControl, mermaidHelpers, artifactRevision, artifactLoadToken);
 })();`;
 }
