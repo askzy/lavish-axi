@@ -74,6 +74,7 @@ import {
 } from "./prune.js";
 import { formatServerLogLine, serverStdioIsTimestamped } from "./server-log.js";
 import { canonicalFile, canonicalSessionFile, SessionStore, sessionKey } from "./session-store.js";
+import { detectTailscale } from "./tailscale.js";
 import {
   ACCEPTED_IMAGE_MIME,
   isValidAttachmentKey,
@@ -289,9 +290,7 @@ export async function serve({
   hosts = undefined,
   linkHost: linkHostName = undefined,
   allowedHosts = undefined,
-  // Tailscale detection is not wired in this fork yet: the CLI passes null, and tests pass a fake
-  // detector. The surrounding reconcile and phone-readiness plumbing is in place for when it is.
-  detectTailscale: detectTailscaleFn = null,
+  detectTailscale: detectTailscaleFn = detectTailscale,
   lookupHost = undefined,
   extraListenHosts = [],
   bindRecoveryDelaysMs = BIND_RECOVERY_DELAYS_MS,
@@ -320,7 +319,7 @@ export async function serve({
   const activeTailscaleNetwork = tailscaleNetworkKey(tailscale);
   const serverStateId = stateId(stateFile);
   let tailscalePhoneReady = false;
-  let tailscaleDetectionWarning = typeof tailscale?.warning === "string" ? tailscale.warning : "";
+  let tailscaleDetectionWarning = tailscaleWarning(tailscale);
   // Requested addresses that have not bound yet, with the last error for each. Background recovery
   // keeps retrying them and every surface that reports network health reads them from here, so a
   // failed bind is never just one log line nobody sees.
@@ -421,7 +420,7 @@ export async function serve({
         const detectedNetwork = tailscaleNetworkKey(detectedTailscale);
         const stale = detectedNetwork !== activeTailscaleNetwork;
         if (stale) {
-          tailscaleDetectionWarning = typeof detectedTailscale?.warning === "string" ? detectedTailscale.warning : "";
+          tailscaleDetectionWarning = tailscaleWarning(detectedTailscale);
         }
         return stale;
       } catch {
@@ -507,7 +506,7 @@ export async function serve({
         title: "Wrong address",
         message: tailscalePhoneReady
           ? "This Lavish review server does not accept that host. Open the working URL below on this computer or your phone through Tailscale."
-          : "This Lavish review server does not accept that host. Open the working URL below on this computer.",
+          : "This Lavish review server does not accept that host. Open the working URL below on this computer. Phone access is unavailable.",
       });
     });
   }
@@ -2057,6 +2056,11 @@ function listenHttp(app, port, host, onRuntimeError) {
     // important defense: a reachable extra address must never turn into an all-interfaces listener.
     server.listen({ port, host });
   });
+}
+
+/** @param {{ ipv4: string | null, magicDnsName: string | null, warning?: string } | null | undefined} tailscale */
+function tailscaleWarning(tailscale) {
+  return typeof tailscale?.warning === "string" ? tailscale.warning : "";
 }
 
 function tailscaleNetworkKey(tailscale) {
