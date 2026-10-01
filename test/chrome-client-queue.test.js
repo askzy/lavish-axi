@@ -32,6 +32,10 @@ async function createChromeHarness({
   // Opt-in frozen clock. `reloadChromeAfterServerRestart` waits on wall-clock deadlines, so a
   // test that needs one to expire has to own `Date.now()` rather than sleep through it.
   fakeClock = false,
+  // Opt-in phone-width viewport: installs a `window.matchMedia` whose single query answers the
+  // chrome's sheet breakpoint, with `setMobile` flipping it the way a resize would. Left off, the
+  // window has no matchMedia at all, which is the desktop the other tests run against.
+  mobile = false,
 } = {}) {
   const source = await readFile(sourceUrl, "utf8");
   const postedToFrame = [];
@@ -44,6 +48,7 @@ async function createChromeHarness({
   const beginRequests = [];
   const artifactBeginRequests = [];
   const focusLog = [];
+  let activeElement = null;
   let nextTimerId = 1;
   let reloadCount = 0;
   let artifactRevision = 0;
@@ -183,6 +188,7 @@ async function createChromeHarness({
       },
       focus() {
         this.focused = true;
+        activeElement = this;
         focusLog.push(this.id);
       },
       select() {},
@@ -215,6 +221,9 @@ async function createChromeHarness({
   element("moreMenu").hidden = true;
   element("warningsDrawer").hidden = true;
   element("layoutGateBypass").hidden = true;
+  element("chatInput").parentElement = element("chatComposer");
+  element("chatComposer").parentElement = element("panel");
+  element("panelScroll").parentElement = element("panel");
 
   const harnessFetch = async (url, init) => {
     if (String(url).includes("/chrome-loads/begin")) {
@@ -273,6 +282,9 @@ async function createChromeHarness({
     },
     document: {
       body: element("body"),
+      get activeElement() {
+        return activeElement;
+      },
       getElementById(id) {
         // Answer only for ids the served page declares, so an id the client and the page disagree
         // on fails here the way it would go dead in a browser.
@@ -312,6 +324,22 @@ async function createChromeHarness({
       },
     },
   };
+
+  const mediaQueries = [];
+  if (mobile) {
+    context.window.matchMedia = (query) => {
+      const list = {
+        media: query,
+        matches: true,
+        changeHandlers: [],
+        addEventListener(type, handler) {
+          if (type === "change") this.changeHandlers.push(handler);
+        },
+      };
+      mediaQueries.push(list);
+      return list;
+    };
+  }
 
   vm.runInNewContext(source, context, { filename: "chrome-client.js" });
   await flushPromises();
@@ -379,6 +407,30 @@ async function createChromeHarness({
     beginRequests,
     artifactBeginRequests,
     artifactLoadToken: frameLoadToken,
+    mediaQueries,
+    setMobile(matches) {
+      for (const list of mediaQueries) {
+        list.matches = matches;
+        for (const handler of list.changeHandlers) handler({ matches });
+      }
+    },
+    // A pointer gesture on the conversation dock, as the browser would deliver it: one pointer
+    // id from down to up, with the y travel the test names.
+    dragDock(fromY, toY, { pointerId = 1 } = {}) {
+      const head = element("panelHead");
+      head.dispatch("pointerdown", { pointerId, clientY: fromY, button: 0 });
+      head.dispatch("pointermove", { pointerId, clientY: fromY + (toY - fromY) / 2 });
+      head.dispatch("pointermove", { pointerId, clientY: toY });
+      head.dispatch("pointerup", { pointerId, clientY: toY });
+      // A completed pointer sequence is followed by a click on the same target.
+      head.dispatch("click", {});
+    },
+    cancelDock(fromY, moveY, cancelY, { pointerId = 1 } = {}) {
+      const head = element("panelHead");
+      head.dispatch("pointerdown", { pointerId, clientY: fromY, button: 0 });
+      head.dispatch("pointermove", { pointerId, clientY: moveY });
+      head.dispatch("pointercancel", { pointerId, clientY: cancelY });
+    },
   };
 }
 
@@ -2415,4 +2467,220 @@ test("a local asset failure inside the artifact is reported as a fatal artifact 
   const failure = posts.find((post) => post.url === "/api/abc/artifact-failures");
   assert.equal(failure.body.failures[0].kind, "artifact-asset-unavailable");
   assert.match(failure.body.failures[0].detail, /logo\.png/);
+});
+
+// ---- Phone-width conversation sheet ----
+
+function sheetState(chrome) {
+  const toggle = chrome.element("panelToggle");
+  return {
+    open: chrome.element("body").classList.contains("sheet-open"),
+    scrollInert: Boolean(chrome.element("panelScroll").inert),
+    composerInert: Boolean(chrome.element("chatComposer").inert),
+    expanded: toggle["aria-expanded"],
+    label: toggle["aria-label"],
+    summary: chrome.element("panelSummary").textContent,
+    summaryClass: String(chrome.element("panelSummary").classList),
+    stored: chrome.storage.get("lavish-axi:sheet-open:abc") || null,
+  };
+}
+
+test("desktop chrome never turns the conversation panel into a sheet", async () => {
+  const chrome = await createChromeHarness();
+
+  assert.deepEqual(chrome.mediaQueries, []);
+  const before = sheetState(chrome);
+  assert.equal(before.open, false);
+  assert.equal(before.scrollInert, false);
+  assert.equal(before.composerInert, false);
+
+  // The heading is plain text on desktop: clicking it must not start hiding the panel.
+  chrome.element("panelHead").dispatch("click", {});
+  const after = sheetState(chrome);
+  assert.equal(after.open, false);
+  assert.equal(after.scrollInert, false);
+  assert.equal(after.stored, null);
+});
+
+test("phone chrome boots with the conversation docked and raises it on tap", async () => {
+  const chrome = await createChromeHarness({ mobile: true });
+
+  assert.equal(chrome.mediaQueries.length, 1);
+  assert.match(chrome.mediaQueries[0].media, /max-width/);
+  const docked = sheetState(chrome);
+  assert.equal(docked.open, false);
+  // The hidden part of the sheet must be unreachable: a focus landing in the off-screen
+  // composer would scroll the page into a state the layout cannot recover from.
+  assert.equal(docked.scrollInert, true);
+  assert.equal(docked.composerInert, true);
+  assert.equal(docked.expanded, "false");
+  assert.equal(docked.label, "Show conversation");
+
+  chrome.element("panelHead").dispatch("click", {});
+  const raised = sheetState(chrome);
+  assert.equal(raised.open, true);
+  assert.equal(raised.scrollInert, false);
+  assert.equal(raised.composerInert, false);
+  assert.equal(raised.expanded, "true");
+  assert.equal(raised.label, "Hide conversation");
+  assert.equal(raised.stored, "1");
+
+  // The scrim behind the sheet is a tap-to-dismiss surface.
+  chrome.element("panelScrim").dispatch("click", {});
+  assert.equal(sheetState(chrome).open, false);
+  assert.equal(sheetState(chrome).stored, null);
+
+  // Escape also lowers it, after the menus and drawers that sit above it have had their turn.
+  chrome.element("panelHead").dispatch("click", {});
+  assert.equal(sheetState(chrome).open, true);
+  chrome.dispatchDocumentKeydown({ key: "Escape" });
+  assert.equal(sheetState(chrome).open, false);
+});
+
+test("phone chrome restores an open sheet across a chrome reload", async () => {
+  const storage = new Map([["lavish-axi:sheet-open:abc", "1"]]);
+  const chrome = await createChromeHarness({ mobile: true, storage });
+
+  const state = sheetState(chrome);
+  assert.equal(state.open, true);
+  assert.equal(state.scrollInert, false);
+  assert.equal(state.expanded, "true");
+});
+
+test("the dock summarizes what the user should know while the sheet is down", async () => {
+  const chrome = await createChromeHarness({
+    mobile: true,
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+
+  assert.equal(sheetState(chrome).summary, "Agent not listening");
+
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening" }) });
+  assert.equal(sheetState(chrome).summary, "Agent listening");
+
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "working" }) });
+  assert.equal(sheetState(chrome).summary, "Agent is working…");
+
+  // A reply that lands behind the artifact is previewed on the dock until the sheet comes up.
+  chrome.eventSource().listeners.get("agent-reply")({ data: JSON.stringify({ text: "Renamed the payment step." }) });
+  let state = sheetState(chrome);
+  assert.equal(state.summary, "Renamed the payment step.");
+  assert.match(state.summaryClass, /is-unread/);
+
+  // Work the user queued from the artifact outranks the unread preview: it is the thing they
+  // still have to send.
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Call this Payment method", selector: "h2", tag: "element", text: "Payment" },
+  });
+  state = sheetState(chrome);
+  assert.equal(state.summary, "1 queued");
+  assert.match(state.summaryClass, /is-accent/);
+  assert.doesNotMatch(state.summaryClass, /is-unread/);
+  assert.match(String(chrome.element("panelHead").classList), /is-fresh/);
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Drop the map preview", selector: "p", tag: "element", text: "Autofill" },
+  });
+  assert.equal(sheetState(chrome).summary, "2 queued");
+
+  // Raising the sheet shows the reply itself, so the preview is no longer owed; once the queue
+  // is sent the dock is back to reporting the agent.
+  chrome.element("panelHead").dispatch("click", {});
+  chrome.element("send").click();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(sheetState(chrome).summary, "Agent is working…");
+  assert.doesNotMatch(sheetState(chrome).summaryClass, /is-unread/);
+
+  // A reply that arrives while the sheet is up was seen, so lowering it previews nothing.
+  chrome.eventSource().listeners.get("agent-reply")({ data: JSON.stringify({ text: "Done." }) });
+  chrome.element("panelHead").dispatch("click", {});
+  assert.equal(sheetState(chrome).summary, "Agent is working…");
+});
+
+test("the dock reports an ended session and keeps the panel inert", async () => {
+  const chrome = await createChromeHarness({
+    mobile: true,
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+
+  chrome.element("panelHead").dispatch("click", {});
+  chrome.element("chatInput").value = "Ship it";
+  chrome.element("sendAndEnd").click();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.element("sendAndEnd").disabled, true, "the session ended");
+  assert.equal(sheetState(chrome).summary, "Session ended");
+  assert.equal(sheetState(chrome).scrollInert, true);
+  assert.equal(sheetState(chrome).composerInert, true);
+
+  chrome.setMobile(false);
+  assert.equal(sheetState(chrome).scrollInert, true, "an ended panel never becomes interactive on desktop");
+});
+
+test("a swipe on the dock raises and lowers the sheet, and a tap after a swipe is not a second toggle", async () => {
+  const chrome = await createChromeHarness({ mobile: true });
+
+  // Upward travel past the threshold raises it; the click that ends the gesture is swallowed.
+  chrome.dragDock(800, 700);
+  assert.equal(sheetState(chrome).open, true);
+
+  // A nudge short of the threshold is not a decision either way.
+  chrome.dragDock(100, 130, { pointerId: 2 });
+  assert.equal(sheetState(chrome).open, true);
+
+  chrome.dragDock(100, 220, { pointerId: 3 });
+  assert.equal(sheetState(chrome).open, false);
+
+  // A pure tap (no travel) still toggles.
+  chrome.dragDock(300, 300, { pointerId: 4 });
+  assert.equal(sheetState(chrome).open, true);
+
+  // Nothing the gesture set on the panel survives its end.
+  const panel = chrome.element("panel");
+  assert.equal(panel.style.transform, "");
+  assert.equal(panel.classList.contains("is-dragging"), false);
+});
+
+test("a cancelled dock swipe leaves the sheet unchanged and the next tap active", async () => {
+  const chrome = await createChromeHarness({ mobile: true });
+  const panel = chrome.element("panel");
+
+  chrome.cancelDock(800, 790, 0);
+
+  assert.equal(sheetState(chrome).open, false);
+  assert.equal(panel.style.transform, "");
+  assert.equal(panel.classList.contains("is-dragging"), false);
+
+  chrome.element("panelHead").dispatch("click", {});
+  assert.equal(sheetState(chrome).open, true);
+});
+
+test("crossing the breakpoint in either direction leaves no sheet state behind", async () => {
+  const chrome = await createChromeHarness({ mobile: true });
+  chrome.element("panelHead").dispatch("click", {});
+  assert.equal(sheetState(chrome).open, true);
+  assert.equal(chrome.storage.get("lavish-axi:sheet-open:abc"), "1");
+
+  // Widening to desktop: the panel is a plain side panel again, never inert, never "open".
+  chrome.setMobile(false);
+  let state = sheetState(chrome);
+  assert.equal(state.open, false);
+  assert.equal(state.scrollInert, false);
+  assert.equal(state.composerInert, false);
+  assert.equal(chrome.storage.has("lavish-axi:sheet-open:abc"), false);
+
+  // Narrowing back docks it again and moves focus out of the content becoming inert.
+  chrome.element("chatInput").focus();
+  chrome.setMobile(true);
+  state = sheetState(chrome);
+  assert.equal(state.open, false);
+  assert.equal(state.scrollInert, true);
+  assert.equal(chrome.focusLog.at(-1), "panelToggle");
+  assert.equal(chrome.storage.has("lavish-axi:sheet-open:abc"), false);
 });
