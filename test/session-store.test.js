@@ -150,6 +150,57 @@ test("queued mermaid node prompts preserve node identity and drop unknown fields
   }
 });
 
+test("queued whiteboard prompts normalize the excalidraw-scene target to its fixed shape", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<div class='mermaid'>graph TD; A-->B;</div>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+
+    await store.queuePrompts(session.key, {
+      prompts: [
+        {
+          uid: "",
+          prompt: "Whiteboard edits:\nMoved rectangle (Auth)",
+          selector: "",
+          tag: "whiteboard",
+          text: "Whiteboard edits",
+          target: {
+            type: "excalidraw-scene",
+            diagramIndex: "1",
+            diagramId: "mermaid-2",
+            sourceHash: "abc123def4567890",
+            scenePath: "/state/whiteboards/k/1.excalidraw",
+            previewPath: "/state/whiteboards/k/1.png",
+            imageFallback: false,
+            stats: { added: 1, removed: 0, moved: 2, relabeled: 0, drawn: 1 },
+            hostile: { nested: "should not survive" },
+          },
+        },
+      ],
+    });
+
+    const result = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(result.prompts.length, 1);
+    assert.equal(result.prompts[0].tag, "whiteboard");
+    assert.deepEqual(result.prompts[0].target, {
+      type: "excalidraw-scene",
+      diagramIndex: 1,
+      diagramId: "mermaid-2",
+      sourceHash: "abc123def4567890",
+      scenePath: "/state/whiteboards/k/1.excalidraw",
+      previewPath: "/state/whiteboards/k/1.png",
+      imageFallback: false,
+      stats: { added: 1, removed: 0, moved: 2, relabeled: 0, drawn: 1 },
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a diagnostic pass records warnings passively and never becomes agent feedback", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {
@@ -1147,6 +1198,42 @@ test("taken feedback stays leased and is delivered again once the lease expires 
     assert.deepEqual(redelivered.prompts, first.prompts);
     assert.equal(redelivered.dom_snapshot, "snap");
     assert.equal((await store.takeFeedback(session.key)).status, "waiting");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an expired whiteboard lease is redelivered with the same scene and preview paths", async () => {
+  const { dir, store, session, advance } = await leaseFixture();
+  try {
+    const target = {
+      type: "excalidraw-scene",
+      diagramIndex: 0,
+      diagramId: "mermaid-1",
+      sourceHash: "abc123def4567890",
+      scenePath: path.join(dir, "whiteboards", session.key, "0.excalidraw"),
+      previewPath: path.join(dir, "whiteboards", session.key, "0.png"),
+      imageFallback: false,
+      stats: { added: 0, removed: 0, moved: 1, relabeled: 0, drawn: 0 },
+    };
+    await store.queuePrompts(session.key, {
+      prompts: [
+        { uid: "", prompt: "Whiteboard edits to diagram 1", selector: "", tag: "whiteboard", text: "", target },
+      ],
+    });
+
+    const first = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(first.prompts[0].target.scenePath, target.scenePath);
+
+    // The poll died without acking; the sidecar files are still on disk, so the redelivered
+    // prompt must point at the very same paths.
+    advance(60_000);
+    const redelivered = feedbackResult(await store.takeFeedback(session.key));
+    assert.notEqual(redelivered.delivery_id, first.delivery_id);
+    assert.equal(redelivered.prompts[0].tag, "whiteboard");
+    assert.equal(redelivered.prompts[0].target.scenePath, target.scenePath);
+    assert.equal(redelivered.prompts[0].target.previewPath, target.previewPath);
+    assert.deepEqual(redelivered.prompts[0].target, first.prompts[0].target);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
