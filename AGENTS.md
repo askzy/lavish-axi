@@ -77,6 +77,7 @@ State lives at `~/.lavish-axi/state.json` (`LAVISH_AXI_STATE_DIR`), shared acros
 6. User actions in the iframe `postMessage` to the chrome. Queued prompts live in tab `sessionStorage`; unsent prompts sharing the SDK-internal `_lavishQueueKey` replace each other, that field is stripped before POSTing collected prompts to `/api/:key/prompts`, and sent prompts are removed only after a successful response.
    `/api/:key/prompts` is **same-origin guarded** like the reviewer-handoff route: whatever lands there reaches the agent as the reviewer's own instructions, and the key alone must never buy that. Only this server's own chrome may queue prompts, so any test or tool that posts there has to send a matching `Origin`.
    The chrome page (`/session/:key`) also answers `X-Frame-Options: DENY` and `frame-ancestors 'none'`, denying an attacker page both a window handle to the chrome and a clickjacking surface over Send. The header is scoped to that route on purpose - `/artifact/*` is framed by the chrome.
+   The route rejects every new batch for an already-ended session (409 `status: "ended"`), including a redundant send-and-end batch, because no later poll will deliver it.
    Text selection prompts use `tag: "text"` with a `target` of `type: "text-range"` (selected text, `commonAncestorSelector`, start/end boundary anchors).
    Mermaid diagram-node prompts use `tag: "mermaid-node"` with a `target` carrying `diagramId`, `nodeId`, the rendered `label`, and a `selector`, so the annotation anchors to node identity and survives a re-render that reshuffles the SVG.
    Composer and annotation-card keyboard conventions, button layout, and the conversation panel are user-facing behavior owned by README's Feedback controls and Keyboard shortcuts bullets.
@@ -92,6 +93,7 @@ State lives at `~/.lavish-axi/state.json` (`LAVISH_AXI_STATE_DIR`), shared acros
    If SIGINT or SIGTERM interrupts a no-timeout poll, the CLI writes re-run guidance to stderr and exits with the conventional signal code; queued feedback persists, so re-running the same poll is safe.
 8. The `/events/:key` SSE stream emits `agent-presence` states: `waiting` before any poll has attached, `listening` while one is active, and `working` after a poll has delivered feedback and released; the chrome allows queued feedback while waiting or listening and blocks sends only while working.
    An agent reply (`POST /api/:key/agent-reply`, the CLI's `--agent-reply`) concludes the working state and returns presence to `waiting`, so sends re-enable as soon as the agent answers instead of staying blocked until another poll attaches.
+   An `ended` SSE event makes every connected chrome read-only immediately. The stream registers listeners before reading session state, then sends an `ended` snapshot when that state is already terminal; the bootstrapped `initialEnded` state covers pages loaded after the end, and `markSessionEnded()` is idempotent across redundant signals.
    `--agent-reply` posts a chat message into the session before polling, rendered in the browser conversation panel via the same stream.
 
 ### Passive layout-warning inbox

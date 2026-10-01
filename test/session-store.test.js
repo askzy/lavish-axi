@@ -835,7 +835,7 @@ test("queued prompts can atomically carry a browser end intent", async () => {
   }
 });
 
-test("late prompts after a user end preserve the ended session state", async () => {
+test("prompts queued after a session already ended are rejected, not silently stored", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {
     const stateFile = path.join(dir, "state.json");
@@ -845,23 +845,54 @@ test("late prompts after a user end preserve the ended session state", async () 
     const store = new SessionStore(stateFile);
     const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
     await store.endSession(session.key, "user");
-    await store.queuePrompts(session.key, {
+    // No agent will ever poll for this again - accepting it with a 200 would be a promise the
+    // server cannot keep, so the whole batch is rejected instead.
+    const result = await store.queuePrompts(session.key, {
       domSnapshot: 'uid=1 h1 "Hello"',
       prompts: [{ uid: "", prompt: "Late feedback", selector: "", tag: "message", text: "Freeform message" }],
     });
+    assert.equal(result.ended, true);
+    assert.equal(result.ended_by, "user");
 
     const updated = await store.findByKey(session.key);
     assert.equal(updated.status, "ended");
     assert.equal(updated.ended_by, "user");
+    assert.equal(updated.pending_prompts, 0);
 
-    const first = feedbackResult(await store.takeFeedback(session.key));
-    assert.equal(first.session_ended, true);
-    assert.equal(first.ended_by, "user");
-    assert.equal(first.prompts[0].prompt, "Late feedback");
+    const taken = await store.takeFeedback(session.key);
+    assert.equal(taken.status, "ended");
+    assert.equal(taken.ended_by, "user");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
-    const second = await store.takeFeedback(session.key);
-    assert.equal(second.status, "ended");
-    assert.equal(second.ended_by, "user");
+test("a Send & End that arrives after the session already ended is also rejected", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    // The agent already ended the session; a browser tab that has not learned that yet clicks
+    // Send & End. Asking to end again does not make the batch deliverable.
+    await store.endSession(session.key, "agent");
+    const result = await store.queuePrompts(session.key, {
+      domSnapshot: 'uid=1 h1 "Hello"',
+      endSession: true,
+      prompts: [{ uid: "", prompt: "Parting feedback", selector: "", tag: "message", text: "Freeform message" }],
+    });
+    assert.equal(result.ended, true);
+    assert.equal(result.ended_by, "agent");
+
+    const updated = await store.findByKey(session.key);
+    assert.equal(updated.pending_prompts, 0);
+
+    const taken = await store.takeFeedback(session.key);
+    assert.equal(taken.status, "ended");
+    assert.equal(taken.ended_by, "agent");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
