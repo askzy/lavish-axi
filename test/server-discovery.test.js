@@ -106,12 +106,21 @@ async function captureCli(args) {
   return output;
 }
 
+// A port free on `host` AND on loopback: serve() always binds loopback too, and under a parallel
+// test run a port free on one address is often taken on the other.
 async function freePort(host = "127.0.0.1") {
-  const probe = createServer();
-  await new Promise((resolve) => probe.listen({ port: 0, host }, () => resolve(undefined)));
-  const { port } = /** @type {{ port: number }} */ (probe.address());
-  await new Promise((resolve) => probe.close(() => resolve(undefined)));
-  return port;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const probe = createServer();
+    await new Promise((resolve) => probe.listen({ port: 0, host }, () => resolve(undefined)));
+    const { port } = /** @type {{ port: number }} */ (probe.address());
+    await new Promise((resolve) => probe.close(() => resolve(undefined)));
+    if (host === "127.0.0.1") return port;
+    const loopbackProbe = await listenRaw("127.0.0.1", port).catch(() => null);
+    if (!loopbackProbe) continue;
+    await closeRaw(loopbackProbe);
+    return port;
+  }
+  throw new Error(`no port free on both ${host} and loopback`);
 }
 
 async function listenRaw(host, port) {
@@ -203,16 +212,18 @@ test(
       const port = await freePort(otherHost);
       const squatter = await listenRaw(otherHost, port);
       const logs = [];
-      const server = await serve({
-        port,
-        stateFile: path.join(dir, "state.json"),
-        version: "9.9.9-test",
-        env: { LAVISH_AXI_HOST: otherHost },
-        log: (line) => logs.push(line),
-        idleTimeoutMs: null,
-        bindRecoveryDelaysMs: [100],
-      });
+      /** @type {Awaited<ReturnType<typeof serve>> | null} */
+      let server = null;
       try {
+        server = await serve({
+          port,
+          stateFile: path.join(dir, "state.json"),
+          version: "9.9.9-test",
+          env: { LAVISH_AXI_HOST: otherHost },
+          log: (line) => logs.push(line),
+          idleTimeoutMs: null,
+          bindRecoveryDelaysMs: [100],
+        });
         assert.deepEqual(server.hosts, ["127.0.0.1"]);
         const degraded = await health("127.0.0.1", port);
         assert.deepEqual(degraded.hosts, ["127.0.0.1"]);
@@ -236,7 +247,7 @@ test(
         assert.match(reopened.url, new RegExp(`^http://${otherHost.replaceAll(".", "\\.")}:${port}/session/`));
         assert.equal(reopened.network_warning, undefined);
       } finally {
-        await server.close();
+        await server?.close();
         await closeRaw(squatter).catch(() => {});
       }
     });
@@ -257,18 +268,20 @@ test(
       const port = await freePort(tailscaleIpv4);
       const squatter = await listenRaw(tailscaleIpv4, port);
       const magicDnsName = "review-phone.example.ts.net";
-      const server = await serve({
-        port,
-        stateFile: path.join(dir, "state.json"),
-        version: "9.9.9-test",
-        env: {},
-        detectTailscale: async () => ({ ipv4: tailscaleIpv4, magicDnsName }),
-        log: () => {},
-        idleTimeoutMs: null,
-        // Far beyond the test: only the reconcile a CLI invocation triggers can bind it here.
-        bindRecoveryDelaysMs: [600_000],
-      });
+      /** @type {Awaited<ReturnType<typeof serve>> | null} */
+      let server = null;
       try {
+        server = await serve({
+          port,
+          stateFile: path.join(dir, "state.json"),
+          version: "9.9.9-test",
+          env: {},
+          detectTailscale: async () => ({ ipv4: tailscaleIpv4, magicDnsName }),
+          log: () => {},
+          idleTimeoutMs: null,
+          // Far beyond the test: only the reconcile a CLI invocation triggers can bind it here.
+          bindRecoveryDelaysMs: [600_000],
+        });
         const degraded = await openSession("127.0.0.1", port, artifact);
         assert.match(degraded.url, new RegExp(`^http://127\\.0\\.0\\.1:${port}/session/`));
         assert.match(
@@ -284,7 +297,7 @@ test(
         const recovered = await openSession("127.0.0.1", port, artifact);
         assert.equal(recovered.url, `http://${magicDnsName}:${port}/session/${recovered.key}`);
       } finally {
-        await server.close();
+        await server?.close();
         await closeRaw(squatter).catch(() => {});
       }
     });

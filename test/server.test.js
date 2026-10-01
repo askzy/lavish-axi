@@ -3,7 +3,7 @@ import { on, once } from "node:events";
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { connect as netConnect } from "node:net";
-import { homedir, tmpdir } from "node:os";
+import { homedir, networkInterfaces, tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
@@ -1342,6 +1342,387 @@ test("session URLs use the same IPv4 loopback host the server binds", async () =
   }
 });
 
+function availableConcreteIpv4() {
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const entry of entries || []) {
+      if (entry.family === "IPv4" && !entry.internal && entry.address !== "127.0.0.1") return entry.address;
+    }
+  }
+  return null;
+}
+
+test("resolved all-interfaces aliases are rejected before listening", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-wildcard-alias-"));
+  try {
+    for (const alias of ["0", "0x00000000"]) {
+      await assert.rejects(
+        () =>
+          serve({
+            port: 0,
+            stateFile: path.join(dir, `${alias}.json`),
+            version: "9.9.9-test",
+            env: { LAVISH_AXI_HOST: alias },
+            detectTailscale: async () => null,
+            lookupHost: async () => [{ address: "0.0.0.0", family: 4 }],
+            idleTimeoutMs: null,
+          }),
+        /all-interfaces address/,
+      );
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("LAVISH_AXI_HOST=127.0.0.1 never calls the Tailscale detector", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-explicit-host-"));
+  let detections = 0;
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    env: { LAVISH_AXI_HOST: "127.0.0.1" },
+    detectTailscale: async () => {
+      detections += 1;
+      return { ipv4: "100.64.12.34", magicDnsName: "review.tailnet.ts.net" };
+    },
+    idleTimeoutMs: null,
+  });
+  try {
+    assert.equal(detections, 0);
+    assert.deepEqual(server.hosts, ["127.0.0.1"]);
+    const health = await fetch(`http://127.0.0.1:${server.port}/health`).then((response) => response.json());
+    assert.equal(health.network_warning, undefined);
+    await fetch(`http://127.0.0.1:${server.port}/health?reconcile_network=1`);
+    assert.equal(detections, 0);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a down Tailscale detector keeps the server loopback-only without a phone link", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-no-tailscale-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body>review</body></html>");
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    env: {},
+    detectTailscale: async () => null,
+    idleTimeoutMs: null,
+  });
+  try {
+    assert.deepEqual(
+      server.addresses.map((address) => address.address),
+      ["127.0.0.1"],
+    );
+    const opened = await rawRequest(server.port, "/api/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    assert.match(JSON.parse(opened.body).url, new RegExp(`^http://127\\.0\\.0\\.1:${server.port}/session/`));
+    const rejected = await rawRequest(server.port, "/health", {
+      host: `attacker.example:${server.port}`,
+      headers: { accept: "text/html" },
+    });
+    assert.equal(rejected.status, 403);
+    assert.match(rejected.body, /Open the working URL below on this computer/);
+    assert.match(rejected.body, /Phone access is unavailable/);
+    assert.doesNotMatch(rejected.body, /phone through Tailscale/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("network reconciliation coalesces concurrent checks and briefly caches the result", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-tailscale-reconcile-"));
+  let detected = null;
+  let detectionCalls = 0;
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    env: {},
+    detectTailscale: async () => {
+      detectionCalls += 1;
+      if (detectionCalls > 1) await new Promise((resolve) => setTimeout(resolve, 30));
+      return detected;
+    },
+    idleTimeoutMs: null,
+  });
+  try {
+    detected = {
+      ipv4: null,
+      magicDnsName: null,
+      warning: "Tailscale is running but MagicDNS is unavailable; there is no phone access.",
+    };
+    const ordinary = await fetch(`http://127.0.0.1:${server.port}/health`).then((response) => response.json());
+    assert.equal(ordinary.network_stale, undefined);
+    const checks = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        fetch(`http://127.0.0.1:${server.port}/health?reconcile_network=1`).then((response) => response.json()),
+      ),
+    );
+    assert.ok(checks.every((body) => body.network_stale === true));
+    assert.ok(checks.every((body) => body.network_warning.includes("MagicDNS is unavailable")));
+    assert.equal(detectionCalls, 2);
+    const cached = await fetch(`http://127.0.0.1:${server.port}/health?reconcile_network=1`).then((response) =>
+      response.json(),
+    );
+    assert.equal(cached.network_stale, true);
+    assert.match(cached.network_warning, /MagicDNS is unavailable/);
+    assert.equal(detectionCalls, 2);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reconciliation distinguishes incomplete Tailscale from down state", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-tailscale-incomplete-"));
+  /** @type {any} */
+  let detected = {
+    ipv4: null,
+    magicDnsName: null,
+    warning: "Tailscale is running but MagicDNS is unavailable; there is no phone access.",
+  };
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    env: {},
+    detectTailscale: async () => detected,
+    log: () => {},
+    idleTimeoutMs: null,
+  });
+  try {
+    detected = null;
+    const health = await fetch(`http://127.0.0.1:${server.port}/health?reconcile_network=1`).then((response) =>
+      response.json(),
+    );
+    assert.equal(health.network_stale, true);
+    assert.equal(health.network_warning, undefined);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed Tailscale listener warns and falls back without advertising MagicDNS", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-tailscale-bind-fallback-"));
+  const artifact = path.join(dir, "artifact.html");
+  const logs = [];
+  await writeFile(artifact, "<!doctype html><html><body>review</body></html>");
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    env: {},
+    detectTailscale: async () => ({ ipv4: "192.0.2.1", magicDnsName: "unreachable.tailnet.ts.net" }),
+    log: (line) => logs.push(line),
+    idleTimeoutMs: null,
+  });
+  try {
+    assert.deepEqual(server.hosts, ["127.0.0.1"]);
+    assert.ok(logs.some((line) => line.includes("Tailscale binding failed") && line.includes("no phone access")));
+    const opened = await rawRequest(server.port, "/api/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const openedBody = JSON.parse(opened.body);
+    assert.match(openedBody.url, new RegExp(`^http://127\\.0\\.0\\.1:${server.port}/session/`));
+    assert.match(openedBody.network_warning, /Tailscale binding failed.*no phone access/);
+    const staleHost = await rawRequest(server.port, "/health", {
+      host: `unreachable.tailnet.ts.net:${server.port}`,
+      headers: { accept: "text/html" },
+    });
+    assert.equal(staleHost.status, 403);
+    assert.match(staleHost.body, /Phone access is unavailable/);
+    assert.doesNotMatch(staleHost.body, /phone through Tailscale/);
+    const reconciliation = await fetch(`http://127.0.0.1:${server.port}/health?reconcile_network=1`).then((response) =>
+      response.json(),
+    );
+    assert.equal(reconciliation.network_stale, undefined);
+    assert.match(reconciliation.network_warning, /Tailscale binding failed.*no phone access/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Tailscale mode binds concrete listeners, serves the MagicDNS link, and tears down every listener", async (t) => {
+  const tailscaleIpv4 = availableConcreteIpv4();
+  if (!tailscaleIpv4) {
+    t.skip("host has no non-loopback IPv4 address for the second listener");
+    return;
+  }
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-tailscale-"));
+  const magicDnsName = "review-phone.example.ts.net";
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    env: {},
+    detectTailscale: async () => ({ ipv4: tailscaleIpv4, magicDnsName }),
+    idleTimeoutMs: null,
+  });
+  try {
+    assert.deepEqual(
+      server.addresses.map((address) => address.address),
+      ["127.0.0.1", tailscaleIpv4],
+    );
+    assert.ok(server.addresses.every((address) => address.address !== "0.0.0.0"));
+
+    const health = await rawRequest(server.port, "/health", { host: `${tailscaleIpv4}:${server.port}` });
+    assert.equal(health.status, 200);
+    const magicDnsHealth = await rawRequest(server.port, "/health", { host: `${magicDnsName}:${server.port}` });
+    assert.equal(magicDnsHealth.status, 200);
+    const rejected = await rawRequest(server.port, "/health", {
+      host: `attacker.example:${server.port}`,
+      headers: { accept: "text/html" },
+    });
+    assert.equal(rejected.status, 403);
+    assert.match(rejected.body, new RegExp(`http://${magicDnsName}:${server.port}/`));
+    assert.match(rejected.body, /phone through Tailscale/);
+    assert.doesNotMatch(rejected.body, /Phone access is unavailable/);
+    assert.doesNotMatch(rejected.body, /forbidden host/);
+
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<!doctype html><html><body>review</body></html>");
+    const opened = await rawRequest(server.port, "/api/sessions", {
+      method: "POST",
+      host: `${tailscaleIpv4}:${server.port}`,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const openedBody = JSON.parse(opened.body);
+    assert.match(openedBody.url, new RegExp(`^http://${magicDnsName}:${server.port}/session/`));
+
+    const missing = await rawRequest(server.port, "/session/0000000000000000", {
+      host: `${magicDnsName}:${server.port}`,
+      headers: { accept: "text/html" },
+    });
+    assert.equal(missing.status, 404);
+    assert.match(missing.body, new RegExp(`http://${magicDnsName}:${server.port}/`));
+    assert.doesNotMatch(missing.body, /Session not found$/);
+    const landing = await rawRequest(server.port, "/", {
+      host: `${magicDnsName}:${server.port}`,
+      headers: { accept: "text/html" },
+    });
+    assert.equal(landing.status, 200);
+    assert.match(landing.body, /Lavish Editor is running/);
+
+    const shutdown = await rawRequest(server.port, "/shutdown", {
+      method: "POST",
+      host: `${tailscaleIpv4}:${server.port}`,
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(shutdown.status, 200);
+    await server.done;
+    for (const address of server.addresses) {
+      await assert.doesNotReject(() => connectTo(address.address, address.port));
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Phone uploads and whiteboard writes are same-origin fetches from a chrome the browser loaded at
+// the MagicDNS URL, so Host and Origin both carry the MagicDNS authority. A foreign Origin on the
+// same Host is the CSRF case and must still be refused.
+test("attachment uploads and whiteboard writes accept the MagicDNS origin and refuse a foreign one", async (t) => {
+  const tailscaleIpv4 = availableConcreteIpv4();
+  if (!tailscaleIpv4) {
+    t.skip("host has no non-loopback IPv4 address for the second listener");
+    return;
+  }
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-tailscale-writes-"));
+  const magicDnsName = "review-phone.example.ts.net";
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body>review</body></html>");
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    env: {},
+    detectTailscale: async () => ({ ipv4: tailscaleIpv4, magicDnsName }),
+    idleTimeoutMs: null,
+  });
+  const authority = `${magicDnsName}:${server.port}`;
+  const phoneOrigin = `http://${authority}`;
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQVR42mP8z8BQz0BkYGAAADAAA/8W1p0AAAAASUVORK5CYII=",
+    "base64",
+  );
+  try {
+    const opened = await rawRequest(server.port, "/api/sessions", {
+      method: "POST",
+      host: authority,
+      headers: { "content-type": "application/json", origin: phoneOrigin },
+      body: JSON.stringify({ file: artifact }),
+    });
+    assert.equal(opened.status, 200);
+    const { key } = JSON.parse(opened.body);
+
+    const upload = await rawRequest(server.port, `/api/${key}/attachments`, {
+      method: "POST",
+      host: authority,
+      headers: { "content-type": "image/png", origin: phoneOrigin },
+      body: png,
+    });
+    assert.equal(upload.status, 200, upload.body);
+    assert.equal(JSON.parse(upload.body).status, "stored");
+
+    const whiteboard = await rawRequest(server.port, `/api/${key}/whiteboard/0`, {
+      method: "PUT",
+      host: authority,
+      headers: { "content-type": "application/json", origin: phoneOrigin },
+      body: JSON.stringify({ source_hash: "abc", scene: { elements: [] } }),
+    });
+    assert.equal(whiteboard.status, 200, whiteboard.body);
+    assert.deepEqual(JSON.parse(whiteboard.body), { status: "saved" });
+
+    const foreignUpload = await rawRequest(server.port, `/api/${key}/attachments`, {
+      method: "POST",
+      host: authority,
+      headers: { "content-type": "image/png", origin: "http://evil.example" },
+      body: png,
+    });
+    assert.equal(foreignUpload.status, 403);
+    const foreignWhiteboard = await rawRequest(server.port, `/api/${key}/whiteboard/0`, {
+      method: "PUT",
+      host: authority,
+      headers: { "content-type": "application/json", origin: "http://evil.example" },
+      body: JSON.stringify({ source_hash: "abc", scene: { elements: [] } }),
+    });
+    assert.equal(foreignWhiteboard.status, 403);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+function connectTo(host, port) {
+  return new Promise((resolve, reject) => {
+    const socket = netConnect({ host, port });
+    socket.once("connect", () => {
+      socket.destroy();
+      reject(new Error(`listener still open at ${host}:${port}`));
+    });
+    socket.once("error", (error) => {
+      socket.destroy();
+      resolve(error);
+    });
+  });
+}
+
 test("session URLs use the configured linkHost while binding to loopback", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
@@ -1400,6 +1781,11 @@ test("session URLs can disable the layout gate for one open", async () => {
  * @param {number} port
  * @param {string} pathname
  * @param {{ method?: string, host?: string, headers?: Record<string, string>, body?: string }} [options]
+ */
+/**
+ * @param {number} port
+ * @param {string} pathname
+ * @param {{ method?: string, host?: string, headers?: Record<string, string>, body?: string | Buffer }} [options]
  */
 function rawRequest(port, pathname, { method = "GET", host, headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {
@@ -3922,6 +4308,49 @@ test("a user-initiated end via the keyed route blocks a plain reopen but honors 
 
     const afterReopen = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
     assert.equal((await afterReopen.json()).status, "waiting");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a blocked user-ended open returns the current listener URL", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-user-ended-current-url-"));
+  const artifact = path.join(dir, "artifact.html");
+  const statePath = path.join(dir, "state.json");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  let server = await serve({
+    port: 0,
+    stateFile: statePath,
+    version: "9.9.9-test",
+    host: "127.0.0.1",
+    linkHost: "old.example",
+    idleTimeoutMs: null,
+  });
+  try {
+    const opened = await fetch(`http://127.0.0.1:${server.port}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+    await fetch(`http://127.0.0.1:${server.port}/api/${opened.key}/end`, { method: "POST" });
+    await server.close();
+
+    server = await serve({
+      port: 0,
+      stateFile: statePath,
+      version: "9.9.9-test",
+      host: "127.0.0.1",
+      linkHost: "current.example",
+      idleTimeoutMs: null,
+    });
+    const blocked = await fetch(`http://127.0.0.1:${server.port}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+    assert.equal(blocked.status, "user-ended");
+    assert.equal(blocked.url, `http://current.example:${server.port}/session/${opened.key}`);
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
