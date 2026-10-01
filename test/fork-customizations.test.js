@@ -22,6 +22,7 @@
 // failing for a good reason. Delete the guard then, do not weaken it.
 
 import assert from "node:assert/strict";
+import { on, once } from "node:events";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -30,6 +31,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import WebSocket from "ws";
 
 import { AxiError } from "axi-sdk-js";
 
@@ -476,39 +478,37 @@ test("fork: /health advertises the build id the server was started with", async 
 // constraints upstream did not have to meet: the result must leave every lease untouched, and a
 // `--timeout-ms 0` drain must behave exactly as before.
 async function startPresenceStream(base, key) {
-  const controller = new AbortController();
-  const res = await fetch(`${base}/events/${key}`, { signal: controller.signal });
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const socket = new WebSocket(`${base.replace(/^http/, "ws")}/events/${key}`, { origin: base });
+  const messages = on(socket, "message");
+  await once(socket, "open");
   return {
     async next() {
       const deadline = Date.now() + 500;
       while (true) {
-        const match = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m);
-        if (match) {
-          buffer = buffer.replace(match[0], "");
-          return JSON.parse(match[1]).state;
-        }
         const remaining = Math.max(1, deadline - Date.now());
-        const { value, done } = await Promise.race([
-          reader.read(),
+        const result = await Promise.race([
+          messages.next(),
           new Promise((_, reject) =>
             setTimeout(() => reject(new Error("timed out waiting for agent presence event")), remaining),
           ),
         ]);
-        if (done) throw new Error("presence stream closed before an agent presence event");
-        buffer += decoder.decode(value, { stream: true });
+        if (result.done) throw new Error("presence stream closed before an agent presence event");
+        const message = JSON.parse(String(result.value[0]));
+        if (message.type === "agent-presence") return message.data.state;
       }
     },
     async close() {
-      controller.abort();
-      await reader.cancel().catch(() => {});
+      await messages.return();
+      socket.close();
     },
   };
 }
 
-async function disconnectFixture({ browserDisconnectGraceMs, feedbackLeaseTtlMs = 300 }) {
+async function disconnectFixture({
+  browserDisconnectGraceMs,
+  feedbackLeaseTtlMs = 300,
+  liveEventHeartbeatMs = undefined,
+}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "lavish-fork-disconnect-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(artifact, "<!doctype html><html><body><p>hi</p></body></html>", "utf8");
@@ -520,6 +520,7 @@ async function disconnectFixture({ browserDisconnectGraceMs, feedbackLeaseTtlMs 
     idleTimeoutMs: null,
     browserDisconnectGraceMs,
     feedbackLeaseTtlMs,
+    ...(liveEventHeartbeatMs === undefined ? {} : { liveEventHeartbeatMs }),
   });
   const base = `http://127.0.0.1:${server.port}`;
   const { key } = await fetch(`${base}/api/sessions`, {
@@ -644,6 +645,33 @@ test("fork: browser_disconnected leaves an outstanding lease untouched and the d
     assert.equal(redelivered.status, "feedback");
     assert.equal(redelivered.prompts[0].prompt, "important note");
   } finally {
+    await fixture.close();
+  }
+});
+
+// Port of upstream #353 onto the grace timer: a tab whose socket went half-open (a slept laptop)
+// never emits `close` on its own, so only the heartbeat can start the grace period for it.
+test("fork: a review tab that stops answering heartbeats releases the poll as browser_disconnected", async () => {
+  const fixture = await disconnectFixture({ browserDisconnectGraceMs: 20, liveEventHeartbeatMs: 40 });
+  let mute;
+  try {
+    // `autoPong: false` is a socket that is open at the TCP level and silent at the application
+    // level, exactly what a slept laptop leaves behind.
+    mute = new WebSocket(`${fixture.base.replace(/^http/, "ws")}/events/${fixture.key}`, {
+      origin: fixture.base,
+      autoPong: false,
+    });
+    await once(mute, "open");
+
+    const poll = fixture.poll(undefined, { signal: AbortSignal.timeout(2000) });
+    await sleep(30);
+    assert.deepEqual(await poll, { status: "browser_disconnected" });
+    assert.equal(mute.readyState, WebSocket.CLOSED, "the server terminated the half-open socket");
+    assert.deepEqual(await fixture.drain(), { status: "waiting" }, "the session is still open");
+    const state = JSON.parse(await readFile(fixture.stateFile, "utf8"));
+    assert.equal(state.sessions[fixture.key].status, "open");
+  } finally {
+    mute?.terminate();
     await fixture.close();
   }
 });

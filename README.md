@@ -103,12 +103,12 @@ Upstream ships `lavish-axi setup hooks` to write that hook into **Claude Code**,
 
 ### From source
 
-This is the install path for the fork. It needs Node 22+. pnpm is not required; npm works.
+This is the install path for the fork. It needs Node 22+; `corepack` ships with Node and provides the pinned pnpm.
 
 ```sh
 git clone https://github.com/askzy/lavish-axi.git
 cd lavish-axi
-npm install
+corepack pnpm install --frozen-lockfile
 npm run build
 ln -s "$PWD/dist/skill-local" ~/.claude/skills/lavish
 ln -s "$PWD/dist/skill-local-check-lavish" ~/.claude/skills/check-lavish
@@ -117,6 +117,8 @@ ln -s "$PWD/dist/skill-local-check-lavish" ~/.claude/skills/check-lavish
 `npm run build` writes two skills under `dist/`: `lavish` and `check-lavish`. Both call the CLI as `node <repo>/dist/cli.mjs`, so nothing is installed globally and `npx` never fetches upstream by mistake. The symlinks make them available in every Claude Code project. Restart your Claude Code session afterwards so it picks them up.
 
 To put the `lavish-axi` binary on your `PATH` (for a session hook, for example), run `npm link` in the checkout.
+
+After pulling, run `corepack pnpm install --frozen-lockfile && npm run build` again: `dist/cli.mjs` resolves its runtime dependencies (such as `ws`, the live-event transport) from `node_modules` rather than bundling them, so a stale install fails at server start.
 
 ## How It Works
 
@@ -183,7 +185,7 @@ To put the `lavish-axi` binary on your `PATH` (for a session hook, for example),
 - **Keyboard shortcuts** - In the chrome composer, Enter sends queued prompts and Shift+Enter inserts a newline.
   In the annotation card, Enter queues the annotation, Shift+Enter inserts a newline, and Ctrl+Enter (Cmd+Enter on macOS) queues it and sends all queued prompts immediately. Escape closes the card, same as Cancel, but only while it is empty; with unsent text present, Escape does nothing rather than risk discarding it.
   Cmd+I or Ctrl+I toggles between annotate and explore mode from either the browser chrome or the artifact iframe, including while focus is in a textarea or control.
-- **Agent presence** - The browser shows when no agent is listening, keeps queued feedback for the next successful `lavish-axi poll` send even across reloads, and only blocks human sends while the agent is working on delivered feedback; the agent's reply (`--agent-reply`) concludes that work and re-enables sends. The no-timeout poll always writes an immediate stderr banner so it is visibly not hung; it adds the periodic stderr wait ticks only in an interactive terminal, so when stderr is piped (as under agent harnesses) the captured output carries no tick noise. Stdout always stays reserved for the final response; in a feedback response the prompts and `next_step` come before the bulky `dom_snapshot`, so read it completely before truncating or filtering it. If the poll is interrupted or reaped, queued feedback is never lost: in this fork the agent hands the review back to the user instead of re-running the poll, and `/check-lavish` collects the queue later. Delivered feedback is leased rather than deleted - the CLI acknowledges a batch only after it has printed it, and a batch whose poll died first is delivered again about a minute later. Closing the last review tab while a poll is active starts a 10-second reconnect grace period; if no tab comes back, the poll returns `browser_disconnected` without ending the session or touching any lease, and the agent hands back instead of reopening uninvited.
+- **Agent presence** - The browser shows when no agent is listening, keeps queued feedback for the next successful `lavish-axi poll` send even across reloads, and only blocks human sends while the agent is working on delivered feedback; the agent's reply (`--agent-reply`) concludes that work and re-enables sends. The no-timeout poll always writes an immediate stderr banner so it is visibly not hung; it adds the periodic stderr wait ticks only in an interactive terminal, so when stderr is piped (as under agent harnesses) the captured output carries no tick noise. Stdout always stays reserved for the final response; in a feedback response the prompts and `next_step` come before the bulky `dom_snapshot`, so read it completely before truncating or filtering it. If the poll is interrupted or reaped, queued feedback is never lost: in this fork the agent hands the review back to the user instead of re-running the poll, and `/check-lavish` collects the queue later. Delivered feedback is leased rather than deleted - the CLI acknowledges a batch only after it has printed it, and a batch whose poll died first is delivered again about a minute later. Closing the last review tab while a poll is active starts a 10-second reconnect grace period; if no tab comes back, the poll returns `browser_disconnected` without ending the session or touching any lease, and the agent hands back instead of reopening uninvited. Live events reach the page over a WebSocket; the server pings it every 30 seconds and drops a tab that stops answering (a slept laptop), so that grace period also starts for a connection the browser never closed. A page whose server has gone away shows the "no longer running" banner after five failed reconnects and clears it on its own once it reconnects.
 - **Session end etiquette** - Lavish tracks who ended a session: a human clicking **End session** (or **Send & End**) in the browser is a user-initiated end, while `lavish-axi end <html-file>` is agent-initiated.
   When either side ends the session, every open review tab becomes visibly read-only and disables its feedback controls; feedback submitted after the end is refused instead of being accepted without an agent to receive it.
   A plain `lavish-axi <html-file>` after a user-initiated end refuses to reopen the browser and returns guidance instead; pass `--reopen` only when the user asks for further review or something important needs their visual attention.
