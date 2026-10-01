@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -659,7 +659,7 @@ export async function serve({
         return;
       }
       const root = path.dirname(session.file);
-      const file = resolveArtifactAsset(root, assetPath);
+      const file = await resolveArtifactAsset(root, assetPath);
       if (!file) {
         res.status(403).send("Forbidden");
         return;
@@ -1084,13 +1084,41 @@ function normalizeOrigin(value) {
   }
 }
 
-export function resolveArtifactAsset(root, assetPath) {
+// Confines an asset request lexically first, then - like export-bundle.js's guardedRead -
+// resolves the real (symlink-followed) path and refuses anything that escapes the artifact
+// directory, so a symlink placed beside the artifact can't make this route serve an outside
+// file (e.g. ~/.ssh/id_rsa).
+export async function resolveArtifactAsset(root, assetPath) {
   const file = path.resolve(root, assetPath);
   const relative = path.relative(root, file);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     return null;
   }
-  return file;
+  let real;
+  try {
+    real = await realpath(file);
+  } catch (error) {
+    // Nonexistent path (e.g. an asset that hasn't been built yet): nothing to read, so the
+    // lexical confinement above is enough - the caller's existsSync/sendFile handles the 404.
+    // Every other realpath failure fails closed, like guardedRead.
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+      return file;
+    }
+    throw error;
+  }
+  let realRoot;
+  try {
+    realRoot = await realpath(root);
+  } catch {
+    realRoot = path.resolve(root);
+  }
+  const relativeReal = path.relative(realRoot, real);
+  if (relativeReal === ".." || relativeReal.startsWith(`..${path.sep}`) || path.isAbsolute(relativeReal)) {
+    return null;
+  }
+  // Hand back the resolved path, not the requested one: a real path contains no symlinks, so
+  // sendFile re-opening it cannot be redirected by a link swapped in after this check.
+  return real;
 }
 
 /**
