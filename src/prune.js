@@ -2,6 +2,7 @@ import { readdir, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { attachmentsDir } from "./attachment-store.js";
+import { whiteboardDir } from "./whiteboard-store.js";
 
 /** @typedef {import("./session-store.js").SessionStore} SessionStore */
 
@@ -53,9 +54,10 @@ function resolveDurationMs(value, fallback) {
  * ended and its last update is older than the cutoff, or when it is open and its last update is
  * older than `openMaxAgeMs`, or older than `unrepliedMaxAgeMs` while the user never wrote in its
  * chat. An open session holding undelivered or unacknowledged feedback is kept whatever its age.
- * A removed session's image attachments (`<state-dir>/attachments/<key>/`) go with it: nothing
- * can reference them once the record is gone, and the hourly sweep would otherwise hold them
- * until their own TTL. Then every `.html` file directly inside each artifact directory that is
+ * A removed session's image attachments (`<state-dir>/attachments/<key>/`) and whiteboard
+ * sidecars (`<state-dir>/whiteboards/<key>/`) go with it: nothing can reference them once the
+ * record is gone, and the hourly attachment sweep would otherwise hold the attachments until
+ * their own TTL. Then every `.html` file directly inside each artifact directory that is
  * older than the cutoff is deleted, unless a session that is still open points at it; the file of
  * an open session removed here is swept by that same cutoff.
  *
@@ -105,9 +107,11 @@ export async function prune({
     { dryRun },
   );
 
-  let attachmentBytesFreed = 0;
+  const stateDir = path.dirname(store.file);
+  let sidecarBytesFreed = 0;
   for (const session of removedSessions) {
-    attachmentBytesFreed += await removeSessionAttachments(path.dirname(store.file), session.key, dryRun);
+    sidecarBytesFreed += await removeSessionDir(attachmentsDir(stateDir, session.key), dryRun);
+    sidecarBytesFreed += await removeSessionDir(whiteboardDir(stateDir, session.key), dryRun);
   }
 
   const protectedFiles = new Set(kept.filter((session) => session.status !== "ended").map((session) => session.file));
@@ -126,7 +130,7 @@ export async function prune({
     dryRun,
     sessionsRemoved: removedSessions.length,
     filesRemoved: removedFiles.length,
-    bytesFreed: stateBytesFreed + attachmentBytesFreed + fileBytesFreed,
+    bytesFreed: stateBytesFreed + sidecarBytesFreed + fileBytesFreed,
     removedSessions: removedSessions.map((session) => session.file),
     removedFiles,
   };
@@ -143,10 +147,9 @@ function hasPendingFeedback(session) {
   );
 }
 
-// Returns the bytes the session's attachment dir held. The dir is removed whole: every file in it
+// Returns the bytes a per-session sidecar dir held. The dir is removed whole: every file in it
 // belongs to this session alone, and the store no longer has a record that could reference one.
-async function removeSessionAttachments(stateDir, key, dryRun) {
-  const dir = attachmentsDir(stateDir, key);
+async function removeSessionDir(dir, dryRun) {
   let entries;
   try {
     entries = await readdir(dir, { withFileTypes: true });

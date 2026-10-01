@@ -151,6 +151,53 @@ test("prune removes a pruned session's attachment dir and leaves live sessions' 
   }
 });
 
+test("prune removes a pruned session's whiteboard sidecars and keeps those a live lease points at", async () => {
+  const dir = await makeTemp();
+  try {
+    const stale = await writeArtifact(dir, "stale.html", OLD);
+    const leased = await writeArtifact(dir, "leased.html", RECENT);
+    const staleRecord = sessionRecord(stale, "ended", OLD);
+    const leasedRecord = sessionRecord(leased, "open", daysAgo(400));
+    const scenePath = path.join(dir, "whiteboards", leasedRecord.key, "0.excalidraw");
+    const previewPath = path.join(dir, "whiteboards", leasedRecord.key, "0.png");
+    const prompt = {
+      uid: "",
+      prompt: "Whiteboard edits to diagram 1",
+      selector: "",
+      tag: "whiteboard",
+      text: "",
+      target: { type: "excalidraw-scene", diagramIndex: 0, scenePath, previewPath },
+    };
+    leasedRecord.leases = [{ delivery_id: "d1", leased_at: daysAgo(400).toISOString(), prompts: [prompt] }];
+    const stateFile = await writeStore(dir, [staleRecord, leasedRecord]);
+    const staleDir = path.join(dir, "whiteboards", staleRecord.key);
+    await mkdir(staleDir, { recursive: true });
+    await mkdir(path.dirname(scenePath), { recursive: true });
+    await writeFile(path.join(staleDir, "0.json"), "{}");
+    await writeFile(path.join(staleDir, "0.excalidraw"), Buffer.alloc(100));
+    await writeFile(path.join(staleDir, "0.png"), Buffer.alloc(50));
+    await writeFile(scenePath, Buffer.alloc(100));
+
+    const dryRun = await prune({
+      store: new SessionStore(stateFile),
+      maxAgeMs: 30 * DAY_MS,
+      dryRun: true,
+      now: () => NOW,
+    });
+    assert.deepEqual(dryRun.removedSessions, [stale]);
+    assert.ok(await exists(path.join(staleDir, "0.excalidraw")), "a dry run deletes nothing");
+
+    const result = await prune({ store: new SessionStore(stateFile), maxAgeMs: 30 * DAY_MS, now: () => NOW });
+    assert.deepEqual(result.removedSessions, [stale]);
+    assert.equal(await exists(staleDir), false, "the pruned session's whiteboard dir is gone");
+    assert.ok(await exists(scenePath), "the sidecar an unacked lease points at survives");
+    assert.ok(result.bytesFreed >= 152, "freed bytes count the sidecar files");
+    assert.equal(dryRun.bytesFreed, result.bytesFreed, "a dry run reports the same total it would free");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("prune removes abandoned open sessions by the unreplied and open windows", async () => {
   const dir = await makeTemp();
   try {

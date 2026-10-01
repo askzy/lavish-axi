@@ -493,6 +493,9 @@ export function createPollOutput({ file, response }) {
 
 function createFeedbackNextStep(file, artifactFailures, sessionEnded, endedBy, prompts = []) {
   const count = artifactFailures.length;
+  const whiteboardNote = prompts.some((prompt) => prompt && prompt.tag === "whiteboard")
+    ? `This feedback includes whiteboard edits (tag "whiteboard"): read the edit summary in the prompt text first, and only when it is not enough, open the target's scenePath (.excalidraw scene JSON) or previewPath (PNG) local files for detail. The artifact's Mermaid source stays authoritative - apply the edits by updating the Mermaid text in ${file} (Lavish live-reloads it); never try to write the .excalidraw scene back. `
+    : "";
   const layoutNote = prompts.some((prompt) => prompt && prompt.tag === "layout-warnings")
     ? `This feedback includes layout issues the user selected from the Lavish Layout issues inbox (tag "layout-warnings"): the target lists the exact warning ids and targets. Apply every listed fix in one pass before saving so the user's review refreshes once. Queueing is a repair request, not a resolution - Lavish only marks a warning resolved after a newer artifact load and a complete check at the same viewport no longer detects it. `
     : "";
@@ -511,13 +514,13 @@ function createFeedbackNextStep(file, artifactFailures, sessionEnded, endedBy, p
         count > 0
           ? ""
           : ` Only run \`lavish-axi ${file} --reopen\` if the user explicitly asks for further review or something genuinely important needs their visual attention.`;
-      return `${failureNote}${layoutNote}${attachmentNote}This was the last feedback before the user ended the session. Stop polling ${file} and do not reopen it - deliver any remaining updates directly in this conversation instead.${reopenNote}`;
+      return `${failureNote}${layoutNote}${whiteboardNote}${attachmentNote}This was the last feedback before the user ended the session. Stop polling ${file} and do not reopen it - deliver any remaining updates directly in this conversation instead.${reopenNote}`;
     }
-    return `${failureNote}${layoutNote}${attachmentNote}This was the last feedback before the Lavish Editor session ended. Stop polling ${file}. Deliver any remaining updates directly in this conversation, or run \`lavish-axi ${file}\` to open a fresh session if the user needs further visual review.`;
+    return `${failureNote}${layoutNote}${whiteboardNote}${attachmentNote}This was the last feedback before the Lavish Editor session ended. Stop polling ${file}. Deliver any remaining updates directly in this conversation, or run \`lavish-axi ${file}\` to open a fresh session if the user needs further visual review.`;
   }
   const prefix =
     count > 0 ? artifactFailuresPrefix(file, artifactFailures) : `Apply the requested changes to ${file}. `;
-  return `${prefix}${layoutNote}${attachmentNote}Do not respond to the user just yet. Now you must run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms unless the user ended the session. The poll waits silently until the user sends more feedback, ends the session, or closes the review page - never kill it. ${pollExecutionGuidance()}`;
+  return `${prefix}${layoutNote}${whiteboardNote}${attachmentNote}Do not respond to the user just yet. Now you must run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms unless the user ended the session. The poll waits silently until the user sends more feedback, ends the session, or closes the review page - never kill it. ${pollExecutionGuidance()}`;
 }
 
 // The narrow fatal path. Ordinary layout findings never reach the poll: they wait in the user's
