@@ -77,8 +77,9 @@ test(
       await writeFile(artifact, ARTIFACT_HTML, "utf8");
 
       // Both layouts, because they serve the chrome from different places: the source layout from
-      // `src/` via `bin/lavish-axi.js`, the published layout from `dist/` via the self-spawning
-      // `dist/cli.mjs`. A `scripts/build.js` that forgot to copy an asset only fails the latter.
+      // `src/` via `bin/lavish-axi.js`, the published layout from `dist/` via `dist/cli.mjs` and
+      // its `dist/server.mjs` bootstrap. A `scripts/build.js` that forgot to copy an asset only
+      // fails the latter.
       const layouts = [
         { name: "source", session: await startSourceLayoutSession(temp, artifact, cleanups) },
         { name: "bundle", session: await startBundleLayoutSession(temp, artifact, cleanups) },
@@ -363,8 +364,8 @@ async function startSourceLayoutSession(temp, artifact, cleanups) {
 }
 
 /**
- * The published layout: only `dist/` exists, so `resolveServerEntry()` re-spawns `dist/cli.mjs`
- * itself and the chrome is served out of `dist/`.
+ * The published layout: only `dist/` exists, so `resolveServerEntry()` spawns the sibling
+ * `dist/server.mjs` bootstrap and the chrome is served out of `dist/`.
  * @param {string} temp
  * @param {string} artifact
  * @param {Array<() => Promise<void>>} cleanups

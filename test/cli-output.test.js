@@ -715,6 +715,34 @@ test("home directory collapse tolerates Windows mixed separators", () => {
   );
 });
 
+test("open output carries a network warning and tells the agent to pass it on", () => {
+  const warning = "Could not bind 192.0.2.1:4387 (EADDRNOTAVAIL); Lavish fell back to loopback.";
+  const output = createOpenOutput({
+    file: "/tmp/artifact.html",
+    url: "http://127.0.0.1:4387/session/abc123",
+    status: "opened",
+    networkWarning: warning,
+  });
+  assert.equal(output.network_warning, warning);
+  assert.match(output.next_step, /^Lavish could not serve every address it was asked to \(see network_warning\)/);
+  assert.match(output.next_step, /tell them/);
+
+  const clean = createOpenOutput({
+    file: "/tmp/artifact.html",
+    url: "http://127.0.0.1:4387/session/abc123",
+    status: "opened",
+  });
+  assert.equal("network_warning" in clean, false);
+  assert.match(clean.next_step, /^Do not respond to the user just yet\./);
+
+  const userEnded = createUserEndedOpenOutput({
+    file: "/tmp/artifact.html",
+    url: "http://127.0.0.1:4387/session/abc123",
+    networkWarning: warning,
+  });
+  assert.equal(userEnded.network_warning, warning);
+});
+
 test("open output keeps the user URL in session data and next_step focused on polling", () => {
   const output = createOpenOutput({
     file: "/tmp/artifact.html",
@@ -1058,7 +1086,7 @@ test("poll feedback and the next step are emitted before the bulky DOM snapshot"
     dom_snapshot: "large snapshot",
   };
   const server = createServer((req, res) => {
-    if (req.url === "/health") {
+    if (new URL(req.url || "/", "http://localhost").pathname === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, app: "lavish-axi", version: VERSION }));
       return;
@@ -1508,15 +1536,20 @@ test("server spawn options can persist detached server output to a log fd", () =
   assert.deepEqual(options.stdio, ["ignore", 17, 17]);
 });
 
-test("server entry resolves to a node-executable script that actually invokes run()", () => {
-  // Running from source, the entry must be `bin/lavish-axi.js` (the only file in the
-  // source tree that calls run() on import). In the published bundle only `dist/cli.mjs`
-  // ships - it embeds the bin wrapper so it self-invokes. Either way, spawning the entry
-  // with `node <entry> server` must boot the server, not silently load the module and exit.
+test("server entry resolves to the detached bootstrap that stamps stdio before the CLI loads", () => {
+  // Running from source, the entry is `bin/lavish-axi-server.js`. In the published bundle only
+  // `dist/` ships, so the entry is the sibling `server.mjs` that scripts/build.js emits next to
+  // `cli.mjs`. Either way, spawning the entry with `node <entry> server` must boot the server.
   const entry = resolveServerEntry();
   assert.ok(existsSync(entry), `server entry must exist on disk, got: ${entry}`);
-  // From source: bin/lavish-axi.js is present and preferred.
-  assert.equal(entry, fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)));
+  assert.equal(entry, fileURLToPath(new URL("../bin/lavish-axi-server.js", import.meta.url)));
+});
+
+test("detached server entry dispatches the CLI", () => {
+  const entry = fileURLToPath(new URL("../bin/lavish-axi-server.js", import.meta.url));
+  const result = spawnSync(process.execPath, [entry, "--version"], { encoding: "utf8" });
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /\d+\.\d+\.\d+/);
 });
 
 test("local built CLI opens force a server restart while source and installed runs do not", () => {
@@ -1529,6 +1562,14 @@ test("local built CLI opens force a server restart while source and installed ru
 
 test("shouldRestartServer reuses a server running the same version", () => {
   assert.equal(shouldRestartServer("0.1.4", { ok: true, version: "0.1.4" }), false);
+});
+
+test("shouldRestartServer restarts a same-version server whose network identity went stale", () => {
+  const health = { ok: true, app: "lavish-axi", version: "0.1.4", network_stale: true };
+  assert.equal(shouldRestartServer("0.1.4", health), true);
+  assert.equal(serverReplacementReason("0.1.4", health), "");
+  // A stale network on a foreign /health is not ours to act on.
+  assert.equal(shouldRestartServer("0.1.4", { ok: true, app: "other", version: "0.1.4", network_stale: true }), false);
 });
 
 test("shouldRestartServer restarts same-version Lavish servers when forced", () => {
@@ -1588,7 +1629,7 @@ test("serverReplacementReason names nothing when no replacement is warranted", (
 async function startShutdownRecorder(version = "0.0.0-previous") {
   const bodies = [];
   const server = createServer((req, res) => {
-    if (req.url === "/health") {
+    if (new URL(req.url || "/", "http://localhost").pathname === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, app: "lavish-axi", version }));
       return;
@@ -1655,8 +1696,9 @@ test("shutdownServerOnPort kills pre-handshake Lavish servers when shutdown does
       shutdowns += 1;
     },
     waitForPortFree: async () => portFreeResults.shift() ?? false,
-    killProcessOnPort: () => {
+    killServerProcess: () => {
       kills += 1;
+      return true;
     },
     processMatchesLavish: () => true,
   });
@@ -1678,8 +1720,9 @@ test("shutdownServerOnPort ignores unidentified health responders", async () => 
       shutdowns += 1;
     },
     waitForPortFree: async () => false,
-    killProcessOnPort: () => {
+    killServerProcess: () => {
       kills += 1;
+      return true;
     },
     processMatchesLavish: () => false,
   });
@@ -1797,12 +1840,17 @@ test("fetchJson reports interrupted response body failures without retrying", as
 test("stop command shuts down the running server on the configured port", async () => {
   const dir = await mkdtemp(`${os.tmpdir()}/lavish-axi-stop-test-`);
   const server = await serve({ port: 0, stateFile: `${dir}/state.json`, version: "9.9.9-test" });
+  // `stop` only stops a server of its own installation, identified by the state directory.
+  const previousStateDir = process.env.LAVISH_AXI_STATE_DIR;
+  process.env.LAVISH_AXI_STATE_DIR = dir;
   try {
     const output = await stopCommand(["--port", String(server.port)]);
     assert.deepEqual(output, { server: { status: "stopped", port: server.port } });
     await server.done;
     await assert.rejects(() => fetch(`http://127.0.0.1:${server.port}/health`), /fetch failed|ECONNREFUSED/);
   } finally {
+    if (previousStateDir === undefined) delete process.env.LAVISH_AXI_STATE_DIR;
+    else process.env.LAVISH_AXI_STATE_DIR = previousStateDir;
     await server.close();
     await rm(dir, { force: true, recursive: true });
   }

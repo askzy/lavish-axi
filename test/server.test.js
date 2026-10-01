@@ -1948,21 +1948,29 @@ test("allowsAllHosts detects the '*' opt-out sentinel", () => {
   assert.equal(allowsAllHosts([]), false);
 });
 
-test("serve rejects fast when the bind host is unavailable", async () => {
+test("serve falls back promptly when the bind host is unavailable", async () => {
+  // This used to reject with EADDRNOTAVAIL, which is what took the whole server down whenever a
+  // pinned LAVISH_AXI_HOST was momentarily gone - no listener, and no agent able to heal it. The
+  // property this test has always really guarded is that the attempt stays BOUNDED, so that is
+  // what it asserts now; the fallback's reachability is owned by server-bind-durability.test.js.
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const startedAt = Date.now();
   try {
-    await assert.rejects(
-      serve({
-        port: 0,
-        stateFile: path.join(dir, "state.json"),
-        version: "9.9.9-test",
-        host: "192.0.2.1",
-      }),
-      (error) => {
-        const code = /** @type {NodeJS.ErrnoException} */ (error).code;
-        return code === "EADDRNOTAVAIL" || code === "EADDRINUSE";
-      },
-    );
+    const server = await serve({
+      port: 0,
+      stateFile: path.join(dir, "state.json"),
+      version: "9.9.9-test",
+      env: {},
+      host: "192.0.2.1",
+      log: () => {},
+      idleTimeoutMs: null,
+    });
+    try {
+      assert.deepEqual(server.hosts, ["127.0.0.1"]);
+      assert.ok(Date.now() - startedAt < 5000, "the bind retry budget must stay bounded");
+    } finally {
+      await server.close();
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -4699,7 +4707,7 @@ test("concurrent same-session opens create only one file watcher", async () => {
   }
 });
 
-test("/health and / stay responsive after opening two back-to-back sessions", async () => {
+test("/health and the landing page stay responsive after opening two back-to-back sessions", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-back-to-back-"));
   const a = path.join(dir, "a.html");
   const b = path.join(dir, "b.html");
@@ -4735,8 +4743,8 @@ test("/health and / stay responsive after opening two back-to-back sessions", as
       fetch(`${base}/`),
       new Promise((_, reject) => setTimeout(() => reject(new Error("/ timed out")), 1000)),
     ]);
-    assert.equal(rootRes.status, 404);
-    await rootRes.text().catch(() => {});
+    assert.equal(rootRes.status, 200);
+    assert.match(await rootRes.text(), /Lavish Editor/);
 
     assert.ok(Date.now() - start < 1000, "both probes should return well under one second");
   } finally {
@@ -5205,4 +5213,53 @@ test("every id in the chrome markup appears exactly once", () => {
   const duplicates = ids.filter((id, index) => ids.indexOf(id) !== index);
   assert.deepEqual(duplicates, []);
   assert.ok(ids.length >= 30, `only ${ids.length} ids found`);
+});
+
+test("GET / serves a landing page and a wrong host or missing session gets an HTML page naming the working URL", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    linkHost: "host.example",
+    allowedHosts: ["host.example"],
+  });
+  try {
+    const landing = await fetch(`http://127.0.0.1:${server.port}/`);
+    assert.equal(landing.status, 200);
+    assert.match(landing.headers.get("content-type") || "", /text\/html/);
+    assert.match(await landing.text(), /Lavish Editor is running/);
+
+    // A browser (Accept: text/html) under a host this server does not answer to is told where to
+    // go; a machine client without that Accept still gets the JSON it always got.
+    const deniedPage = await rawRequest(server.port, "/session/0123456789abcdef", {
+      host: `evil.example:${server.port}`,
+      headers: { accept: "text/html,application/xhtml+xml" },
+    });
+    assert.equal(deniedPage.status, 403);
+    assert.match(deniedPage.headers["content-type"] || "", /text\/html/);
+    assert.match(deniedPage.body, /Wrong address/);
+    assert.match(deniedPage.body, new RegExp(`http://host\\.example:${server.port}/session/0123456789abcdef`));
+    const deniedJson = await rawRequest(server.port, "/session/0123456789abcdef", {
+      host: `evil.example:${server.port}`,
+    });
+    assert.equal(deniedJson.status, 403);
+    assert.deepEqual(JSON.parse(deniedJson.body), { error: "forbidden host" });
+
+    const missingPage = await rawRequest(server.port, "/session/0123456789abcdef", {
+      headers: { accept: "text/html" },
+    });
+    assert.equal(missingPage.status, 404);
+    assert.match(missingPage.body, /Session not found/);
+    assert.match(missingPage.body, new RegExp(`http://host\\.example:${server.port}/`));
+    assert.doesNotMatch(missingPage.body, /session\/0123456789abcdef/);
+    const missingJson = await rawRequest(server.port, "/session/0123456789abcdef");
+    assert.equal(missingJson.status, 404);
+    assert.deepEqual(JSON.parse(missingJson.body), { error: "session not found" });
+    // Denied pages escape what they interpolate.
+    assert.doesNotMatch(missingPage.body, /<script/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });

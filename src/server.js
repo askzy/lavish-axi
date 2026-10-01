@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
+import { createServer, get as httpGet } from "node:http";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -51,7 +52,19 @@ import {
 } from "./whiteboard-store.js";
 import { buildSelfContainedHtml, exportFileName, splitExportWarnings } from "./export-bundle.js";
 import { injectLavishSdk } from "./html-transform.js";
-import { bindHost, extraAllowedHosts, hostForUrl, IPV6_LOOPBACK_HOST, linkHost, LOOPBACK_HOST } from "./paths.js";
+import {
+  bindHost,
+  extraAllowedHosts,
+  hostForUrl,
+  IPV6_LOOPBACK_HOST,
+  isWildcardHost,
+  LOOPBACK_HOST,
+  resolveConcreteListenHosts,
+  resolveLinkHost,
+  resolveListenHosts,
+  sanitizeListenHosts,
+  stateId,
+} from "./paths.js";
 import {
   formatPruneSummary,
   prune,
@@ -59,6 +72,7 @@ import {
   resolvePruneOpenMaxAgeMs,
   resolvePruneUnrepliedMaxAgeMs,
 } from "./prune.js";
+import { formatServerLogLine, serverStdioIsTimestamped } from "./server-log.js";
 import { canonicalFile, canonicalSessionFile, SessionStore, sessionKey } from "./session-store.js";
 import {
   ACCEPTED_IMAGE_MIME,
@@ -93,6 +107,16 @@ const designAssetUrls = {
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
 const WHITEBOARD_CHANNEL_TOKEN_TTL_MS = 5 * 60_000;
+const NETWORK_RECONCILE_CACHE_MS = 1_000;
+// Every concrete address gets this retry budget, not just a tailnet one: an interface that is
+// still coming up fails the same way whichever host names it, and the single-pinned-host case has
+// no second listener to fall back on.
+const BIND_RETRY_DELAYS_MS = [100, 250, 500];
+// A requested address that still has not bound after that budget is retried in the background for
+// the life of the process (the last delay repeats), so an address held by a stale daemon or absent
+// while its interface restarts comes back without anyone restarting Lavish.
+const BIND_RECOVERY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
+const LOOPBACK_OWNER_PROBE_TIMEOUT_MS = 500;
 // Sweep orphaned/expired attachments periodically, not just at startup: a
 // detached server can run for days, and an upload whose /prompts follow-up never
 // arrived would otherwise linger until the next restart.
@@ -243,6 +267,7 @@ export function readAttachmentUploadBody(req, maxBytes) {
 }
 
 export async function serve({
+  env = process.env,
   port,
   stateFile,
   version = "",
@@ -252,14 +277,55 @@ export async function serve({
   pollHeartbeatMs = 15_000,
   browserDisconnectGraceMs = BROWSER_DISCONNECT_GRACE_MS,
   idleTimeoutMs = resolveIdleTimeoutMs(),
-  host = bindHost(),
-  linkHost: linkHostName = linkHost(),
-  allowedHosts = extraAllowedHosts(),
+  host = bindHost(env),
+  hosts = undefined,
+  linkHost: linkHostName = undefined,
+  allowedHosts = undefined,
+  // Tailscale detection is not wired in this fork yet: the CLI passes null, and tests pass a fake
+  // detector. The surrounding reconcile and phone-readiness plumbing is in place for when it is.
+  detectTailscale: detectTailscaleFn = null,
+  lookupHost = undefined,
+  extraListenHosts = [],
+  bindRecoveryDelaysMs = BIND_RECOVERY_DELAYS_MS,
   feedbackLeaseTtlMs = undefined,
   // undefined resolves LAVISH_AXI_PRUNE_MAX_AGE at start; null skips the start-up prune.
   pruneMaxAgeMs = undefined,
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
 }) {
+  const extraHosts = allowedHosts ?? extraAllowedHosts(env);
+  const envHost = env.LAVISH_AXI_HOST?.trim();
+  const autoTailscale = !envHost;
+  const detect = typeof detectTailscaleFn === "function" ? detectTailscaleFn : null;
+  const tailscale = !hosts?.length && autoTailscale && detect ? await detect() : null;
+  const requestedListenHosts = sanitizeListenHosts(
+    hosts?.length
+      ? [...hosts, ...extraListenHosts]
+      : resolveListenHosts({ host, env, tailscale, extraHosts: extraListenHosts }),
+  );
+  const lookupOptions = lookupHost ? { lookup: lookupHost } : {};
+  const listenHosts = await resolveConcreteListenHosts(requestedListenHosts, {
+    ...lookupOptions,
+    keepUnresolved: true,
+  });
+  const activeTailscaleNetwork = tailscaleNetworkKey(tailscale);
+  const serverStateId = stateId(stateFile);
+  let tailscalePhoneReady = false;
+  let tailscaleDetectionWarning = typeof tailscale?.warning === "string" ? tailscale.warning : "";
+  // Requested addresses that have not bound yet, with the last error for each. Background recovery
+  // keeps retrying them and every surface that reports network health reads them from here, so a
+  // failed bind is never just one log line nobody sees.
+  /** @type {Map<string, Error>} */
+  const pendingBinds = new Map();
+  let resolvedLinkHost = linkHostName ?? resolveLinkHost({ env, tailscale, fallbackHost: host });
+  // Declared before anything listens: an SSE chrome or /shutdown can reach these handlers the
+  // moment the first listener binds, while later addresses are still retrying. Declaring them
+  // after the bind loop made that window a TDZ ReferenceError that crashed restarted servers.
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let idleTimer = null;
+  /** @type {ReturnType<typeof setInterval> | null} */
+  let attachmentSweepTimer = null;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let bindRecoveryTimer = null;
   const app = express();
   const whiteboardChannelSecret = crypto.randomBytes(32);
   const store = new SessionStore(stateFile, feedbackLeaseTtlMs === undefined ? {} : { feedbackLeaseTtlMs });
@@ -274,10 +340,90 @@ export async function serve({
   // Sessions with at least one warning the user queued that has not been re-checked yet.
   const outstandingRepairBatches = new Set();
   const diagnosticViewportClasses = resolveDiagnosticViewportClasses();
-  const verbose = debug || process.env.LAVISH_AXI_DEBUG === "1";
-  const writeLog = typeof log === "function" ? log : (line) => process.stderr.write(`${line}\n`);
+  const verbose = debug || env.LAVISH_AXI_DEBUG === "1";
+  // The detached server's stderr is appended to server.log across restarts, where an untimestamped
+  // line cannot be dated or correlated with an outage. An injected logger formats its own lines.
+  const writeLog =
+    typeof log === "function"
+      ? log
+      : (line) => process.stderr.write(`${serverStdioIsTimestamped() ? line : formatServerLogLine(line)}\n`);
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
+  if (tailscaleDetectionWarning) writeLog(`[lavish] WARNING: ${tailscaleDetectionWarning}`);
   let publicPort = port;
+  let serverReady = false;
+  let networkReconcileCheckedAt = 0;
+  let cachedNetworkStale = false;
+  /** @type {Promise<boolean> | null} */
+  let networkReconcilePromise = null;
+
+  function networkWarningField() {
+    const networkWarning = currentNetworkWarning();
+    return networkWarning ? { network_warning: networkWarning } : {};
+  }
+
+  function describeBindFailure(listenHost, error) {
+    const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+    const why =
+      code === "EADDRINUSE"
+        ? "EADDRINUSE: another process is already listening there"
+        : code === "EADDRNOTAVAIL"
+          ? "EADDRNOTAVAIL: that address is not on this machine right now"
+          : code === "ENOTFOUND" || code === "EAI_AGAIN"
+            ? `${code}: that name does not resolve right now`
+            : code || (error instanceof Error ? error.message : String(error));
+    const address = `${hostForUrl(listenHost)}:${publicPort || port}`;
+    const reachable = `Lavish remains available on ${boundHosts.map((bound) => hostForUrl(bound)).join(", ") || "loopback"}`;
+    if (listenHost === tailscale?.ipv4) {
+      return `Tailscale binding failed for ${address} (${why}); there is no phone access and tailnet review links do not load. ${reachable} and keeps retrying the tailnet address in the background.`;
+    }
+    const fellBack = boundHosts.length > 0 && boundHosts.every((bound) => bound === LOOPBACK_HOST);
+    return `Could not bind ${address} (${why}); ${fellBack ? "Lavish fell back to loopback and is" : "Lavish is"} not reachable at that address. ${reachable} and keeps retrying ${hostForUrl(listenHost)} in the background.`;
+  }
+
+  // Everything that reports network health reads this, so the warning appears and clears with the
+  // bind state instead of being stamped once at startup.
+  function currentNetworkWarning() {
+    return [
+      tailscaleDetectionWarning,
+      ...[...pendingBinds].map(([listenHost, error]) => describeBindFailure(listenHost, error)),
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  // A requested address that failed to bind is recovered in this process (retried now, and in the
+  // background), never by reporting the server stale: a restart cannot free a port another process
+  // holds, and it would drop every live review connection for an address that comes back on its own.
+  async function reconcileNetwork() {
+    await retryPendingBinds();
+    if (!(autoTailscale && detect)) return false;
+    return reconcileTailscaleNetwork();
+  }
+
+  async function reconcileTailscaleNetwork() {
+    if (Date.now() - networkReconcileCheckedAt < NETWORK_RECONCILE_CACHE_MS) return cachedNetworkStale;
+    if (networkReconcilePromise) return networkReconcilePromise;
+    networkReconcilePromise = (async () => {
+      try {
+        const detectedTailscale = await detect();
+        const detectedNetwork = tailscaleNetworkKey(detectedTailscale);
+        const stale = detectedNetwork !== activeTailscaleNetwork;
+        if (stale) {
+          tailscaleDetectionWarning = typeof detectedTailscale?.warning === "string" ? detectedTailscale.warning : "";
+        }
+        return stale;
+      } catch {
+        return false;
+      }
+    })();
+    try {
+      cachedNetworkStale = await networkReconcilePromise;
+      networkReconcileCheckedAt = Date.now();
+      return cachedNetworkStale;
+    } finally {
+      networkReconcilePromise = null;
+    }
+  }
 
   // DNS-rebinding guard. An Origin/Referer same-origin check stops classic cross-origin CSRF but
   // NOT DNS rebinding: a page that rebinds its own domain to this loopback port
@@ -293,8 +439,46 @@ export async function serve({
   // Additional names are an explicit opt-in via LAVISH_AXI_ALLOWED_HOSTS; a lone
   // "*" there disables the guard. When a reverse proxy sits in front,
   // X-Forwarded-Host is validated too (see isAllowedRequestHost).
-  const allowedHostnames = buildAllowedHostnames({ host, linkHost: linkHostName, allowedHosts });
-  const allowAnyHostname = allowsAllHosts(allowedHosts);
+  const allowedHostnames = buildAllowedHostnames({
+    host: requestedListenHosts[0],
+    hosts: [...requestedListenHosts, ...listenHosts],
+    linkHost: resolvedLinkHost,
+    allowedHosts: extraHosts,
+  });
+  const allowAnyHostname = allowsAllHosts(extraHosts);
+
+  function workingUrlFor(req, { includeSessionPath = true } = {}) {
+    const origin = `http://${hostForUrl(resolvedLinkHost)}:${publicPort}`;
+    if (includeSessionPath && typeof req.path === "string" && req.path.startsWith("/session/")) {
+      return `${origin}${req.path}`;
+    }
+    return `${origin}/`;
+  }
+
+  // A reviewer who opens the server under a wrong host or a stale link sees a page naming the URL
+  // that works, not raw JSON. Machine clients that do not ask for HTML still get JSON.
+  function sendDenied(req, res, { status, error, title, message, workingUrl = undefined }) {
+    const resolvedWorkingUrl = workingUrl || workingUrlFor(req);
+    if (wantsHtml(req)) {
+      res
+        .status(status)
+        .type("html")
+        .send(createDeniedHtml({ title, message, workingUrl: resolvedWorkingUrl }));
+      return;
+    }
+    res.status(status).json({ error });
+  }
+
+  function sendSessionNotFound(req, res) {
+    sendDenied(req, res, {
+      status: 404,
+      error: "session not found",
+      title: "Session not found",
+      message: "This review session does not exist. Return to your agent and open the session URL it printed.",
+      workingUrl: workingUrlFor(req, { includeSessionPath: false }),
+    });
+  }
+
   if (!allowAnyHostname) {
     app.use((req, res, next) => {
       const requestHost = { host: req.headers.host, forwardedHost: req.headers["x-forwarded-host"] };
@@ -305,7 +489,14 @@ export async function serve({
       logEvent?.(
         `rejected request with disallowed host host=${req.headers.host ?? ""} x-forwarded-host=${req.headers["x-forwarded-host"] ?? ""} path=${req.path}`,
       );
-      res.status(403).json({ error: "forbidden host" });
+      sendDenied(req, res, {
+        status: 403,
+        error: "forbidden host",
+        title: "Wrong address",
+        message: tailscalePhoneReady
+          ? "This Lavish review server does not accept that host. Open the working URL below on this computer or your phone through Tailscale."
+          : "This Lavish review server does not accept that host. Open the working URL below on this computer.",
+      });
     });
   }
 
@@ -356,8 +547,34 @@ export async function serve({
     return defaultJsonParser(req, res, next);
   });
 
-  app.get("/health", (req, res) => {
-    res.json({ ok: true, app: "lavish-axi", version, build });
+  app.get("/", (_req, res) => {
+    res.type("html").send(createLandingHtml());
+  });
+
+  app.get("/health", async (req, res) => {
+    if (!serverReady) {
+      res.status(503).json({ ok: false, app: "lavish-axi", version, build });
+      return;
+    }
+    const networkStale = req.query.reconcile_network === "1" ? await reconcileNetwork() : false;
+    const networkWarning = currentNetworkWarning();
+    res.json({
+      ok: true,
+      app: "lavish-axi",
+      version,
+      build,
+      state_id: serverStateId,
+      state_dir: path.dirname(stateFile),
+      // Where this process is listening and every address it was asked to serve (bound or still
+      // retrying). The CLI uses both to find one daemon per port whatever host it was configured
+      // with, and to tell a same-port daemon at another address apart from this one.
+      hosts: [...boundHosts],
+      // Configured names sit beside the addresses they resolved to, so a CLI that resolves the same
+      // name finds it served whichever form it compares.
+      requested_hosts: [...new Set([...listenHosts, ...requestedListenHosts])],
+      ...(networkStale ? { network_stale: true } : {}),
+      ...(networkWarning ? { network_warning: networkWarning } : {}),
+    });
   });
 
   let shutdownResolve;
@@ -374,7 +591,7 @@ export async function serve({
     const reason = SHUTDOWN_REASONS.has(String(req.body?.reason || "")) ? String(req.body.reason) : "";
     res.json({ status: "shutting-down" });
     // Defer until after the response flushes so the client gets confirmation.
-    setImmediate(() => shutdown(reloadKey, reason));
+    setImmediate(() => shutdown(reloadKey, reason, "shutdown-request"));
   });
 
   app.post("/api/sessions", async (req, res, next) => {
@@ -383,6 +600,7 @@ export async function serve({
       const key = sessionKey(file);
       const reopen = Boolean(req.body.reopen);
       const existing = await store.findByKey(key);
+      const sessionUrl = `http://${hostForUrl(resolvedLinkHost)}:${publicPort}/session/${key}`;
       // A user-initiated end (ending or send-and-ending from the browser) means the human
       // deliberately closed the review surface. Silently reopening it on the next
       // `lavish-axi <file>` is the exact behavior this route exists to prevent - require an
@@ -390,10 +608,9 @@ export async function serve({
       // (`lavish-axi end`) keep reviving on the next open, same as before this change.
       if (existing?.status === "ended" && existing.ended_by === "user" && !reopen) {
         logEvent?.(`session open blocked (user-ended) key=${key} file=${file}`);
-        res.json({ key, file, url: existing.url, status: "user-ended" });
+        res.json({ key, file, url: sessionUrl, status: "user-ended", ...networkWarningField() });
         return;
       }
-      const sessionUrl = `http://${hostForUrl(linkHostName)}:${publicPort}/session/${key}`;
       const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(sessionUrl) : sessionUrl;
       const session = await store.upsertSession(file, sessionUrl);
       if (existing?.status === "ended") {
@@ -402,7 +619,7 @@ export async function serve({
       logEvent?.(`session opened key=${key} file=${file}`);
       await syncOutstandingRepairs(key);
       await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
-      res.json({ key, file, url, status: "opened" });
+      res.json({ key, file, url, status: "opened", ...networkWarningField() });
     } catch (error) {
       next(error);
     }
@@ -785,7 +1002,7 @@ export async function serve({
     try {
       const chromeLoad = await store.issueReviewerHandoff(req.params.key);
       if (!chromeLoad) {
-        res.status(404).send("Session not found");
+        sendSessionNotFound(req, res);
         return;
       }
       const session = chromeLoad.session;
@@ -871,7 +1088,7 @@ export async function serve({
       const revision = req.query.artifact_revision;
       const beforeRead = await store.verifyArtifactLoad(key, token, revision);
       if (!beforeRead) {
-        res.status(404).send("Session not found");
+        sendSessionNotFound(req, res);
         return;
       }
       if (!beforeRead.valid) {
@@ -907,7 +1124,7 @@ export async function serve({
       const assetPath = req.params[1];
       const session = await store.findByKey(key);
       if (!session) {
-        res.status(404).send("Session not found");
+        sendSessionNotFound(req, res);
         return;
       }
       const root = path.dirname(session.file);
@@ -1070,7 +1287,7 @@ export async function serve({
         req.query.artifact_revision,
       );
       if (!verified) {
-        res.status(404).send("Session not found");
+        sendSessionNotFound(req, res);
         return;
       }
       if (!verified.valid) {
@@ -1349,17 +1566,201 @@ export async function serve({
     res.status(status).json({ error: error instanceof Error ? error.message : String(error) });
   });
 
-  const httpServer = await new Promise((resolve, reject) => {
-    const s = app.listen(port, host, () => {
-      if (s.address()) resolve(s);
-    });
-    s.once("error", reject);
-  });
-  publicPort = httpServer.address().port;
+  const httpServers = [];
+  const boundHosts = [];
+  let boundPort = port;
+  let lastBindError = null;
 
-  function shutdown(reloadKey = "", reason = "") {
+  // One listen attempt. A listener that finishes binding after shutdown began is closed at once,
+  // or it would keep the process alive with nothing left to serve.
+  // A configured name is resolved here, through the same lookup and all-interfaces refusal as at
+  // startup, so one that only resolves later is served at its address and reported by it. A name
+  // that resolves to an address already bound is served by that listener.
+  async function listenOnce(listenHost) {
+    const address = isIP(listenHost) ? listenHost : (await resolveConcreteListenHosts([listenHost], lookupOptions))[0];
+    if (address !== listenHost) {
+      if (!listenHosts.includes(address)) listenHosts.push(address);
+      if (boundHosts.includes(address)) {
+        boundHosts.push(listenHost);
+        return;
+      }
+    }
+    const httpServer = await listenHttp(app, boundPort, address, (error) => {
+      writeLog(`[lavish] HTTP server error: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    if (shuttingDown) {
+      httpServer.close();
+      throw new Error("Lavish server is shutting down");
+    }
+    if (boundPort === 0) boundPort = httpServer.address().port;
+    if (!publicPort) publicPort = boundPort;
+    httpServers.push(httpServer);
+    boundHosts.push(listenHost);
+    if (address !== listenHost) boundHosts.push(address);
+  }
+
+  // Bind one address, retrying a transient failure. Whether anything else has bound yet is
+  // deliberately NOT consulted here: that check used to run before the retry, which made both the
+  // retry and the loopback fallback unreachable whenever the first (or only) host failed - exactly
+  // the single pinned-host case, where the process then exited with no listener at all.
+  async function bindListener(listenHost) {
+    let retryIndex = 0;
+    while (true) {
+      try {
+        await listenOnce(listenHost);
+        return null;
+      } catch (error) {
+        if (!shuttingDown && retryIndex < BIND_RETRY_DELAYS_MS.length) {
+          await new Promise((resolve) => setTimeout(resolve, BIND_RETRY_DELAYS_MS[retryIndex]));
+          retryIndex += 1;
+          continue;
+        }
+        return error instanceof Error ? error : new Error(String(error));
+      }
+    }
+  }
+
+  // Session URLs, the Host allowlist, and phone readiness all follow what is actually bound, so
+  // they are recomputed whenever a listener comes up rather than frozen at startup.
+  function applyNetworkState() {
+    tailscalePhoneReady = Boolean(tailscale?.ipv4 && boundHosts.includes(tailscale.ipv4));
+    if (linkHostName != null) {
+      resolvedLinkHost = linkHostName;
+    } else if (tailscalePhoneReady) {
+      resolvedLinkHost = resolveLinkHost({ env, tailscale, fallbackHost: host });
+    } else if (boundHosts.includes(listenHosts[0])) {
+      resolvedLinkHost = resolveLinkHost({ env, tailscale: null, fallbackHost: host });
+    } else {
+      // Session URLs must name somewhere that is actually listening, so while the requested host
+      // is unbound the link host moves to loopback unless the operator named one explicitly.
+      resolvedLinkHost = resolveLinkHost({ env, tailscale: null, fallbackHost: LOOPBACK_HOST });
+    }
+    const servesHost = (candidate) => candidate !== tailscale?.ipv4 || tailscalePhoneReady;
+    const nextAllowedHostnames = buildAllowedHostnames({
+      host: requestedListenHosts[0],
+      hosts: [...requestedListenHosts.filter(servesHost), ...listenHosts.filter(servesHost), ...boundHosts],
+      linkHost: resolvedLinkHost,
+      allowedHosts: extraHosts,
+    });
+    allowedHostnames.clear();
+    for (const allowedHostname of nextAllowedHostnames) allowedHostnames.add(allowedHostname);
+  }
+
+  // A later attempt for every requested address still unbound. Shared by the background schedule
+  // and by /health?reconcile_network=1, so a CLI invocation right after the address frees up binds
+  // it immediately instead of waiting for the next tick.
+  let bindRecoveryInFlight = null;
+  async function retryPendingBinds() {
+    if (pendingBinds.size === 0 || shuttingDown) return;
+    if (!bindRecoveryInFlight) {
+      bindRecoveryInFlight = (async () => {
+        let bound = false;
+        for (const listenHost of [...pendingBinds.keys()]) {
+          if (shuttingDown) return;
+          try {
+            await listenOnce(listenHost);
+            pendingBinds.delete(listenHost);
+            bound = true;
+            writeLog(`[lavish] now listening on ${hostForUrl(listenHost)}:${boundPort} after an earlier bind failure.`);
+          } catch (error) {
+            if (!shuttingDown) pendingBinds.set(listenHost, error instanceof Error ? error : new Error(String(error)));
+          }
+        }
+        if (bound) applyNetworkState();
+      })().finally(() => {
+        bindRecoveryInFlight = null;
+      });
+    }
+    await bindRecoveryInFlight;
+  }
+
+  let bindRecoveryAttempt = 0;
+  function scheduleBindRecovery() {
+    if (shuttingDown || pendingBinds.size === 0 || bindRecoveryTimer || !bindRecoveryDelaysMs.length) return;
+    const delay = bindRecoveryDelaysMs[Math.min(bindRecoveryAttempt, bindRecoveryDelaysMs.length - 1)];
+    bindRecoveryAttempt += 1;
+    bindRecoveryTimer = setTimeout(() => {
+      bindRecoveryTimer = null;
+      retryPendingBinds()
+        .catch(() => {})
+        .finally(() => scheduleBindRecovery());
+    }, delay);
+    bindRecoveryTimer.unref?.();
+  }
+
+  // Loopback is bound first because it is this port's control address: every CLI probes it
+  // whatever its own LAVISH_AXI_HOST says. Whoever holds it owns the port, so a second Lavish
+  // server started concurrently (two agents with different host settings) loses here and exits
+  // instead of taking the remaining addresses and splitting one port across two daemons that share
+  // one state file.
+  const bindOrder = listenHosts.includes(LOOPBACK_HOST)
+    ? [LOOPBACK_HOST, ...listenHosts.filter((listenHost) => listenHost !== LOOPBACK_HOST)]
+    : listenHosts;
+  for (const listenHost of bindOrder) {
+    const error = await bindListener(listenHost);
+    if (!error) continue;
+    lastBindError = error;
+    if (listenHost === LOOPBACK_HOST && isAddressInUseBindError(error)) {
+      const owner = await probeLavishHealth(LOOPBACK_HOST, boundPort);
+      throw new Error(
+        owner
+          ? `Another Lavish server (version ${owner.version || "unknown"}) already owns port ${boundPort} on ${LOOPBACK_HOST}; not starting a second one.`
+          : `Loopback ${LOOPBACK_HOST}:${boundPort} is already in use; not starting a Lavish server on another address.`,
+        { cause: error },
+      );
+    }
+    pendingBinds.set(listenHost, error);
+  }
+
+  // Loopback floor. A server that cannot reach its requested address is still far more useful on
+  // loopback than absent: the local agent CLI keeps working, and the next invocation finds THIS
+  // server instead of spawning a duplicate beside it. Only reached when nothing else bound and
+  // loopback was not requested, so a healthy multi-listener startup is untouched.
+  if (httpServers.length === 0 && !listenHosts.includes(LOOPBACK_HOST)) {
+    const error = await bindListener(LOOPBACK_HOST);
+    if (error) lastBindError = error;
+  }
+  if (httpServers.length === 0) {
+    throw new Error(
+      `Lavish server failed to bind any address${lastBindError ? `: ${lastBindError.message}` : ""}`,
+      lastBindError ? { cause: lastBindError } : undefined,
+    );
+  }
+  // The CLI control channel only probes the primary requested host and loopback. A process that
+  // bound neither is alive and unreachable, so close every listener already taken in this call.
+  if (!boundHosts.includes(LOOPBACK_HOST) && !boundHosts.includes(listenHosts[0])) {
+    const error = new Error(
+      `Lavish server failed to bind a control-channel address${lastBindError ? `: ${lastBindError.message}` : ""}`,
+      lastBindError ? { cause: lastBindError } : undefined,
+    );
+    await Promise.all(
+      httpServers.splice(0).map(
+        (httpServer) =>
+          new Promise((resolve) => {
+            httpServer.close(() => resolve(undefined));
+          }),
+      ),
+    );
+    boundHosts.length = 0;
+    throw error;
+  }
+  applyNetworkState();
+  publicPort = httpServers[0].address().port;
+  // Always logged, not only under --verbose: an address that silently stopped serving leaves
+  // review links dead with nothing but a debug line to show for it.
+  for (const [listenHost, error] of pendingBinds) {
+    writeLog(`[lavish] WARNING: ${describeBindFailure(listenHost, error)}`);
+  }
+  serverReady = true;
+  scheduleBindRecovery();
+
+  // `cause` is log-only and never reaches a chrome: `reason` is the user-facing SHUTDOWN_REASONS
+  // value, and widening it here would let an internal cause render as a banner line that claims
+  // something untrue. Without the log line, server.log records an exit with no explanation at all.
+  function shutdown(reloadKey = "", reason = "", cause = "requested") {
     if (shuttingDown) return;
     shuttingDown = true;
+    writeLog(`[lavish] shutting down: ${cause}${reason ? ` (reason=${reason})` : ""}`);
     if (idleTimer) {
       clearTimeout(idleTimer);
       idleTimer = null;
@@ -1367,6 +1768,10 @@ export async function serve({
     if (attachmentSweepTimer) {
       clearInterval(attachmentSweepTimer);
       attachmentSweepTimer = null;
+    }
+    if (bindRecoveryTimer) {
+      clearTimeout(bindRecoveryTimer);
+      bindRecoveryTimer = null;
     }
     // Only the chrome whose artifact is being reopened is reloaded: the replacement server
     // adopts that session via state.json once it binds, and the caller named it. Every other
@@ -1393,18 +1798,22 @@ export async function serve({
       w.close().catch(() => {});
     }
     watchers.clear();
-    httpServer.close(() => shutdownResolve());
-    // Force-close keep-alive sockets so SSE / long-polls don't keep us alive.
-    if (typeof httpServer.closeAllConnections === "function") {
-      httpServer.closeAllConnections();
+    let remaining = httpServers.length;
+    const closed = () => {
+      remaining -= 1;
+      if (remaining === 0) shutdownResolve();
+    };
+    for (const httpServer of httpServers) {
+      httpServer.close(closed);
+      // Force-close keep-alive sockets so SSE / long-polls don't keep us alive.
+      if (typeof httpServer.closeAllConnections === "function") {
+        httpServer.closeAllConnections();
+      }
     }
   }
 
   // Idle self-shutdown: the timer only runs while nothing is connected. Any live SSE chrome or
   // active long-poll cancels it; losing the last connection (re)arms it.
-  let idleTimer = null;
-  /** @type {ReturnType<typeof setInterval> | null} */
-  let attachmentSweepTimer = null;
   function refreshIdleTimer() {
     if (idleTimer) {
       clearTimeout(idleTimer);
@@ -1415,8 +1824,7 @@ export async function serve({
     idleTimer = setTimeout(() => {
       idleTimer = null;
       if (!shuttingDown && sseClients.size === 0 && activePolls.size === 0) {
-        logEvent?.(`idle for ${idleTimeoutMs}ms with no connections, shutting down`);
-        shutdown();
+        shutdown("", "", `idle-timeout after ${idleTimeoutMs}ms with no connections`);
       }
     }, idleTimeoutMs);
     idleTimer.unref?.();
@@ -1432,8 +1840,7 @@ export async function serve({
     try {
       const sessions = await store.listSessions();
       if (sessions.every((session) => session.status === "ended")) {
-        logEvent?.("last open session ended with no live connections, shutting down");
-        setImmediate(shutdown);
+        setImmediate(() => shutdown("", "", "last open session ended with no live connections"));
       }
     } catch {
       // ignore - the idle timer remains as a backstop
@@ -1519,13 +1926,106 @@ export async function serve({
   refreshIdleTimer();
 
   return {
-    port: httpServer.address().port,
+    port: publicPort,
+    hosts: boundHosts,
+    addresses: httpServers.map((server) => server.address()),
     close: async () => {
-      shutdown();
+      shutdown("", "", "close() called");
       await done;
     },
     done,
   };
+}
+
+function listenHttp(app, port, host, onRuntimeError) {
+  return new Promise((resolve, reject) => {
+    const server = createServer(app);
+    let listening = false;
+    const onError = (error) => {
+      if (!listening) {
+        server.off("listening", onListening);
+        reject(error);
+        return;
+      }
+      onRuntimeError?.(error);
+    };
+    const onListening = () => {
+      listening = true;
+      const address = server.address();
+      if (address && typeof address === "object" && isWildcardHost(address.address)) {
+        server.close(() => reject(new Error(`Refusing all-interfaces listener at ${address.address}`)));
+        return;
+      }
+      resolve(server);
+    };
+    // Keep this listener after startup: removing it when `listening` fires turns any later server
+    // error into an unhandled EventEmitter error that terminates the detached process silently.
+    server.on("error", onError);
+    server.once("listening", onListening);
+    // `host` has already been sanitized by resolveListenHosts. Keeping this helper concrete is an
+    // important defense: a reachable extra address must never turn into an all-interfaces listener.
+    server.listen({ port, host });
+  });
+}
+
+function tailscaleNetworkKey(tailscale) {
+  if (!tailscale) return "down";
+  if (tailscale.warning) return "incomplete";
+  if (!tailscale.ipv4 || !tailscale.magicDnsName) return "incomplete";
+  return `up\n${tailscale.ipv4}\n${tailscale.magicDnsName}`;
+}
+
+function isAddressInUseBindError(error) {
+  return error instanceof Error && "code" in error && error.code === "EADDRINUSE";
+}
+
+// Whether a Lavish server answers /health at this address. Bounded, because a foreign process
+// that accepts the connection and never answers must not stall startup, and the socket is
+// destroyed on every exit path: a lingering probe connection keeps a failed server process alive
+// and holds the other process's close() open.
+function probeLavishHealth(host, port) {
+  return new Promise((resolve) => {
+    const request = httpGet({ host, port, path: "/health", agent: false }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 64 * 1024) request.destroy();
+      });
+      response.on("end", () => {
+        request.destroy();
+        try {
+          const parsed = JSON.parse(body);
+          resolve(parsed && typeof parsed === "object" && parsed.app === "lavish-axi" ? parsed : null);
+        } catch {
+          resolve(null);
+        }
+      });
+      response.on("error", () => resolve(null));
+    });
+    request.setTimeout(LOOPBACK_OWNER_PROBE_TIMEOUT_MS, () => {
+      request.destroy();
+      resolve(null);
+    });
+    request.on("error", () => resolve(null));
+    request.on("close", () => resolve(null));
+  });
+}
+
+function wantsHtml(req) {
+  const accept = String(req.get("accept") || "");
+  return accept.toLowerCase().includes("text/html");
+}
+
+function createLandingHtml() {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lavish Editor</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f4ef;color:#25221f;font:16px/1.5 system-ui,sans-serif}.card{width:min(560px,calc(100% - 40px));padding:32px;border:1px solid #d9d0c5;border-radius:16px;background:#fffdf9;box-shadow:0 12px 40px #25221f18}h1{margin:0 0 12px;font-size:26px}p{margin:0}</style></head><body><main class="card"><h1>Lavish Editor is running</h1><p>Open the review session URL printed by your agent.</p></main></body></html>`;
+}
+
+function createDeniedHtml({ title, message, workingUrl }) {
+  const safeTitle = escapeHtml(title);
+  const safeMessage = escapeHtml(message);
+  const safeUrl = escapeHtml(workingUrl);
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${safeTitle} - Lavish Editor</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f4ef;color:#25221f;font:16px/1.5 system-ui,sans-serif}.card{width:min(560px,calc(100% - 40px));padding:32px;border:1px solid #d9d0c5;border-radius:16px;background:#fffdf9;box-shadow:0 12px 40px #25221f18}h1{margin:0 0 12px;font-size:26px}p{margin:0 0 18px}.url{display:block;padding:12px 14px;border-radius:10px;background:#f0ebe4;color:#25221f;overflow-wrap:anywhere}a{color:inherit;font-weight:700}</style></head><body><main class="card"><h1>${safeTitle}</h1><p>${safeMessage}</p><p>Open this working URL:</p><a class="url" href="${safeUrl}">${safeUrl}</a></main></body></html>`;
 }
 
 async function readDesignAsset(asset) {
@@ -1572,24 +2072,21 @@ function encodeRfc5987Value(value) {
   );
 }
 
-// Wildcard bind addresses ("all interfaces") are not connectable hostnames, so
-// they never belong in the Host allowlist - and "0.0.0.0" as a Host is a known
-// loopback-reach trick, so it must stay rejected.
-const WILDCARD_BIND_HOSTS = new Set(["0.0.0.0", "::", "[::]"]);
-
 // The set of Host header hostnames this server answers to: loopback names plus
-// the resolved bind and link host and any explicit LAVISH_AXI_ALLOWED_HOSTS
-// extras, minus wildcard binds and the "*" sentinel. Lowercased for
-// case-insensitive comparison against the incoming Host.
-export function buildAllowedHostnames({ host, linkHost: linkHostName, allowedHosts = [] }) {
+// every concrete listener and the resolved link host and any explicit
+// LAVISH_AXI_ALLOWED_HOSTS extras, minus wildcard binds and the "*" sentinel.
+// Wildcard bind addresses ("all interfaces") are not connectable hostnames, and
+// "0.0.0.0" as a Host is a known loopback-reach trick, so it must stay rejected.
+// Lowercased for case-insensitive comparison against the incoming Host.
+export function buildAllowedHostnames({ host, hosts = [], linkHost: linkHostName, allowedHosts = [] }) {
   return new Set(
-    [LOOPBACK_HOST, IPV6_LOOPBACK_HOST, "localhost", host, linkHostName, ...allowedHosts]
+    [LOOPBACK_HOST, IPV6_LOOPBACK_HOST, "localhost", host, ...hosts, linkHostName, ...allowedHosts]
       .map((value) =>
         String(value || "")
           .trim()
           .toLowerCase(),
       )
-      .filter((value) => value && value !== "*" && !WILDCARD_BIND_HOSTS.has(value)),
+      .filter((value) => value && value !== "*" && !isWildcardHost(value)),
   );
 }
 
