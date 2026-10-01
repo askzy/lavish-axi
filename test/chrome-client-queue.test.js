@@ -3,7 +3,18 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
+import { createChromeHtml } from "../src/server.js";
+
 const sourceUrl = new URL("../src/chrome-client.js", import.meta.url);
+
+// The ids the served chrome page actually declares. The client reaches for these by id, so a page
+// that stopped declaring one would leave the corresponding feature silently dead behind an
+// `if (element)` guard - a harness that invents an element for any id would never notice.
+const servedChromeIds = new Set(
+  [...createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }).matchAll(/\sid="([^"]+)"/g)].map(
+    (match) => match[1],
+  ),
+);
 
 /** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, initialEnded?: boolean, initialEndedBy?: string | null }} HarnessSessionData */
 /** @type {HarnessSessionData} */
@@ -18,6 +29,9 @@ async function createChromeHarness({
   storage = new Map(),
   beginLoadResponses = [],
   handoffResponses = [],
+  // Opt-in frozen clock. `reloadChromeAfterServerRestart` waits on wall-clock deadlines, so a
+  // test that needs one to expire has to own `Date.now()` rather than sleep through it.
+  fakeClock = false,
 } = {}) {
   const source = await readFile(sourceUrl, "utf8");
   const postedToFrame = [];
@@ -143,6 +157,9 @@ async function createChromeHarness({
         return false;
       },
       appendChild(child) {
+        // Appending a node that is already in the tree moves it, as the real DOM does.
+        const existing = child.parentElement;
+        if (existing) existing.children = existing.children.filter((node) => node !== child);
         child.parentElement = this;
         this.children.push(child);
         this.lastAppendedChild = child;
@@ -197,6 +214,7 @@ async function createChromeHarness({
   };
   element("moreMenu").hidden = true;
   element("warningsDrawer").hidden = true;
+  element("layoutGateBypass").hidden = true;
 
   const harnessFetch = async (url, init) => {
     if (String(url).includes("/chrome-loads/begin")) {
@@ -222,9 +240,12 @@ async function createChromeHarness({
     return fetchImpl(url, init);
   };
 
+  let clockNow = Date.now();
   const context = {
+    AbortController,
     clearTimeout: fakeClearTimeout,
     console,
+    ...(fakeClock ? { Date: { now: () => clockNow, parse: Date.parse } } : {}),
     fetch: harnessFetch,
     location: {
       reload() {
@@ -253,6 +274,9 @@ async function createChromeHarness({
     document: {
       body: element("body"),
       getElementById(id) {
+        // Answer only for ids the served page declares, so an id the client and the page disagree
+        // on fails here the way it would go dead in a browser.
+        if (!servedChromeIds.has(id) && !elements.has(id)) return null;
         return element(id);
       },
       addEventListener(type, handler, capture) {
@@ -348,11 +372,23 @@ async function createChromeHarness({
       for (const { handler } of documentListeners.get("mousedown") || []) handler({ target });
     },
     runTimers,
+    advanceClock(ms) {
+      clockNow += ms;
+    },
     srcLoads,
     beginRequests,
     artifactBeginRequests,
     artifactLoadToken: frameLoadToken,
   };
+}
+
+// One whole begin-load attempt that fails: the request plus both in-call transport retries.
+async function exhaustOneBeginLoadAttempt(chrome) {
+  await flushPromises();
+  chrome.runTimers(100);
+  await flushPromises();
+  chrome.runTimers(300);
+  await flushPromises();
 }
 
 function flushPromises() {
@@ -1096,6 +1132,575 @@ test("a failed begin-load keeps the previous frame until a retry succeeds", asyn
     posts.some((post) => post.url === "/api/abc/artifact-failures"),
     false,
   );
+});
+
+// A chrome whose FIRST begin-load fails has no previous frame to preserve: the iframe carries
+// only `data-artifact-src` and is never navigated until a begin succeeds. Abandoning the load
+// there leaves the layout gate spinning over an empty frame for good, which is what a session
+// reopened across a server restart looked like.
+test("a first begin-load that fails keeps retrying until the artifact loads", async () => {
+  const beginLoadResponses = [
+    { ok: false, status: 503 },
+    { ok: false, status: 503 },
+    { ok: false, status: 503 },
+  ];
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    beginLoadResponses,
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+
+  await exhaustOneBeginLoadAttempt(chrome);
+  assert.equal(chrome.artifactBeginRequests.length, 3);
+  assert.equal(chrome.frame.src, "", "the artifact frame is never navigated while begin fails");
+
+  // The backoff retry is a whole fresh attempt, and the harness answers it successfully.
+  chrome.runTimers(1000);
+  await flushPromises();
+  assert.equal(chrome.artifactBeginRequests.length, 4);
+  assert.match(chrome.frame.src, /^\/artifact\/abc\/index\.html\?artifact_revision=\d+&artifact_load_token=/);
+  // Retries alone never raise the failure card: the gate is back on its ordinary checking copy.
+  assert.match(String(chrome.element("layoutGateTitle").innerHTML), /Checking layout/);
+});
+
+test("a first begin-load that never recovers surfaces a reloadable failure instead of a blank frame", async () => {
+  const beginLoadResponses = [];
+  for (let i = 0; i < 40; i += 1) beginLoadResponses.push({ ok: false, status: 503 });
+  let running = false;
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    beginLoadResponses,
+    fetchImpl: async (url) => {
+      if (String(url) === "/health" && !running) throw new Error("connection refused");
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  await exhaustOneBeginLoadAttempt(chrome);
+  for (const delay of [1000, 3000, 8000, 20000]) {
+    chrome.runTimers(delay);
+    await exhaustOneBeginLoadAttempt(chrome);
+  }
+
+  assert.equal(chrome.frame.src, "");
+  assert.equal(chrome.element("layoutGateOverlay").hidden, false);
+  assert.equal(chrome.element("layoutGateTitle").textContent, "Lavish could not load this artifact.");
+  assert.equal(chrome.element("layoutGateAction").textContent, "Check and reload");
+  assert.equal(chrome.element("layoutGateBypass").hidden, false, "Show anyway stays available on a failure card");
+
+  // This card is raised in the state where the server may be gone, so it must not navigate into
+  // a port nothing is listening on.
+  await chrome.element("layoutGateAction").click();
+  await flushPromises();
+  assert.equal(chrome.reloadCount(), 0);
+  assert.match(chrome.element("layoutGateCopy").textContent, /still not answering/);
+  assert.equal(chrome.element("layoutGateAction").disabled, false);
+
+  running = true;
+  await chrome.element("layoutGateAction").click();
+  await flushPromises();
+  assert.equal(chrome.reloadCount(), 1);
+});
+
+// The backoff budget belongs to the attempt that started it, not to the page.
+test("a load that asks for the artifact again gets the whole recovery backoff again", async () => {
+  const beginLoadResponses = [];
+  for (let i = 0; i < 18; i += 1) beginLoadResponses.push({ ok: false, status: 503 });
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    beginLoadResponses,
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+
+  await exhaustOneBeginLoadAttempt(chrome);
+  for (const delay of [1000, 3000, 8000, 20000]) {
+    chrome.runTimers(delay);
+    await exhaustOneBeginLoadAttempt(chrome);
+  }
+  assert.equal(chrome.artifactBeginRequests.length, 15);
+  assert.equal(chrome.element("layoutGateTitle").textContent, "Lavish could not load this artifact.");
+
+  chrome.element("reloadArtifact").click();
+  await exhaustOneBeginLoadAttempt(chrome);
+  assert.equal(chrome.artifactBeginRequests.length, 18);
+  assert.equal(chrome.frame.src, "");
+
+  chrome.runTimers(1000);
+  await flushPromises();
+  assert.equal(chrome.artifactBeginRequests.length, 19);
+  assert.match(chrome.frame.src, /artifact_load_token=/);
+  assert.match(String(chrome.element("layoutGateTitle").innerHTML), /Checking layout/);
+});
+
+test("a superseded reviewer is not retried in the background", async () => {
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    sessionData: { ...defaultSessionData, chromeLoadToken: "old-handoff" },
+    beginLoadResponses: [{ ok: false, status: 409, json: async () => ({ status: "superseded" }) }],
+  });
+  await flushPromises();
+
+  assert.equal(chrome.artifactBeginRequests.length, 1);
+  assert.equal(chrome.element("handoffBanner").hidden, false);
+  chrome.runTimers(1000);
+  await flushPromises();
+  assert.equal(chrome.artifactBeginRequests.length, 1);
+});
+
+test("a superseded first load names itself on the layout gate instead of holding the spinner", async () => {
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    sessionData: { ...defaultSessionData, chromeLoadToken: "old-handoff", layoutGateEnabled: true },
+    beginLoadResponses: [{ ok: false, status: 409, json: async () => ({ status: "superseded" }) }],
+  });
+  await flushPromises();
+  await flushPromises();
+
+  // Nothing ever reached the frame, and the takeover banner is covered by the gate overlay, so
+  // the overlay itself has to carry the message and the control.
+  assert.equal(chrome.element("artifact").src, "");
+  assert.equal(chrome.element("layoutGateOverlay").hidden, false);
+  assert.match(chrome.element("layoutGateTitle").textContent, /already open in another tab/);
+  assert.equal(chrome.element("layoutGateAction").textContent, "Take over here");
+  chrome.element("layoutGateAction").click();
+  assert.equal(chrome.reloadCount(), 1);
+  chrome.runTimers();
+  await flushPromises();
+  assert.equal(chrome.artifactBeginRequests.length, 1);
+});
+
+test("a chrome told to reload after a server restart waits for the replacement to answer", async () => {
+  let healthy = false;
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    fakeClock: true,
+    fetchImpl: async (url) => {
+      if (String(url) === "/health" && !healthy) throw new Error("connection refused");
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.eventSource().listeners.get("chrome-reload")({ data: JSON.stringify({ reason: "upgrade" }) });
+  for (let i = 0; i < 5; i += 1) {
+    await flushPromises();
+    chrome.runTimers(100);
+  }
+  await flushPromises();
+  assert.equal(chrome.reloadCount(), 0, "never reload into a port nothing is listening on");
+
+  healthy = true;
+  for (let i = 0; i < 3; i += 1) {
+    await flushPromises();
+    chrome.runTimers(100);
+  }
+  await flushPromises();
+  assert.equal(chrome.reloadCount(), 1);
+});
+
+async function createChromeWithDeadReplacement({ layoutGateEnabled = true } = {}) {
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    fakeClock: true,
+    sessionData: { ...defaultSessionData, layoutGateEnabled },
+    fetchImpl: async (url) => {
+      if (String(url) === "/health") throw new Error("connection refused");
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.eventSource().listeners.get("chrome-reload")({ data: "{}" });
+  await flushPromises();
+  chrome.advanceClock(61000);
+  for (let i = 0; i < 3; i += 1) {
+    chrome.runTimers(100);
+    await flushPromises();
+  }
+  return chrome;
+}
+
+test("a chrome whose replacement server never returns says so instead of reloading", async () => {
+  const chrome = await createChromeWithDeadReplacement();
+
+  assert.equal(chrome.reloadCount(), 0);
+  assert.equal(chrome.element("layoutGateOverlay").hidden, false);
+  assert.equal(chrome.element("layoutGateTitle").textContent, "Lavish is not running.");
+  assert.equal(chrome.element("layoutGateAction").textContent, "Check and reload");
+});
+
+// The sticky card's copy is the user's to retire, but it may never trap the viewer: a completed
+// pass, Show anyway, or the gate timeout still reveals the artifact underneath.
+test("the not-running card copy survives a later artifact load but never traps the viewer", async () => {
+  const chrome = await createChromeWithDeadReplacement();
+  assert.equal(chrome.element("layoutGateTitle").textContent, "Lavish is not running.");
+
+  chrome.eventSource().listeners.get("reload")();
+  await flushPromises();
+  await flushPromises();
+  assert.match(chrome.frame.src, /artifact_load_token=/, "the artifact still reloads");
+  assert.equal(chrome.element("layoutGateTitle").textContent, "Lavish is not running.");
+  assert.equal(chrome.element("layoutGateOverlay").hidden, false);
+
+  chrome.sendFrameMessage({
+    artifact_load_token: chrome.artifactLoadToken(),
+    type: "lavish:layoutDiagnostics",
+    complete: true,
+    findings: [],
+  });
+  assert.equal(chrome.element("layoutGateOverlay").hidden, true);
+  assert.equal(chrome.element("layoutGateTitle").textContent, "Lavish is not running.");
+
+  chrome.eventSource().listeners.get("reload")();
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.element("layoutGateOverlay").hidden, false);
+  assert.equal(chrome.element("layoutGateBypass").hidden, false);
+  chrome.element("layoutGateBypass").click();
+  assert.equal(chrome.element("layoutGateOverlay").hidden, true);
+});
+
+test("a sticky failure cannot outlive the layout gate timeout", async () => {
+  const chrome = await createChromeWithDeadReplacement();
+  assert.equal(chrome.element("layoutGateOverlay").hidden, false);
+
+  chrome.runTimers(12000);
+  assert.equal(chrome.element("layoutGateOverlay").hidden, true);
+});
+
+test("a no-gate sticky failure reveals by pass, manual bypass, or timeout", async () => {
+  const completed = await createChromeWithDeadReplacement({ layoutGateEnabled: false });
+  assert.equal(completed.element("layoutGateOverlay").hidden, false);
+  completed.sendFrameMessage({
+    artifact_load_token: completed.artifactLoadToken(),
+    type: "lavish:layoutDiagnostics",
+    complete: true,
+    findings: [],
+  });
+  assert.equal(completed.element("layoutGateOverlay").hidden, true);
+
+  const bypassed = await createChromeWithDeadReplacement({ layoutGateEnabled: false });
+  bypassed.element("layoutGateBypass").click();
+  assert.equal(bypassed.element("layoutGateOverlay").hidden, true);
+
+  const timedOut = await createChromeWithDeadReplacement({ layoutGateEnabled: false });
+  timedOut.runTimers(12000);
+  assert.equal(timedOut.element("layoutGateOverlay").hidden, true);
+});
+
+test("a diagnostics network failure does not hold the visual gate", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).includes("/layout-diagnostics")) throw new Error("server replaced");
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.sendFrameMessage({ type: "lavish:layoutDiagnostics", complete: true, findings: [] });
+  assert.equal(chrome.element("layoutGateOverlay").hidden, true);
+});
+
+test("a layout pass lost to a token race requests a fresh pass", async () => {
+  const chrome = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html" });
+
+  chrome.sendFrameMessage({
+    artifact_load_token: "stale-load-token",
+    type: "lavish:layoutDiagnostics",
+    complete: true,
+    findings: [],
+  });
+  assert.equal(chrome.postedToFrame.at(-1).type, "lavish:requestLayoutDiagnostics");
+});
+
+function sendChromeOutdated(chrome, reason) {
+  chrome.eventSource().listeners.get("chrome-outdated")({
+    data: JSON.stringify(reason === undefined ? {} : { reason }),
+  });
+}
+
+test("an outdated chrome shows a dismissible banner and never reloads itself", async () => {
+  const chrome = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html" });
+
+  assert.equal(chrome.element("outdatedBanner").hidden, true);
+  const gateBefore = chrome.element("layoutGateOverlay").hidden;
+  sendChromeOutdated(chrome, "upgrade");
+  await flushPromises();
+
+  assert.equal(chrome.element("outdatedBanner").hidden, false);
+  assert.equal(chrome.element("layoutGateOverlay").hidden, gateBefore, "the banner never covers the artifact");
+  assert.equal(chrome.element("chatInput").disabled, false, "an outdated page can still write feedback");
+  chrome.runTimers();
+  await flushPromises();
+  assert.equal(chrome.reloadCount(), 0, "only the user may reload an outdated page");
+
+  chrome.element("outdatedDismiss").click();
+  assert.equal(chrome.element("outdatedBanner").hidden, true);
+
+  sendChromeOutdated(chrome, "upgrade");
+  await chrome.element("outdatedReload").click();
+  await flushPromises();
+  assert.equal(chrome.reloadCount(), 1);
+});
+
+test("the outdated banner says what actually happened to the server", async () => {
+  const chrome = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html" });
+
+  sendChromeOutdated(chrome, "upgrade");
+  assert.equal(
+    chrome.element("outdatedText").textContent,
+    "Lavish was updated. This page is running the previous version.",
+  );
+
+  sendChromeOutdated(chrome, "stop");
+  assert.equal(chrome.element("outdatedText").textContent, "Lavish was stopped. Reload after you start it again.");
+
+  sendChromeOutdated(chrome, "local-build");
+  const localBuild = chrome.element("outdatedText").textContent;
+  assert.match(localBuild, /local build/);
+  assert.doesNotMatch(localBuild, /updated/);
+
+  for (const unnamed of [undefined, "", "something-else"]) {
+    sendChromeOutdated(chrome, unnamed);
+    const copy = chrome.element("outdatedText").textContent;
+    assert.match(copy, /no longer running/);
+    assert.doesNotMatch(copy, /updated/);
+    assert.doesNotMatch(copy, /stopped/);
+  }
+});
+
+test("the outdated banner's reload asks the server before navigating", async () => {
+  let running = false;
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    fetchImpl: async (url) => {
+      if (String(url) === "/health" && !running) throw new Error("connection refused");
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  sendChromeOutdated(chrome, "stop");
+  await chrome.element("outdatedReload").click();
+  await flushPromises();
+  assert.equal(chrome.reloadCount(), 0);
+  assert.match(chrome.element("outdatedText").textContent, /still not running/);
+  assert.equal(chrome.element("outdatedReload").disabled, false);
+
+  running = true;
+  await chrome.element("outdatedReload").click();
+  await flushPromises();
+  assert.equal(chrome.reloadCount(), 1);
+});
+
+// Unsent annotation text is the user's writing. A restart-driven reload replays it, but the
+// interruption is still theirs to choose, and the banner names the same cause the shutdown gave.
+async function restartWithUnsentDraft(reason) {
+  let healthy = false;
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    fakeClock: true,
+    fetchImpl: async (url) => {
+      if (String(url) === "/health" && !healthy) throw new Error("connection refused");
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.sendFrameMessage({
+    artifact_load_token: chrome.artifactLoadToken(),
+    type: "lavish:reviewState",
+    state: { card: { selector: "#hero", text: "needs a shorter headline" }, fields: [] },
+  });
+  await flushPromises();
+
+  chrome.eventSource().listeners.get("chrome-reload")({
+    data: JSON.stringify(reason === undefined ? {} : { reason }),
+  });
+  await flushPromises();
+  chrome.runTimers(100);
+  await flushPromises();
+  healthy = true;
+  for (let i = 0; i < 3; i += 1) {
+    chrome.runTimers(100);
+    await flushPromises();
+  }
+  return chrome;
+}
+
+test("a restart reload with an unsent draft offers the banner instead of reloading", async () => {
+  const chrome = await restartWithUnsentDraft("upgrade");
+
+  assert.equal(chrome.reloadCount(), 0);
+  assert.equal(chrome.element("outdatedBanner").hidden, false);
+  assert.equal(
+    chrome.element("outdatedText").textContent,
+    "Lavish was updated. This page is running the previous version.",
+  );
+});
+
+test("the banner a held-back reload shows names the reason the shutdown gave", async () => {
+  const localBuild = await restartWithUnsentDraft("local-build");
+  assert.match(localBuild.element("outdatedText").textContent, /local build/);
+
+  const unnamed = await restartWithUnsentDraft(undefined);
+  const unnamedCopy = unnamed.element("outdatedText").textContent;
+  assert.match(unnamedCopy, /no longer running/);
+  assert.doesNotMatch(unnamedCopy, /updated/);
+});
+
+// A full page reload used to destroy an annotation draft: the chrome kept it in memory only,
+// while queued prompts were already persisted per session.
+test("an unsent annotation draft survives a full page reload", async () => {
+  const storage = new Map();
+  const first = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html", storage });
+
+  first.sendFrameMessage({
+    artifact_load_token: first.artifactLoadToken(),
+    type: "lavish:reviewState",
+    state: { card: { selector: "#hero", text: "needs a shorter headline" }, fields: [] },
+  });
+  await flushPromises();
+
+  const second = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html", storage });
+  const restored = second.postedToFrame.filter((message) => message.type === "lavish:restoreReviewState");
+  assert.equal(restored.length, 1, "the reloaded chrome replays the draft into the new document");
+  assert.equal(restored[0].state.card.text, "needs a shorter headline");
+  assert.equal(restored[0].state.card.selector, "#hero");
+});
+
+test("a queued or cancelled card leaves no draft behind for the next page load", async () => {
+  const storage = new Map();
+  const first = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html", storage });
+
+  first.sendFrameMessage({
+    artifact_load_token: first.artifactLoadToken(),
+    type: "lavish:reviewState",
+    state: { card: { selector: "#hero", text: "needs a shorter headline" }, fields: [] },
+  });
+  await flushPromises();
+  first.sendFrameMessage({
+    artifact_load_token: first.artifactLoadToken(),
+    type: "lavish:reviewState",
+    state: { card: null, fields: [] },
+  });
+  await flushPromises();
+
+  const second = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html", storage });
+  assert.deepEqual(
+    second.postedToFrame.filter((message) => message.type === "lavish:restoreReviewState"),
+    [],
+  );
+});
+
+test("a draft never leaks from one artifact into another", async () => {
+  const storage = new Map();
+  const first = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html", storage });
+
+  first.sendFrameMessage({
+    artifact_load_token: first.artifactLoadToken(),
+    type: "lavish:reviewState",
+    state: { card: { selector: "#hero", text: "needs a shorter headline" }, fields: [] },
+  });
+  await flushPromises();
+
+  const other = await createChromeHarness({
+    artifactSrc: "/artifact/def/index.html",
+    sessionData: { ...defaultSessionData, key: "def" },
+    storage,
+  });
+  assert.deepEqual(
+    other.postedToFrame.filter((message) => message.type === "lavish:restoreReviewState"),
+    [],
+  );
+});
+
+// Drives one live-reload, which the harness answers with a fresh artifact revision and token.
+async function reloadArtifactOnce(chrome) {
+  chrome.eventSource().listeners.get("reload")();
+  await flushPromises();
+  await flushPromises();
+}
+
+// A draft whose anchor the agent removed can never be replayed, so it must not be retried against
+// every later load. Two artifact revisions have to agree that it is gone.
+test("a draft the artifact can no longer anchor is retired after a second revision says so", async () => {
+  const storage = new Map();
+  const chrome = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html", storage });
+
+  chrome.sendFrameMessage({
+    artifact_load_token: chrome.artifactLoadToken(),
+    type: "lavish:reviewState",
+    state: { card: { selector: "#hero", text: "needs a shorter headline" }, fields: [] },
+  });
+  await flushPromises();
+
+  chrome.sendFrameMessage({ type: "lavish:reviewDraftUnrestorable", selector: "#hero" });
+  assert.ok(storage.get("lavish-axi:review-state:abc"), "one miss only records the answer");
+  // The same revision reporting again is the same answer twice, not two answers.
+  chrome.sendFrameMessage({ type: "lavish:reviewDraftUnrestorable", selector: "#hero" });
+  assert.ok(storage.get("lavish-axi:review-state:abc"));
+
+  await reloadArtifactOnce(chrome);
+  chrome.sendFrameMessage({ type: "lavish:reviewDraftUnrestorable", selector: "#hero" });
+
+  assert.equal(storage.has("lavish-axi:review-state:abc"), false, "the retired draft is no longer stored");
+  assert.deepEqual(JSON.parse(storage.get("lavish-axi:retired-drafts:abc")), ["needs a shorter headline"]);
+  const notes = chrome.element("chatLog").children.filter((child) => child.className === "bubble note");
+  assert.equal(notes.length, 1);
+  assert.match(notes[0].innerHTML, /needs a shorter headline/);
+  assert.equal(chrome.element("chatInput").value, "", "the handback never touches the composer");
+
+  // The handback is the only copy left, so it survives a page reload too.
+  const reloaded = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html", storage });
+  const reloadedNotes = reloaded.element("chatLog").children.filter((child) => child.className === "bubble note");
+  assert.equal(reloadedNotes.length, 1);
+});
+
+test("an anchor that comes back on a later revision keeps its draft", async () => {
+  const storage = new Map();
+  const chrome = await createChromeHarness({ artifactSrc: "/artifact/abc/index.html", storage });
+
+  chrome.sendFrameMessage({
+    artifact_load_token: chrome.artifactLoadToken(),
+    type: "lavish:reviewState",
+    state: { card: { selector: "#hero", text: "needs a shorter headline" }, fields: [] },
+  });
+  await flushPromises();
+  chrome.sendFrameMessage({ type: "lavish:reviewDraftUnrestorable", selector: "#hero" });
+
+  // The next load has the element again and the SDK reports the card as restored.
+  await reloadArtifactOnce(chrome);
+  chrome.sendFrameMessage({
+    artifact_load_token: chrome.artifactLoadToken(),
+    type: "lavish:reviewState",
+    state: { card: { selector: "#hero", text: "needs a shorter headline" }, fields: [] },
+  });
+  await reloadArtifactOnce(chrome);
+  chrome.sendFrameMessage({ type: "lavish:reviewDraftUnrestorable", selector: "#hero" });
+
+  assert.equal(JSON.parse(storage.get("lavish-axi:review-state:abc")).card.text, "needs a shorter headline");
+  assert.equal(storage.has("lavish-axi:retired-drafts:abc"), false);
+});
+
+test("a load that recovers after the failure card retires it even when the gate was bypassed", async () => {
+  const beginLoadResponses = [];
+  for (let i = 0; i < 15; i += 1) beginLoadResponses.push({ ok: false, status: 503 });
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    beginLoadResponses,
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+
+  await exhaustOneBeginLoadAttempt(chrome);
+  chrome.element("layoutGateAction").click();
+  for (const delay of [1000, 3000, 8000, 20000]) {
+    chrome.runTimers(delay);
+    await exhaustOneBeginLoadAttempt(chrome);
+  }
+  assert.equal(chrome.element("layoutGateOverlay").hidden, false);
+  assert.equal(chrome.element("layoutGateTitle").textContent, "Lavish could not load this artifact.");
+
+  chrome.element("reloadArtifact").click();
+  await flushPromises();
+  assert.match(chrome.frame.src, /artifact_load_token=/);
+  assert.equal(chrome.element("layoutGateOverlay").hidden, true);
+  assert.equal(chrome.element("layoutGateAction").textContent, "Show anyway");
 });
 
 test("exhausted begin-load retries preserve the previous frame without waking the agent", async () => {

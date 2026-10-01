@@ -65,6 +65,10 @@ const designAssetUrls = {
 };
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
+// The reasons a caller may name for shutting this server down. Each one drives a different line
+// in the chrome's outdated banner, so an unknown value is dropped rather than passed through to
+// text the user would read as a fact.
+const SHUTDOWN_REASONS = new Set(["upgrade", "local-build", "stop"]);
 // An escaped popup can navigate to an artifact-owned HTML or SVG asset on the
 // server origin. Keep every artifact response sandboxed at the response layer
 // so active documents stay opaque-origin even when they are top-level.
@@ -193,9 +197,15 @@ export async function serve({
   });
 
   app.post("/shutdown", (req, res) => {
+    // The caller names the session it is about to reopen, and only that session's chrome is
+    // reloaded. A call that names none reloads nothing. It also names why it is shutting this
+    // server down, because the banner every other chrome shows has to be true for that reason;
+    // an unrecognized or absent reason claims nothing beyond "this server is gone".
+    const reloadKey = String(req.body?.reload_key || "");
+    const reason = SHUTDOWN_REASONS.has(String(req.body?.reason || "")) ? String(req.body.reason) : "";
     res.json({ status: "shutting-down" });
     // Defer until after the response flushes so the client gets confirmation.
-    setImmediate(shutdown);
+    setImmediate(() => shutdown(reloadKey, reason));
   });
 
   app.post("/api/sessions", async (req, res, next) => {
@@ -899,19 +909,26 @@ export async function serve({
   });
   publicPort = httpServer.address().port;
 
-  function shutdown() {
+  function shutdown(reloadKey = "", reason = "") {
     if (shuttingDown) return;
     shuttingDown = true;
     if (idleTimer) {
       clearTimeout(idleTimer);
       idleTimer = null;
     }
-    // Tell open browser chromes to reload before we drop their SSE connection. The new
-    // server adopts the session via state.json once it binds, so the reloaded chrome
-    // immediately gets the upgraded HTML/CSS/JS.
-    for (const res of sseClients.keys()) {
+    // Only the chrome whose artifact is being reopened is reloaded: the replacement server
+    // adopts that session via state.json once it binds, and the caller named it. Every other
+    // open review page is told why this server went away and left alone - a forced reload of a
+    // page the user is reading or writing in is exactly what this avoids. Both events carry the
+    // same reason so two pages never describe one shutdown differently.
+    const shutdownData = JSON.stringify({ reason });
+    for (const [res, clientKey] of sseClients) {
       try {
-        res.write("event: chrome-reload\ndata: {}\n\n");
+        if (reloadKey && clientKey === reloadKey) {
+          res.write(`event: chrome-reload\ndata: ${shutdownData}\n\n`);
+        } else {
+          res.write(`event: chrome-outdated\ndata: ${shutdownData}\n\n`);
+        }
         res.end();
       } catch {
         // best effort
@@ -1489,6 +1506,59 @@ export function extractArtifactHead(html) {
   return { faviconTag, title };
 }
 
+// The chrome page ships with the layout-gate overlay already covering the artifact area. Install
+// its bounded escape and manual bypass inline before `chrome-client.js`, so they still work if the
+// shared server shuts down between serving the page and serving that script. This block also arms
+// the boot-failure card before the external script tag, surviving a request that hangs instead of
+// erroring; `chrome-client.js` cancels that boot timer once it has run to completion and reuses the
+// gate escape for every later overlay state.
+export const CHROME_BOOT_FAILSAFE_MS = 15000;
+export const CHROME_LAYOUT_GATE_MAX_HOLD_MS = 12000;
+// The failsafe's button is the only control on a page whose client script is dead, so its own
+// probe is bounded too: a port that accepts and never answers must not disable it for good.
+const CHROME_BOOT_FAILSAFE_PROBE_TIMEOUT_MS = 4000;
+const CHROME_BOOT_FAILSAFE_JS = `(function(){
+var t=setTimeout(fail,${CHROME_BOOT_FAILSAFE_MS});
+var o=document.getElementById("layoutGateOverlay"),h,c,a,b,gt=0,manual=false,ended=false;
+try{ended=JSON.parse(document.getElementById("lavish-session").textContent).initialEnded===true;}catch(e){}
+function cancelGate(){if(gt)clearTimeout(gt);gt=0;}
+function reveal(){cancelGate();if(o)o.hidden=true;if(document.body)document.body.classList.remove("layout-gate-active");}
+function manualReveal(){if(ended)return false;manual=true;reveal();return true;}
+function armGate(ms,onTimeout){cancelGate();if(!ended)gt=setTimeout(function(){if(ended)return;if(onTimeout)onTimeout();else reveal();},ms);}
+function showBypass(){b=document.getElementById("layoutGateBypass");if(b){b.hidden=false;b.onclick=manualReveal;}}
+window.__lavishLayoutGateEscape={arm:armGate,cancel:cancelGate,reveal:reveal,manualReveal:manualReveal,showBypass:showBypass,end:function(){ended=true;cancelGate();},isEnded:function(){return ended;},isManuallyBypassed:function(){return manual;}};
+a=document.getElementById("layoutGateAction");
+if(ended){reveal();b=document.getElementById("endedOverlay");if(b)b.hidden=false;}
+if(a&&!ended)a.onclick=manualReveal;
+if(o&&!o.hidden&&!ended)armGate(${CHROME_LAYOUT_GATE_MAX_HOLD_MS});
+window.__lavishCancelChromeBootFailsafe=function(){clearTimeout(t);};
+window.__lavishChromeBootFailed=function(){clearTimeout(t);fail();};
+function fail(){
+if(window.__lavishChromeReady||ended)return;
+h=document.getElementById("layoutGateTitle");
+c=document.getElementById("layoutGateCopy");
+a=document.getElementById("layoutGateAction");
+if(h)h.textContent="Lavish could not finish loading.";
+if(c)c.textContent="The Lavish editor script did not load. The server usually restarted while this page was opening. Check and reload to reconnect.";
+if(a){a.textContent="Check and reload";a.disabled=false;a.onclick=check;}
+showBypass();
+if(o)o.hidden=false;
+if(document.body)document.body.classList.add("layout-gate-active");
+armGate(${CHROME_LAYOUT_GATE_MAX_HOLD_MS});
+}
+function check(){
+if(a)a.disabled=true;
+var ctl=new AbortController();
+var pt=setTimeout(function(){ctl.abort();},${CHROME_BOOT_FAILSAFE_PROBE_TIMEOUT_MS});
+fetch("/health",{cache:"no-store",signal:ctl.signal}).then(function(r){return r&&r.ok?"running":"not-running";},function(){return ctl.signal.aborted?"no-answer":"not-running";}).then(function(outcome){
+clearTimeout(pt);
+if(outcome==="running"){location.reload();return;}
+if(a)a.disabled=false;
+if(c)c.textContent=outcome==="no-answer"?"Lavish did not answer the check, so this page cannot tell whether it is running. Try again in a moment.":"Lavish is still not running. Start it again with your agent, then use Check and reload.";
+});
+}
+})();`;
+
 export function createChromeHtml(
   session,
   {
@@ -1536,11 +1606,12 @@ ${faviconTag}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
-<div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>
 <script id="lavish-session" type="application/json">${sessionJson}</script>
-<script src="/chrome-client.js"></script>
+<script>${CHROME_BOOT_FAILSAFE_JS}</script>
+<script src="/chrome-client.js" onerror="window.__lavishChromeBootFailed()"></script>
 </body>
 </html>`;
 }

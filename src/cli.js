@@ -279,7 +279,10 @@ async function openCommand(args) {
   const absolute = await canonicalFile(file);
   const noGate = args.includes("--no-gate");
   const reopen = args.includes("--reopen");
-  const baseUrl = await ensureServer({ forceRestart: shouldForceRestartForLocalBuild(process.argv[1] || "") });
+  const baseUrl = await ensureServer({
+    forceRestart: shouldForceRestartForLocalBuild(process.argv[1] || ""),
+    reloadKey: sessionKey(absolute),
+  });
   const response = await postJson(`${baseUrl}/api/sessions`, { file: absolute, noGate, reopen });
   if (response.status === "user-ended") {
     return createUserEndedOpenOutput({ file: absolute, url: response.url });
@@ -652,7 +655,7 @@ export async function shutdownServerOnPort(
   if (!(await canControlServerOnPort(port, health, processMatchesLavish))) {
     return { server: { status: "not-lavish", port } };
   }
-  await shutdownRequester(baseUrl);
+  await shutdownRequester(baseUrl, { reason: "stop" });
   let freed = await portFreeWaiter(baseUrl, 3000);
   if (!freed && shouldKillProcessOnPort(currentVersion, health)) {
     portKiller(port);
@@ -845,7 +848,9 @@ function isHtmlPath(file) {
   return file.toLowerCase().endsWith(".html") || file.toLowerCase().endsWith(".htm");
 }
 
-async function ensureServer({ forceRestart = false } = {}) {
+// `reloadKey` names the session this invocation is about to open. A version-driven replacement
+// reloads that chrome only; every other open review page is told it is outdated and left alone.
+async function ensureServer({ forceRestart = false, reloadKey = "" } = {}) {
   const port = defaultPort();
   const baseUrl = `http://${hostForUrl(clientHost())}:${port}`;
   const existing = await fetchHealth(baseUrl);
@@ -861,7 +866,10 @@ async function ensureServer({ forceRestart = false } = {}) {
     }
     // Stale server from an older release is squatting on the port. Ask it to shut down
     // gracefully so the upgraded client doesn't keep handing users an old chrome.
-    await requestShutdown(baseUrl);
+    await requestShutdown(baseUrl, {
+      reloadKey,
+      reason: serverReplacementReason(VERSION, existing, forceRestart, build),
+    });
     const freed = await waitForPortFree(baseUrl, 2000);
     if (!freed) {
       // Pre-handshake servers (any release older than this change) don't expose /shutdown
@@ -900,6 +908,18 @@ export function shouldRestartServer(currentVersion, healthBody, forceRestart = f
   }
   if (typeof healthBody.version !== "string" || healthBody.version === "") return true;
   return healthBody.version !== currentVersion;
+}
+
+// Which branch of `shouldRestartServer` actually fired, because that is what the other open
+// review pages are told. A local-build force replaces a server of the SAME version, so calling it
+// an upgrade would be false on both counts; only a version this CLI does not match is one.
+export function serverReplacementReason(currentVersion, healthBody, forceRestart = false, currentBuild = undefined) {
+  if (!shouldRestartServer(currentVersion, healthBody, forceRestart, currentBuild)) return "";
+  const runningVersion = healthBody.version;
+  if (typeof runningVersion !== "string" || runningVersion === "" || runningVersion !== currentVersion) {
+    return "upgrade";
+  }
+  return "local-build";
 }
 
 export function shouldForceRestartForLocalBuild(
@@ -975,9 +995,18 @@ async function fetchHealth(baseUrl) {
   }
 }
 
-async function requestShutdown(baseUrl) {
+// `reason` is what every other open review page is told: this has exactly two callers, and each
+// knows which of them it is.
+async function requestShutdown(baseUrl, { reloadKey = "", reason = "" } = {}) {
+  const body = {};
+  if (reloadKey) body.reload_key = reloadKey;
+  if (reason) body.reason = reason;
   try {
-    await fetch(`${baseUrl}/shutdown`, { method: "POST" });
+    await fetch(`${baseUrl}/shutdown`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
   } catch {
     // Best effort. If the server died before answering, the port will free up on its own.
   }
