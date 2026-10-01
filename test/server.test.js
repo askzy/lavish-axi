@@ -1320,6 +1320,9 @@ test("buildAllowedHostnames covers loopback, bind/link host, and explicit extras
   const wildcard = buildAllowedHostnames({ host: "0.0.0.0", linkHost: "127.0.0.1" });
   assert.equal(wildcard.has("0.0.0.0"), false);
   assert.ok(wildcard.has("127.0.0.1"));
+  const ipv6Wildcard = buildAllowedHostnames({ host: "[::]", linkHost: "127.0.0.1" });
+  assert.equal(ipv6Wildcard.has("[::]"), false);
+  assert.equal(ipv6Wildcard.has("::"), false);
 
   // Explicit extras are lowercased; the "*" sentinel is not a literal hostname.
   const extras = buildAllowedHostnames({
@@ -1892,6 +1895,92 @@ test("reopening a session preserves the existing chrome handoff and artifact loa
     assert.equal(preservedDocument.status, 200);
     assert.equal(secondLoad.artifact_revision, firstLoad.artifact_revision + 1);
     assert.equal((await fetch(artifactLoadUrl(base, key, secondLoad))).status, 200);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("mutating routes reject a present foreign Origin while allowing same-origin and header-less callers", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionBody = JSON.stringify({ file: artifact });
+
+    // A foreign page can reach loopback (Host still names 127.0.0.1) but the browser attaches
+    // the real Origin. Mutating routes must not honor that CSRF.
+    const foreignOpen = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://attacker.example" },
+      body: sessionBody,
+    });
+    assert.equal(foreignOpen.status, 403);
+    assert.deepEqual(await foreignOpen.json(), { error: "cross-origin request rejected" });
+
+    const foreignReferer = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", referer: "https://attacker.example/page" },
+      body: sessionBody,
+    });
+    assert.equal(foreignReferer.status, 403);
+    assert.deepEqual(await foreignReferer.json(), { error: "cross-origin request rejected" });
+
+    // Same-origin chrome POSTs still succeed.
+    const sameOriginOpen = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: sessionBody,
+    });
+    assert.equal(sameOriginOpen.status, 200);
+    const { key } = await sameOriginOpen.json();
+
+    // Every browser-reachable mutating route, including the fork-only ones, is behind the guard.
+    for (const route of [
+      `/api/${key}/prompts`,
+      `/api/${key}/ack`,
+      `/api/${key}/agent-reply`,
+      `/api/${key}/layout-warnings/queue`,
+      `/api/${key}/end`,
+      "/api/end",
+      "/shutdown",
+    ]) {
+      const foreign = await fetch(`${base}${route}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: "https://attacker.example" },
+        body: "{}",
+      });
+      assert.equal(foreign.status, 403, route);
+      assert.deepEqual(await foreign.json(), { error: "cross-origin request rejected" }, route);
+    }
+
+    // CLI control channel: no Origin/Referer. The Host allowlist is the gate.
+    const cliOpen = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: sessionBody,
+    });
+    assert.equal(cliOpen.status, 200);
+
+    // DNS rebinding: a forged Host is still the Host allowlist's job.
+    const forgedHost = await rawRequest(server.port, "/api/sessions", {
+      method: "POST",
+      host: `evil.example:${server.port}`,
+      body: sessionBody,
+    });
+    assert.equal(forgedHost.status, 403);
+    assert.deepEqual(JSON.parse(forgedHost.body), { error: "forbidden host" });
+
+    // Safe methods skip the origin guard.
+    const health = await fetch(`${base}/health`, { headers: { origin: "https://attacker.example" } });
+    assert.equal(health.status, 200);
+
+    // The per-route handoff check still rejects header-less callers with its own error.
+    const headerless = await fetch(`${base}/api/${key}/chrome-loads/begin`, { method: "POST" });
+    assert.equal(headerless.status, 403);
+    assert.deepEqual(await headerless.json(), { error: "cross-origin chrome handoff rejected" });
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });

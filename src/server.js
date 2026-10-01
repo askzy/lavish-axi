@@ -158,6 +158,27 @@ export async function serve({
     });
   }
 
+  // CSRF defense-in-depth on top of the Host allowlist. A foreign page that can reach
+  // 127.0.0.1 passes the Host check, but the browser attaches the real Origin, so mutating
+  // requests with a present, non-matching Origin or Referer are rejected. Header-less CLI
+  // control-channel requests have no Origin and are allowed; the Host allowlist remains their
+  // gate. Routes that already call isSameOriginRequest keep those checks - they also reject
+  // header-less callers, and this middleware does not replace them.
+  app.use((req, res, next) => {
+    if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") {
+      next();
+      return;
+    }
+    if (hasPresentOriginOrReferer(req) && !isSameOriginRequest(req)) {
+      logEvent?.(
+        `rejected cross-origin request origin=${req.get("origin") ?? ""} referer=${req.get("referer") ?? ""} path=${req.path}`,
+      );
+      res.status(403).json({ error: "cross-origin request rejected" });
+      return;
+    }
+    next();
+  });
+
   app.use(express.json({ limit: "2mb" }));
 
   app.get("/health", (req, res) => {
@@ -997,7 +1018,7 @@ function encodeRfc5987Value(value) {
 // Wildcard bind addresses ("all interfaces") are not connectable hostnames, so
 // they never belong in the Host allowlist - and "0.0.0.0" as a Host is a known
 // loopback-reach trick, so it must stay rejected.
-const WILDCARD_BIND_HOSTS = new Set(["0.0.0.0", "::"]);
+const WILDCARD_BIND_HOSTS = new Set(["0.0.0.0", "::", "[::]"]);
 
 // The set of Host header hostnames this server answers to: loopback names plus
 // the resolved bind and link host and any explicit LAVISH_AXI_ALLOWED_HOSTS
@@ -1074,9 +1095,15 @@ export function isAllowedRequestHost({ host, forwardedHost }, allowedHostnames) 
   return isAllowedHostHeader(forwarded.split(",").pop(), allowedHostnames);
 }
 
+function hasPresentOriginOrReferer(req) {
+  return Boolean(req.get("origin") || req.get("referer"));
+}
+
 // Guard state-changing routes against CSRF: a browser attaches an Origin/Referer that must match
 // this server's own origin. Upstream introduced this for the ht-ml.app publish route, which this
-// fork disables; the reviewer-handoff route (#210) needs the same guard, so it stays.
+// fork disables; the reviewer-handoff route (#210) needs the same guard, so it stays. The global
+// mutating-route middleware reuses it too; that middleware is lenient (absent headers pass) while
+// per-route callers still reject header-less requests.
 function isSameOriginRequest(req) {
   const expectedOrigin = `${req.protocol}://${req.get("host")}`;
   const origin = req.get("origin");
