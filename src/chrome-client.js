@@ -21,6 +21,25 @@ const internalQueueKeyField = "_lavishQueueKey";
 const initialChat = Array.isArray(sessionData.initialChat) ? sessionData.initialChat : [];
 const MODE_TOGGLE_HOTKEY_KEY = String(sessionData.modeToggleHotkeyKey || "").toLowerCase();
 const attachmentMaxBytes = Number(sessionData.attachmentMaxBytes) || 0;
+const attachmentMaxCount = Number(sessionData.attachmentMaxCount) || 4;
+// Threaded from the server's single accepted-image list, which also drives the
+// file picker's accept attribute, so the two can never disagree. An unwired
+// list falls back to the same defaults as the SDK's acceptedImageTypes - an
+// empty Set would refuse every image while the card in the same session
+// accepts them, the exact divergence the single list exists to prevent.
+const CHAT_ATTACHMENT_MIME = new Set(
+  (Array.isArray(sessionData.attachmentAcceptedMime) && sessionData.attachmentAcceptedMime.length
+    ? sessionData.attachmentAcceptedMime
+    : ["image/png", "image/jpeg", "image/webp"]
+  ).map(String),
+);
+// Named in the rejection copy, so the message can never tell the user to use a
+// format this build does not accept.
+const CHAT_ATTACHMENT_LABELS = (() => {
+  const labels = [...CHAT_ATTACHMENT_MIME].map((mime) => mime.replace(/^image\//, "").toUpperCase());
+  if (labels.length < 2) return labels.join("");
+  return labels.slice(0, -1).join(", ") + (labels.length > 2 ? ", or " : " or ") + labels[labels.length - 1];
+})();
 
 // The chrome is the only path from the sandboxed (opaque-origin) artifact iframe to
 // the loopback server, so it is the sole place a same-origin confused-deputy can be
@@ -56,10 +75,10 @@ function describeAttachmentRejection(rejected, caps) {
   const reasons = new Set(rejected.map((ref) => ref && ref.reason));
   const parts = [];
   if (reasons.has("prompt-bytes-exceeded") && caps && caps.maxPromptBytes) {
-    parts.push("images exceed the " + formatByteLimit(caps.maxPromptBytes) + " per-annotation limit");
+    parts.push("images exceed the " + formatByteLimit(caps.maxPromptBytes) + " per-prompt limit");
   }
   if (reasons.has("too-many") && caps && caps.maxPerPrompt) {
-    parts.push("more than " + caps.maxPerPrompt + " images on one annotation");
+    parts.push("more than " + caps.maxPerPrompt + " images on one prompt");
   }
   if (reasons.has("too-many-in-request")) {
     parts.push("too many images queued at once");
@@ -85,6 +104,10 @@ const annotationPills = /** @type {HTMLDivElement} */ (document.getElementById("
 const chatLog = /** @type {HTMLDivElement} */ (document.getElementById("chatLog"));
 const chatInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("chatInput"));
 const chatComposer = /** @type {HTMLDivElement} */ (document.getElementById("chatComposer"));
+const chatAttachments = /** @type {HTMLDivElement} */ (document.getElementById("chatAttachments"));
+const chatAttachButton = /** @type {HTMLButtonElement} */ (document.getElementById("chatAttach"));
+const chatAttachInput = /** @type {HTMLInputElement} */ (document.getElementById("chatAttachInput"));
+const chatAttachmentNotice = /** @type {HTMLSpanElement} */ (document.getElementById("chatAttachmentNotice"));
 const panel = /** @type {HTMLElement} */ (document.getElementById("panel"));
 const panelHead = /** @type {HTMLDivElement} */ (document.getElementById("panelHead"));
 const panelSummary = /** @type {HTMLSpanElement} */ (document.getElementById("panelSummary"));
@@ -341,7 +364,10 @@ function render() {
       const showLocator = targetLabel && prompt.selector && targetLabel !== prompt.selector;
       return (
         '<div class="pill-wrap"><div class="pill"><span class="pill-preview">' +
-        escapeHtml(prompt.prompt || (attachmentCount(prompt) ? "Image annotation" : "")) +
+        escapeHtml(
+          prompt.prompt ||
+            (attachmentCount(prompt) ? (prompt.tag === "message" ? "Image message" : "Image annotation") : ""),
+        ) +
         "</span>" +
         pillAttachmentsHtml(prompt) +
         '<button class="pill-close" type="button" aria-label="Remove queued prompt" data-index="' +
@@ -923,25 +949,237 @@ function expireSnapshotRequest(request) {
   submitQueued();
 }
 
+function createChatAttachmentsController() {
+  const items = [];
+  let nextId = 0;
+  let capRejected = false;
+  let sendBlocked = false;
+
+  function currentImageCount() {
+    return items.filter((item) => item.file && CHAT_ATTACHMENT_MIME.has(item.file.type)).length;
+  }
+
+  function renderAttachments() {
+    chatAttachments.innerHTML = items
+      .map((item) => {
+        const status = item.status === "uploading" ? "Uploading…" : item.status === "error" ? item.error : "";
+        const preview = item.preview
+          ? '<img class="chat-attachment-thumb" src="' + escapeHtml(item.preview) + '" alt="">'
+          : "";
+        const retry =
+          item.status === "error" && item.file
+            ? '<button type="button" aria-label="Retry ' +
+              escapeHtml(item.name) +
+              '" data-chat-attachment-retry="' +
+              item.localId +
+              '">Retry</button>'
+            : "";
+        const errorData = item.errorCode ? ' data-error="' + escapeHtml(item.errorCode) + '"' : "";
+        return (
+          '<div class="chat-attachment-chip chat-attachment-' +
+          item.status +
+          '"' +
+          errorData +
+          ">" +
+          preview +
+          '<span class="chat-attachment-copy"><strong>' +
+          escapeHtml(item.name) +
+          "</strong>" +
+          (status ? '<span class="chat-attachment-status" aria-live="polite">' + escapeHtml(status) + "</span>" : "") +
+          "</span>" +
+          retry +
+          '<button type="button" aria-label="Remove ' +
+          escapeHtml(item.name) +
+          '" title="Remove ' +
+          escapeHtml(item.name) +
+          '" data-chat-attachment-remove="' +
+          item.localId +
+          '">×</button></div>'
+        );
+      })
+      .join("");
+    syncNotice();
+  }
+
+  // The notice is DERIVED from the current item states on every render, never
+  // written imperatively by a caller: a blocked send that only stamped a string
+  // went stale the moment the pending upload it described failed, leaving the
+  // user waiting on an upload that was already over.
+  function syncNotice() {
+    if (currentImageCount() < attachmentMaxCount) capRejected = false;
+    const pending = items.some((item) => item.status === "uploading");
+    const errored = items.some((item) => item.status === "error");
+    if (!pending && !errored) sendBlocked = false;
+    chatAttachmentNotice.textContent =
+      sendBlocked && pending
+        ? "Waiting for an image to finish uploading…"
+        : sendBlocked && errored
+          ? "An image couldn't be attached. Retry or remove it before sending."
+          : capRejected
+            ? "You can attach up to " + attachmentMaxCount + " image" + (attachmentMaxCount === 1 ? "" : "s") + "."
+            : "";
+  }
+
+  async function startUpload(item) {
+    const abortController = new AbortController();
+    item.abortController = abortController;
+    item.status = "uploading";
+    item.error = "";
+    renderAttachments();
+    try {
+      const bytes = await item.file.arrayBuffer();
+      if (!items.includes(item)) return;
+      await uploadAttachment(
+        { localId: item.localId, bytes, mime: item.file.type },
+        (result) => {
+          if (!items.includes(item)) return;
+          if (result.ok && result.id) {
+            item.status = "ready";
+            item.id = result.id;
+          } else {
+            item.status = "error";
+            item.error = String(result.error || "Upload failed");
+          }
+          renderAttachments();
+        },
+        abortController.signal,
+      );
+    } catch (error) {
+      if (!items.includes(item)) return;
+      item.status = "error";
+      item.error = error instanceof Error ? error.message : String(error);
+      renderAttachments();
+    }
+  }
+
+  function addFiles(files) {
+    let added = false;
+    let imageCount = currentImageCount();
+    for (const file of Array.from(files || [])) {
+      if (!CHAT_ATTACHMENT_MIME.has(String(file.type || ""))) continue;
+      const tooLarge = attachmentMaxBytes > 0 && Number(file.size) > attachmentMaxBytes;
+      // The cap counts only chips that can upload, mirroring currentImageCount:
+      // if a size-refused chip (file: null) consumed a slot here, syncNotice
+      // would clear the cap notice on the same render tick and a valid image
+      // later in the batch would vanish with no chip and no explanation.
+      if (!tooLarge && imageCount >= attachmentMaxCount) {
+        capRejected = true;
+        continue;
+      }
+      const localId = String(nextId++);
+      const item = {
+        localId,
+        file: tooLarge ? null : file,
+        name: String(file.name || "image"),
+        preview: tooLarge ? "" : URL.createObjectURL(file),
+        status: tooLarge ? "error" : "uploading",
+        error: tooLarge ? "Image is larger than the " + formatByteLimit(attachmentMaxBytes) + " limit" : "",
+        errorCode: "",
+        id: "",
+        abortController: /** @type {AbortController | null} */ (null),
+      };
+      items.push(item);
+      if (!tooLarge) imageCount += 1;
+      added = true;
+      if (!tooLarge) startUpload(item);
+    }
+    renderAttachments();
+    return added;
+  }
+
+  function rejectUnsupported(files) {
+    for (const file of Array.from(files || [])) {
+      if (CHAT_ATTACHMENT_MIME.has(String(file.type || ""))) continue;
+      items.push({
+        localId: String(nextId++),
+        file: null,
+        name: String(file.name || "file"),
+        preview: "",
+        status: "error",
+        error: "Unsupported file type. Use " + CHAT_ATTACHMENT_LABELS + ".",
+        errorCode: "UNSUPPORTED_TYPE",
+        id: "",
+        abortController: /** @type {AbortController | null} */ (null),
+      });
+    }
+    renderAttachments();
+  }
+
+  function remove(localId) {
+    const index = items.findIndex((item) => item.localId === localId);
+    if (index < 0) return;
+    const [item] = items.splice(index, 1);
+    item.abortController?.abort();
+    if (item.preview) URL.revokeObjectURL(item.preview);
+    renderAttachments();
+  }
+
+  function reset() {
+    for (const item of items) {
+      item.abortController?.abort();
+      if (item.preview) URL.revokeObjectURL(item.preview);
+    }
+    items.length = 0;
+    capRejected = false;
+    sendBlocked = false;
+    renderAttachments();
+  }
+
+  return {
+    addFiles,
+    rejectUnsupported,
+    remove,
+    retry(localId) {
+      const item = items.find((candidate) => candidate.localId === localId);
+      if (item?.file) startUpload(item);
+    },
+    hasPending: () => items.some((item) => item.status === "uploading"),
+    hasErrors: () => items.some((item) => item.status === "error"),
+    noteSendBlocked() {
+      sendBlocked = true;
+      syncNotice();
+    },
+    collectReady: () =>
+      items.filter((item) => item.status === "ready").map((item) => ({ id: item.id, name: item.name })),
+    reset,
+  };
+}
+
+const chatAttachmentController = createChatAttachmentsController();
+
 function sendQueued(endAfter) {
   if (ended || agentPresence === "working") return;
   closeMenus();
 
-  const text = chatInput.value.trim();
-  if (text) {
-    queued.push({ uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" });
-    persistQueuedPrompts();
-    addChat("user", text);
-    chatInput.value = "";
-    render();
+  // A pending or failed chip holds back only the COMPOSER message (and an
+  // explicit end, which would strand the chips) - queued annotation prompts
+  // still deliver, mirroring how the annotation card holds only its own card
+  // open. Gating the whole pipeline here made Send and Send & End silently
+  // deliver nothing while the only signal sat in the composer toolbar.
+  const chipsBlocked = chatAttachmentController.hasPending() || chatAttachmentController.hasErrors();
+  if (chipsBlocked) chatAttachmentController.noteSendBlocked();
+
+  if (!chipsBlocked) {
+    const text = chatInput.value.trim();
+    const attachments = chatAttachmentController.collectReady();
+    if (text || attachments.length) {
+      const prompt = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
+      if (attachments.length) prompt.attachments = attachments;
+      queued.push(prompt);
+      persistQueuedPrompts();
+      addChat("user", text || "Image message");
+      chatInput.value = "";
+      chatAttachmentController.reset();
+      render();
+    }
   }
   if (!queued.length) {
-    showSendHint();
+    if (!chipsBlocked) showSendHint();
     return;
   }
   hideSendHint();
 
-  if (endAfter) endAfterSubmit = true;
+  if (endAfter && !chipsBlocked) endAfterSubmit = true;
   requestSnapshot("submit");
 }
 
@@ -2048,7 +2286,7 @@ window.addEventListener("message", (event) => {
 // The sandboxed artifact iframe can't reach the loopback server (opaque origin),
 // so it hands captured image bytes here and the chrome performs the same-origin
 // upload, then reports the server-vetted id back to the card.
-async function uploadAttachment(message) {
+async function uploadAttachment(message, reportResult = postToFrame, signal) {
   const localId = String(message.localId || "");
   if (!localId) return;
   // Echoed verbatim on every result so the artifact can tell a reply to ITS upload
@@ -2068,7 +2306,7 @@ async function uploadAttachment(message) {
     }
   }
   if (!Number.isFinite(size) || size < 0) {
-    postToFrame({
+    reportResult({
       type: "lavish:attachmentResult",
       nonce,
       localId,
@@ -2082,7 +2320,7 @@ async function uploadAttachment(message) {
   // the chip would never leave "uploading". Catching it here guarantees the card
   // reaches its error+retry state. The server still enforces the cap authoritatively.
   if (attachmentMaxBytes > 0 && size > attachmentMaxBytes) {
-    postToFrame({
+    reportResult({
       type: "lavish:attachmentResult",
       nonce,
       localId,
@@ -2095,7 +2333,7 @@ async function uploadAttachment(message) {
   const now = Date.now();
   while (uploadTimestamps.length && now - uploadTimestamps[0] > UPLOAD_RATE_WINDOW_MS) uploadTimestamps.shift();
   if (uploadTimestamps.length >= UPLOAD_RATE_MAX) {
-    postToFrame({
+    reportResult({
       type: "lavish:attachmentResult",
       nonce,
       localId,
@@ -2105,7 +2343,7 @@ async function uploadAttachment(message) {
     return;
   }
   if (uploadedBytesTotal + size > UPLOAD_SESSION_BYTE_QUOTA) {
-    postToFrame({
+    reportResult({
       type: "lavish:attachmentResult",
       nonce,
       localId,
@@ -2118,7 +2356,7 @@ async function uploadAttachment(message) {
   // while the bound is full. The card keeps its retry affordance, and a settled
   // upload (below) frees a slot for the next.
   if (uploadsInFlight >= UPLOAD_MAX_IN_FLIGHT) {
-    postToFrame({
+    reportResult({
       type: "lavish:attachmentResult",
       nonce,
       localId,
@@ -2135,10 +2373,11 @@ async function uploadAttachment(message) {
       method: "POST",
       headers: { "content-type": String(message.mime || "application/octet-stream") },
       body: bytes,
+      signal,
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || "Upload failed");
-    postToFrame({
+    reportResult({
       type: "lavish:attachmentResult",
       nonce,
       localId,
@@ -2146,7 +2385,7 @@ async function uploadAttachment(message) {
       id: (data.attachment && data.attachment.id) || "",
     });
   } catch (error) {
-    postToFrame({
+    reportResult({
       type: "lavish:attachmentResult",
       nonce,
       localId,
@@ -2189,6 +2428,88 @@ moreButton.onclick = () => {
 warningsButton.onclick = toggleWarningsDrawer;
 warningsSelectAll.onchange = toggleSelectAllWarnings;
 warningsQueueButton.onclick = queueSelectedWarningFixes;
+chatAttachButton.onclick = () => chatAttachInput.click();
+chatAttachInput.addEventListener("change", () => {
+  chatAttachmentController.addFiles(chatAttachInput.files);
+  chatAttachmentController.rejectUnsupported(chatAttachInput.files);
+  chatAttachInput.value = "";
+});
+// The one place a paste or drop is turned into a file list, so both surfaces see
+// the same payload. Pasted screenshots arrive as items, not files, in some
+// browsers; `.files` alone silently attaches nothing there.
+function transferredFiles(dataTransfer) {
+  const files = Array.from(dataTransfer?.files || []).filter(Boolean);
+  if (files.length) return files;
+  return Array.from(dataTransfer?.items || [])
+    .filter((item) => item && item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+}
+// Finder/Explorer file copies put the copied file's name or path in text/plain;
+// that placeholder must not land in the message beside the attached image. Real
+// captions (any line that is not a pasted file's name) keep the default paste.
+// Mirrors planClipboardPaste in artifact-sdk.js, which owns the same rule for
+// the annotation card - this file is served raw and cannot import it.
+function keepsClipboardText(text, files) {
+  const lines = String(text)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return false;
+  const names = files.map((file) => String(file?.name || "")).filter(Boolean);
+  if (!names.length) return true;
+  return !lines.every((line) =>
+    names.some((name) => line === name || line.endsWith("/" + name) || line.endsWith("\\" + name)),
+  );
+}
+chatInput.addEventListener("paste", (event) => {
+  const files = transferredFiles(event.clipboardData);
+  // Images only: Office and macOS pastes expose stray non-image file flavors
+  // beside their text, so unsupported entries raise no chip here (matching the
+  // annotation card) - a chip would block sending for a perceived text paste.
+  const added = chatAttachmentController.addFiles(files);
+  if (added && !keepsClipboardText(event.clipboardData?.getData("text/plain") || "", files)) event.preventDefault();
+});
+chatComposer.addEventListener("dragover", (event) => {
+  if (Array.from(event.dataTransfer?.types || []).includes("Files")) {
+    event.preventDefault();
+    chatComposer.classList.add("is-dropping");
+  }
+});
+chatComposer.addEventListener("dragleave", (event) => {
+  const entering = /** @type {Node | null} */ (event.relatedTarget);
+  if (!chatComposer.contains(entering)) chatComposer.classList.remove("is-dropping");
+});
+chatComposer.addEventListener("drop", (event) => {
+  chatComposer.classList.remove("is-dropping");
+  if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
+  event.preventDefault();
+  const files = transferredFiles(event.dataTransfer);
+  if (!files.length) {
+    // A drag advertising Files with nothing enumerable: the default was already
+    // consumed, so refuse visibly (like the card) instead of swallowing it.
+    chatAttachmentController.rejectUnsupported([{ name: "file", type: "" }]);
+    return;
+  }
+  chatAttachmentController.addFiles(files);
+  chatAttachmentController.rejectUnsupported(files);
+});
+// A file drop that misses the composer must not navigate the chrome away from
+// the session (losing chips, uploads, and the SSE connection). Text drags stay
+// untouched so dropping text into the textarea keeps working.
+document.addEventListener("dragover", (event) => {
+  if (Array.from(event.dataTransfer?.types || []).includes("Files")) event.preventDefault();
+});
+document.addEventListener("drop", (event) => {
+  if (Array.from(event.dataTransfer?.types || []).includes("Files")) event.preventDefault();
+});
+chatAttachments.addEventListener("click", (event) => {
+  const target = /** @type {HTMLElement | null} */ (event.target);
+  const remove = /** @type {HTMLElement | null} */ (target?.closest?.("[data-chat-attachment-remove]") || null);
+  if (remove) chatAttachmentController.remove(String(remove.dataset.chatAttachmentRemove || ""));
+  const retry = /** @type {HTMLElement | null} */ (target?.closest?.("[data-chat-attachment-retry]") || null);
+  if (retry) chatAttachmentController.retry(String(retry.dataset.chatAttachmentRetry || ""));
+});
 chatInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();

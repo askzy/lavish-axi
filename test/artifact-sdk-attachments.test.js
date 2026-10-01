@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  acceptedImageTypes,
   attachmentSizeError,
   classifyAttachmentBatch,
   deriveAttachmentNoticeState,
   isTrustedAttachmentResult,
   partitionDroppedFiles,
+  planClipboardPaste,
 } from "../src/artifact-sdk.js";
 import { createSdkJs } from "../src/server.js";
 
@@ -50,9 +52,35 @@ test("the SDK bundle carries ready attachment refs on the queued prompt", () => 
   assert.match(sdk, /queuePrompt\(prompt, \{ \.\.\.c, queueKey: "", attachments: readyAttachments \}\)/);
 });
 
-test("the SDK bundle only accepts PNG, JPEG, and WebP images", () => {
-  assert.match(sdk, /ATTACHMENT_ACCEPTED_MIME = \{ "image\/png": true, "image\/jpeg": true, "image\/webp": true \}/);
-  assert.match(sdk, /accept="image\/png,image\/jpeg,image\/webp"/);
+test("acceptedImageTypes turns the server's list into the card's lookups", () => {
+  const types = acceptedImageTypes(["image/png", "image/avif"]);
+  assert.deepEqual(types.mimes, ["image/png", "image/avif"]);
+  assert.deepEqual(types.accepted, { "image/png": true, "image/avif": true });
+  // The same list drives the file picker, so the card can never offer a format
+  // its own paste/drop filter would then refuse.
+  assert.equal(types.accept, "image/png,image/avif");
+  // The filters the card feeds this to agree with it.
+  const avif = { name: "a.avif", type: "image/avif" };
+  assert.deepEqual(partitionDroppedFiles({ files: [avif] }, types.accepted), { images: [avif], unsupported: [] });
+  assert.deepEqual(
+    partitionDroppedFiles({ files: [{ name: "a.webp", type: "image/webp" }] }, types.accepted).images,
+    [],
+  );
+});
+
+test("acceptedImageTypes falls back to PNG, JPEG, and WebP when unwired", () => {
+  for (const unwired of [undefined, [], null]) {
+    assert.deepEqual(acceptedImageTypes(unwired).mimes, ["image/png", "image/jpeg", "image/webp"]);
+  }
+});
+
+test("the SDK bundle carries the server's accepted image list, not a literal of its own", () => {
+  // The served /sdk.js is generated output: vary the server's list and the
+  // bundle must carry that list, which a hardcoded copy could not do.
+  const custom = createSdkJs("0123456789abcdef", 0, "", { acceptedImageMime: ["image/avif"] });
+  assert.match(custom, /"acceptedImageMime":\["image\/avif"\]/);
+  assert.doesNotMatch(custom, /"image\/webp": ?true/);
+  assert.match(sdk, /"acceptedImageMime":\["image\/png","image\/jpeg","image\/webp"\]/);
 });
 
 test("the SDK bundle renders chips with a thumbnail, name, and status", () => {
@@ -221,6 +249,58 @@ test("a pasted item list partitions the same way (W4-a)", () => {
 test("an empty drop partitions to nothing (W4-a)", () => {
   assert.deepEqual(partitionDroppedFiles(null, ACCEPTED), { images: [], unsupported: [] });
   assert.deepEqual(partitionDroppedFiles({}, ACCEPTED), { images: [], unsupported: [] });
+});
+
+const clipboard = (files, text = "") => ({ files, getData: (type) => (type === "text/plain" ? text : "") });
+
+test("an image-only paste is consumed instead of also inserting clipboard text", () => {
+  const png = file("shot.png", "image/png");
+  const plan = planClipboardPaste(clipboard([png]), ACCEPTED);
+  assert.deepEqual(plan.images, [png]);
+  assert.equal(plan.keepTextPaste, false);
+});
+
+test("mixed clipboard text stays available to the annotation textarea", () => {
+  // The image attaches AND the browser must still insert the text, so the
+  // handler is told to leave the default paste alone.
+  const png = file("shot.png", "image/png");
+  const plan = planClipboardPaste(clipboard([png], "Keep this caption"), ACCEPTED);
+  assert.deepEqual(plan.images, [png]);
+  assert.equal(plan.keepTextPaste, true);
+});
+
+test("a text-only paste attaches nothing and keeps the default paste", () => {
+  const plan = planClipboardPaste(clipboard([], "just words"), ACCEPTED);
+  assert.deepEqual(plan.images, []);
+  assert.equal(plan.keepTextPaste, true);
+});
+
+test("a paste with no clipboard data at all is inert", () => {
+  assert.deepEqual(planClipboardPaste(null, ACCEPTED), { images: [], keepTextPaste: false });
+});
+
+test("a copied file's filename or path text is a placeholder, not a caption", () => {
+  // Finder/Explorer file copies put the file's name or full path in text/plain;
+  // keeping that "text" would silently paste a filesystem path beside the image.
+  const png = file("shot.png", "image/png");
+  for (const text of ["shot.png", "/Users/me/Desktop/shot.png", "C:\\Users\\me\\shot.png", "  shot.png  "]) {
+    assert.equal(planClipboardPaste(clipboard([png], text), ACCEPTED).keepTextPaste, false, JSON.stringify(text));
+  }
+});
+
+test("a multi-file copy's newline-joined names are still placeholder text", () => {
+  const a = file("a.png", "image/png");
+  const b = file("b.png", "image/png");
+  const plan = planClipboardPaste(
+    { files: [a, b], getData: (type) => (type === "text/plain" ? "/tmp/a.png\n/tmp/b.png" : "") },
+    ACCEPTED,
+  );
+  assert.equal(plan.keepTextPaste, false);
+});
+
+test("text that is not the pasted image's name stays a real mixed paste", () => {
+  const png = file("shot.png", "image/png");
+  assert.equal(planClipboardPaste(clipboard([png], "see shot.png here"), ACCEPTED).keepTextPaste, true);
 });
 
 test("the SDK bundle wires the drop handler to partial-accept (W4-a)", () => {

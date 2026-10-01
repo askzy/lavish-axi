@@ -415,6 +415,64 @@ export function partitionDroppedFiles(dataTransfer, acceptedMime) {
 }
 
 /**
+ * Build the accepted-image lookups the annotation card needs from the server's
+ * `ACCEPTED_IMAGE_MIME` list, threaded in by `createSdkJs`.
+ *
+ * The card's paste/drop filter and its file picker's `accept` attribute both come
+ * from the returned value, so no surface can offer a format another one refuses.
+ * The literal is only the unwired fallback (a direct `createArtifactSdk` call in a
+ * unit test), matching how the count and byte caps behave.
+ *
+ * @param {string[]|null|undefined} list
+ * @returns {{ mimes: string[], accepted: Record<string, boolean>, accept: string }}
+ */
+export function acceptedImageTypes(list) {
+  const named = (Array.isArray(list) ? list : []).map(String).filter(Boolean);
+  const mimes = named.length ? named : ["image/png", "image/jpeg", "image/webp"];
+  /** @type {Record<string, boolean>} */
+  const accepted = {};
+  for (const mime of mimes) accepted[mime] = true;
+  return { mimes, accepted, accept: mimes.join(",") };
+}
+
+/**
+ * Split a paste over the annotation textarea into the images it can attach and
+ * whether the browser's own text paste must be preserved.
+ *
+ * A screenshot pasted alone should not also drop its (usually empty or
+ * placeholder) text into the textarea, so that paste is consumed. A paste that
+ * carries real text alongside an image is a mixed paste: the image attaches AND
+ * the text must still land, so the default is left intact.
+ *
+ * Placeholder text includes the pasted files' own names: Finder/Explorer file
+ * copies put the file's name or full path in text/plain, and keeping it would
+ * silently paste a filesystem path beside the attached image. Text is kept
+ * only when at least one line is not a pasted image's name or path.
+ *
+ * @param {{ files?: ArrayLike<any>, items?: ArrayLike<any>, getData?: (type: string) => string }|null|undefined} clipboardData
+ * @param {Record<string, boolean>} acceptedMime
+ * @returns {{ images: any[], keepTextPaste: boolean }}
+ */
+export function planClipboardPaste(clipboardData, acceptedMime) {
+  const { images } = partitionDroppedFiles(clipboardData, acceptedMime);
+  const text = clipboardData && clipboardData.getData ? clipboardData.getData("text/plain") : "";
+  const lines = String(text)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const names = images.map((file) => String((file && file.name) || "")).filter(Boolean);
+  const keepTextPaste =
+    lines.length > 0 &&
+    !(
+      names.length > 0 &&
+      lines.every((line) =>
+        names.some((name) => line === name || line.endsWith("/" + name) || line.endsWith("\\" + name)),
+      )
+    );
+  return { images, keepTextPaste };
+}
+
+/**
  * Decide whether an incoming `lavish:attachmentResult` may be applied to this
  * document's chips. Two independent conditions, both required:
  *
@@ -463,7 +521,7 @@ export function deriveAttachmentNoticeState(state = {}) {
  * @param {number} [artifactRevision]
  * @param {string} [artifactLoadToken]
  * @param {string} [_sessionKey] the session key, reserved for the SDK's own server calls
- * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number }} [options]
+ * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number, acceptedImageMime?: string[] }} [options]
  */
 export function createArtifactSdk(
   deriveQueueKey,
@@ -501,7 +559,8 @@ export function createArtifactSdk(
   // allocated and structured-cloned into the chrome ahead of any rejection.
   const ATTACHMENT_MAX_BYTES =
     Number.isFinite(options.maxAttachmentBytes) && options.maxAttachmentBytes > 0 ? options.maxAttachmentBytes : 0;
-  const ATTACHMENT_ACCEPTED_MIME = { "image/png": true, "image/jpeg": true, "image/webp": true };
+  const ATTACHMENT_IMAGE_TYPES = acceptedImageTypes(options.acceptedImageMime);
+  const ATTACHMENT_ACCEPTED_MIME = ATTACHMENT_IMAGE_TYPES.accepted;
   // Minted once per document load and stamped on every upload, so a result the
   // chrome posts back can be tied to the exact document that asked for it. Chip
   // ids restart at att-1 on each load, so they cannot do this on their own: an
@@ -2348,7 +2407,9 @@ export function createArtifactSdk(
       '<div class="lavish-attach-row"><button class="lavish-attach" type="button">' +
       '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>' +
       "<span>Attach image</span></button>" +
-      '<input class="lavish-attach-input" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden></div>' +
+      '<input class="lavish-attach-input" type="file" accept="' +
+      ATTACHMENT_IMAGE_TYPES.accept +
+      '" multiple hidden></div>' +
       '<div class="lavish-hint">Enter to queue &middot; ' +
       sendNowHint +
       "+Enter to send &middot; paste or drop an image" +
@@ -2401,10 +2462,8 @@ export function createArtifactSdk(
       attachInput.value = "";
     });
     textarea.addEventListener("paste", (event) => {
-      // Images only: a paste carrying no image must still fall through to the
-      // textarea's normal text paste, so unsupported entries raise no chip here.
-      const { images } = partitionDroppedFiles(event.clipboardData, ATTACHMENT_ACCEPTED_MIME);
-      if (images.length && attachments.addFiles(images)) event.preventDefault();
+      const { images, keepTextPaste } = planClipboardPaste(event.clipboardData, ATTACHMENT_ACCEPTED_MIME);
+      if (images.length && attachments.addFiles(images) && !keepTextPaste) event.preventDefault();
     });
     card.addEventListener("dragover", (event) => {
       // Accept ANY file drag so the drop lands on the card (and is preventable)
