@@ -226,7 +226,7 @@ test("design output prints copy-pasteable CDN URLs so agents can opt in to Daisy
   );
   assert.match(output.design.other_design_systems, /different design system|other design system/i);
   assert.match(output.whiteboard_tooling.use_when, /^Opt-in only/);
-  assert.match(output.whiteboard_tooling.use_when, /asks for a Mermaid diagram/);
+  assert.match(output.whiteboard_tooling.use_when, /asks for an editable whiteboard/);
   assert.match(output.whiteboard_tooling.use_when, /hand-authored inline SVG per the diagram playbook/);
   assert.match(output.whiteboard_tooling.mermaid_cdn_snippet, /cdn\.jsdelivr\.net\/npm\/mermaid@\d+\.\d+\.\d+/);
   assert.match(output.whiteboard_tooling.mermaid_cdn_snippet, /mermaid\.initialize/);
@@ -368,7 +368,7 @@ test("diagram playbook defaults to hand-authored SVG and names the anti-patterns
   const output = createPlaybookOutput(["diagram"]);
 
   assert.ok(output.playbook.choose.some((item) => /Default to hand-authored inline SVG/.test(item)));
-  assert.ok(output.playbook.choose.some((item) => /only when the user asks for a Mermaid diagram/i.test(item)));
+  assert.ok(output.playbook.choose.some((item) => /only when the user asks for an editable whiteboard/i.test(item)));
   assert.ok(output.playbook.pitfalls.some((item) => /hand-build boxes-and-arrows/i.test(item)));
   assert.ok(output.playbook.pitfalls.some((item) => /div\/flexbox/i.test(item)));
   assert.ok(output.playbook.pitfalls.some((item) => /reach for Mermaid to save authoring effort/i.test(item)));

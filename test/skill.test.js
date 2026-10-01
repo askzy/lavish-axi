@@ -102,7 +102,10 @@ test("createSkillMarkdown requires opening every matching playbook", () => {
   assert.ok(playbooksSection.includes("MUST open each matching playbook"), "requires opening matching playbooks");
   assert.ok(playbooksSection.includes("hand-authored inline SVG by default"), "names the SVG-first default");
   assert.ok(playbooksSection.includes("never build boxes-and-arrows"), "names the diagram anti-pattern");
-  assert.ok(playbooksSection.includes("only when the user asks for a Mermaid diagram"), "scopes Mermaid to the opt-in");
+  assert.ok(
+    playbooksSection.includes("only when the user asks for an editable whiteboard"),
+    "scopes Mermaid to the opt-in",
+  );
 });
 
 test("createSkillMarkdown does not leak live session state", () => {

@@ -10,7 +10,7 @@ export const PLAYBOOKS = [
     use_when: "Explain relationships, flows, state, architecture, and concepts with illustrations",
     choose: [
       "Default to hand-authored inline SVG: it gives proportion, emphasis, spatial metaphor, and annotation-ready structure that generated layouts cannot.",
-      "Use Mermaid only when the user asks for a Mermaid diagram: rendered Mermaid in a `.mermaid` container is pannable, zoomable, and node-annotatable in the Lavish browser.",
+      "Use Mermaid only when the user asks for an editable whiteboard: rendered Mermaid in a `.mermaid` container becomes an Excalidraw whiteboard in the Lavish browser.",
       "For large systems, draw a small overview illustration and put detail in module cards below it, instead of one dense auto-laid graph.",
     ],
     structure: [
@@ -27,7 +27,7 @@ export const PLAYBOOKS = [
       "Keep labels to a few words and put prose beside the figure in HTML - SVG text does not wrap, so short labels are also the overflow discipline.",
       "Keep figures self-contained: no external images, fonts, or scripts, so exports render offline.",
       "Render-verify before serving: screenshot the artifact in light, dark, and a narrow viewport - the layout audit deliberately skips SVG interiors.",
-      "When the user asked for Mermaid, initialize Mermaid theme-aware with the `lavish-axi design` snippet rather than hardcoding one theme.",
+      "When the user asked for a whiteboard, initialize Mermaid theme-aware with the `lavish-axi design` snippet rather than hardcoding one theme.",
     ],
     pitfalls: [
       "Do not cram every file or function into one figure when a layered explanation would be clearer.",

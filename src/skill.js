@@ -173,7 +173,7 @@ ${bullets(home.visual_guidance)}
 
 Run \`${invocation} playbook <id>\` for focused, detailed guidance on any of these.
 ${PLAYBOOK_ROUTER_HELP}
-Figures are hand-authored inline SVG by default - open the diagram playbook before drawing, and never build boxes-and-arrows from div/flexbox. Use the Mermaid snippet from \`${invocation} design\` only when the user asks for a Mermaid diagram.
+Figures are hand-authored inline SVG by default - open the diagram playbook before drawing, and never build boxes-and-arrows from div/flexbox. Use the Mermaid snippet from \`${invocation} design\` only when the user asks for an editable whiteboard.
 
 ${playbookList(home.playbooks)}
 

@@ -339,9 +339,7 @@ test("feedback-files accepts a scene beyond the default 2mb JSON cap that /promp
   }
 });
 
-// The chrome overlay markup that frames /whiteboard-frame lands with the whiteboard UI; this
-// server-side PR only has to keep the frame page framable and the artifact sandbox untouched.
-test("the whiteboard frame page is framable and the artifact iframe sandbox is unchanged", async () => {
+test("the whiteboard frame page is served with the sandboxed chrome overlay pointing at it", async () => {
   const ctx = await startWhiteboardServer();
   try {
     const framePage = await fetch(`${ctx.base}/whiteboard-frame?key=${ctx.key}`);
@@ -354,6 +352,8 @@ test("the whiteboard frame page is framable and the artifact iframe sandbox is u
     const chrome = await fetch(`${ctx.base}/session/${ctx.key}`);
     assert.equal(chrome.headers.get("x-frame-options"), "DENY");
     const chromeHtml = await chrome.text();
+    assert.match(chromeHtml, /id="whiteboardFrame"[^>]*sandbox="allow-scripts allow-popups"/);
+    assert.doesNotMatch(chromeHtml, /whiteboardFrame[^>]*allow-same-origin/);
     // The artifact iframe's sandbox must be unchanged by this feature.
     assert.match(
       chromeHtml,
