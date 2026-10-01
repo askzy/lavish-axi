@@ -5103,14 +5103,28 @@ test("a timed poll shorter than the lease does not wake for it", async () => {
   }
 });
 
-test("createChromeHtml exposes the attachment caps so the chrome can pre-check uploads", () => {
+test("createChromeHtml exposes attachment limits and Conversation attachment controls", () => {
   const html = createChromeHtml(
     { key: "abc", file: "/tmp/artifact.html" },
     { attachmentMaxBytes: 12345, attachmentMaxCount: 7 },
   );
   assert.match(html, /"attachmentMaxBytes":12345/);
   assert.match(html, /"attachmentMaxCount":7/);
+  assert.match(html, /id="chatAttachments"/);
+  assert.match(html, /id="chatAttach"/);
+  assert.match(html, /id="chatAttachInput"[^>]+accept="image\/png,image\/jpeg,image\/webp"/);
   assert.match(html, /"attachmentAcceptedMime":\["image\/png","image\/jpeg","image\/webp"\]/);
+});
+
+test("the accepted image types the chrome enforces and offers come from one value", () => {
+  // The file picker's accept attribute and the list the composer filters pastes
+  // and drops against must never be able to disagree.
+  const html = createChromeHtml(
+    { key: "abc", file: "/tmp/artifact.html" },
+    { attachmentAcceptedMime: ["image/png", "image/avif"] },
+  );
+  assert.match(html, /id="chatAttachInput"[^>]+accept="image\/png,image\/avif"/);
+  assert.match(html, /"attachmentAcceptedMime":\["image\/png","image\/avif"\]/);
 });
 
 test("createSdkJs hands the server's attachment caps and the session key to the SDK", () => {
