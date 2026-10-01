@@ -627,6 +627,14 @@ test("artifact SDK injects every shared mermaid node helper as a same-scope cons
   assert.match(js, /const mermaidHelpers=\{[^}]*mermaidNodeElement[^}]*\}/);
 });
 
+test("shared SDK helper modules export only functions so serializeModuleHelpers can ship them", async () => {
+  const mermaid = await import("../src/mermaid-node.js");
+  const table = await import("../src/table-cell.js");
+  for (const [name, value] of [...Object.entries(mermaid), ...Object.entries(table)]) {
+    assert.equal(typeof value, "function", `${name} must be a function`);
+  }
+});
+
 test("annotation hover and click resolve to the same Mermaid node element", () => {
   const js = createSdkJs("abc");
 
