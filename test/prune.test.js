@@ -65,6 +65,19 @@ function daysAgo(days) {
 
 const USER_REPLY = { chat: [{ role: "user", text: "Looks good, ship it", at: daysAgo(70).toISOString() }] };
 const AGENT_ONLY = { chat: [{ role: "agent", text: "Here is the plan", at: daysAgo(70).toISOString() }] };
+// An annotation the reviewer sent is a user entry in the transcript too, so a session whose only
+// reviewer words are notes on elements counts as replied-to.
+const ANNOTATION_ONLY = {
+  chat: [
+    {
+      role: "user",
+      kind: "annotation",
+      text: "Rename this",
+      anchor: { kind: "element", label: "<h2>", excerpt: "Heading" },
+      at: daysAgo(70).toISOString(),
+    },
+  ],
+};
 
 async function writeStore(dir, sessions) {
   const file = path.join(dir, "state.json");
@@ -655,6 +668,24 @@ test("prune command takes the open-session windows from flags, then env, then de
     const bad = run(["--open-older-than", "soon"], baseEnv);
     assert.notEqual(bad.status, 0);
     assert.match(`${bad.stdout}${bad.stderr}`, /Invalid duration .*soon/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an annotation-only transcript counts as a user message for the unreplied rule", async () => {
+  const dir = await makeTemp();
+  try {
+    const annotated = await writeArtifact(dir, "annotated-15d.html", RECENT);
+    const silent = await writeArtifact(dir, "silent-15d.html", RECENT);
+    const stateFile = await writeStore(dir, [
+      sessionRecord(annotated, "open", daysAgo(15), ANNOTATION_ONLY),
+      sessionRecord(silent, "open", daysAgo(15), AGENT_ONLY),
+    ]);
+
+    const result = await prune({ store: new SessionStore(stateFile), maxAgeMs: 30 * DAY_MS, now: () => NOW });
+
+    assert.deepEqual(result.removedSessions, [silent]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
