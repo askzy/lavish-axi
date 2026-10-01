@@ -535,7 +535,12 @@ test("server start prune is skipped when disabled and non-fatal on a corrupt sto
       pruneMaxAgeMs: null,
     });
     await disabled.close();
-    assert.deepEqual(lines, [], "a disabled prune never reads the store");
+    // Every shutdown logs its cause; that line is not a store read.
+    assert.deepEqual(
+      lines.filter((line) => !line.startsWith("[lavish] shutting down:")),
+      [],
+      "a disabled prune never reads the store",
+    );
 
     const server = await serve({
       port: 0,

@@ -11,6 +11,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { access, readFile, writeFile } from "node:fs/promises";
+import { get as httpGet } from "node:http";
+import { isIP } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,7 +26,19 @@ import {
   exportWarningSummaries,
   splitExportWarnings,
 } from "./export-bundle.js";
-import { clientHost, defaultPort, ensureStateDir, hostForUrl, serverLogFile, stateFile } from "./paths.js";
+import { discoveryHosts, localInterfaceAddresses } from "./local-address.js";
+import {
+  clientHost,
+  defaultPort,
+  ensureStateDir,
+  hostForUrl,
+  isWildcardHost,
+  LOOPBACK_HOST,
+  resolveConcreteListenHosts,
+  serverLogFile,
+  stateFile,
+  stateId,
+} from "./paths.js";
 import { findPlaybook, listPlaybooks, playbookIds, PLAYBOOK_ROUTER_HELP } from "./playbooks.js";
 import {
   ARTIFACT_DIR_NAME,
@@ -252,10 +266,16 @@ export function createPlaybookOutput(args) {
   return { playbook };
 }
 
-export function createOpenOutput({ file, url, status }) {
+export function createOpenOutput({ file, url, status, networkWarning = undefined }) {
+  // A failed bind is invisible to the person holding a review link at that address - the page
+  // simply does not load - so the agent is told to pass it on rather than leave it in a field.
+  const networkPrefix = networkWarning
+    ? "Lavish could not serve every address it was asked to (see network_warning): when you next message the user, tell them, because review links at that address will not load until it clears. "
+    : "";
   return {
     session: { file, url, status },
-    next_step: `Do not respond to the user just yet. Now you must run \`lavish-axi poll ${file}\`. This command long-polls until the user sends feedback, ends the session, or closes the review page, and it stays silent the whole time - that is normal, never kill it. Layout issues the browser detects do not return this poll; they wait in the user's Layout issues inbox until the user queues them, then arrive as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use. ${pollExecutionGuidance()} After applying feedback, run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms to show your response in Lavish Editor and wait for more feedback. If the user ends the session, stop polling and do not reopen it by re-running \`lavish-axi ${file}\` unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${file} --reopen\`.`,
+    ...(networkWarning ? { network_warning: networkWarning } : {}),
+    next_step: `${networkPrefix}Do not respond to the user just yet. Now you must run \`lavish-axi poll ${file}\`. This command long-polls until the user sends feedback, ends the session, or closes the review page, and it stays silent the whole time - that is normal, never kill it. Layout issues the browser detects do not return this poll; they wait in the user's Layout issues inbox until the user queues them, then arrive as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use. ${pollExecutionGuidance()} After applying feedback, run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms to show your response in Lavish Editor and wait for more feedback. If the user ends the session, stop polling and do not reopen it by re-running \`lavish-axi ${file}\` unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${file} --reopen\`.`,
   };
 }
 
@@ -263,9 +283,10 @@ export function createOpenOutput({ file, url, status }) {
 // browser. Reviving it silently would reopen a browser window the human deliberately closed, so
 // this refuses and requires the explicit --reopen opt-in instead of erroring - the session
 // staying closed is the correct, idempotent outcome unless the agent has a real reason to reopen.
-export function createUserEndedOpenOutput({ file, url }) {
+export function createUserEndedOpenOutput({ file, url, networkWarning = undefined }) {
   return {
     session: { file, url, status: "user-ended" },
+    ...(networkWarning ? { network_warning: networkWarning } : {}),
     next_step: `The user explicitly ended this Lavish Editor session from the browser, so \`lavish-axi ${file}\` did not reopen it. Do not reopen unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${file} --reopen\`.`,
   };
 }
@@ -285,7 +306,7 @@ async function openCommand(args) {
   });
   const response = await postJson(`${baseUrl}/api/sessions`, { file: absolute, noGate, reopen });
   if (response.status === "user-ended") {
-    return createUserEndedOpenOutput({ file: absolute, url: response.url });
+    return createUserEndedOpenOutput({ file: absolute, url: response.url, networkWarning: response.network_warning });
   }
   if (shouldOpenBrowser(args, process.env)) {
     try {
@@ -295,7 +316,12 @@ async function openCommand(args) {
       response.status = "ready";
     }
   }
-  return createOpenOutput({ file: absolute, url: response.url, status: response.status || "opened" });
+  return createOpenOutput({
+    file: absolute,
+    url: response.url,
+    status: response.status || "opened",
+    networkWarning: response.network_warning,
+  });
 }
 
 export function shouldOpenBrowser(args, env) {
@@ -638,7 +664,12 @@ export async function shareCommand(_args) {
 // session), this stops the background process so it stops dangling between sessions.
 export async function stopCommand(args) {
   const port = Number(flagValue(args, "--port") || defaultPort());
-  const baseUrl = `http://${hostForUrl(clientHost())}:${port}`;
+  // A server that fell back to loopback answers there rather than at the requested bind host, and
+  // a `stop` that only dials the requested host reports "not-running" while leaving it running.
+  // A same-port duplicate at another address is this installation's server too, so it stops as well.
+  const { baseUrl, duplicates, foreign } = await findRunningServer(port);
+  if (foreign) throw otherInstallationError(port, foreign);
+  await stopDuplicateServers(duplicates, { reason: "stop" });
   return shutdownServerOnPort(port, { baseUrl, currentVersion: VERSION });
 }
 
@@ -650,21 +681,21 @@ export async function shutdownServerOnPort(
     fetchHealth: healthFetcher = fetchHealth,
     requestShutdown: shutdownRequester = requestShutdown,
     waitForPortFree: portFreeWaiter = waitForPortFree,
-    killProcessOnPort: portKiller = killProcessOnPort,
-    processMatchesLavish = processOnPortMatchesLavish,
+    killServerProcess = killLavishListener,
+    processMatchesLavish = listenerMatchesLavish,
   } = {},
 ) {
   const health = await healthFetcher(baseUrl);
   if (!health) {
     return { server: { status: "not-running", port } };
   }
-  if (!(await canControlServerOnPort(port, health, processMatchesLavish))) {
+  if (!(await canControlServerOnPort(baseUrl, health, processMatchesLavish))) {
     return { server: { status: "not-lavish", port } };
   }
   await shutdownRequester(baseUrl, { reason: "stop" });
   let freed = await portFreeWaiter(baseUrl, 3000);
   if (!freed && shouldKillProcessOnPort(currentVersion, health)) {
-    portKiller(port);
+    if (!killServerProcess(baseUrl)) throw unidentifiedListenerError(baseUrl);
     freed = await portFreeWaiter(baseUrl, 3000);
   }
   return { server: { status: freed ? "stopped" : "stopping", port } };
@@ -792,7 +823,16 @@ function deepEqual(a, b) {
 async function serverCommand(args) {
   const port = Number(flagValue(args, "--port") || defaultPort());
   const debug = args.includes("--verbose") || process.env.LAVISH_AXI_DEBUG === "1";
-  const server = await serve({ port, stateFile: stateFile(), version: VERSION, build: localBuildId(), debug });
+  const server = await serve({
+    port,
+    stateFile: stateFile(),
+    version: VERSION,
+    build: localBuildId(),
+    debug,
+    extraListenHosts: flagValues(args, "--also-listen"),
+    // Tailscale detection lands in a later port; until then the server never looks for it.
+    detectTailscale: null,
+  });
   await server.done;
   return "";
 }
@@ -854,22 +894,199 @@ function isHtmlPath(file) {
   return file.toLowerCase().endsWith(".html") || file.toLowerCase().endsWith(".htm");
 }
 
+const HEALTH_PROBE_TIMEOUT_MS = 500;
+const DEFAULT_HEALTH_TIMEOUT_MS = 2000;
+const MAX_HEALTH_BODY_BYTES = 256 * 1024;
+// A reconcile asks the server to retry any unbound address before answering, which can take longer
+// than a plain health read.
+const HEALTH_RECONCILE_TIMEOUT_MS = 3000;
+
+// The addresses a Lavish server on this port could be answering at: the host this CLI is
+// configured for and loopback. Agents on one machine do not share LAVISH_AXI_HOST, so loopback is
+// the meeting point - every server binds it first as the port lock. See `discoveryHosts` for the
+// opt-in sweep that also finds a server pinned to another address alone.
+function serverCandidateHosts() {
+  return discoveryHosts([clientHost(), LOOPBACK_HOST]);
+}
+
+function serverBaseUrl(host, port) {
+  return `http://${hostForUrl(host)}:${port}`;
+}
+
+// A server is this installation's when it reports our state file. One from before `state_id`
+// existed cannot say, so it counts as ours only at an address this CLI controls - its configured
+// host or loopback - where replacing it is the upgrade path; anywhere else it may belong to another
+// installation and is never adopted or stopped.
+function isOwnedServer(entry, controlHosts) {
+  if (entry.health.app !== "lavish-axi") return false;
+  if (typeof entry.health.state_id === "string") return entry.health.state_id === stateId();
+  return controlHosts.has(entry.host);
+}
+
+// Another installation's Lavish server at an address this CLI controls is never used, replaced, or
+// stopped: its sessions and state file are not ours.
+function otherInstallationError(port, foreign) {
+  const dir = typeof foreign.health.state_dir === "string" ? foreign.health.state_dir : "an unknown state directory";
+  return new AxiError(
+    `Port ${port} is served by another Lavish installation at ${foreign.host} (state directory ${dir})`,
+    "SERVER_ERROR",
+    [`Set LAVISH_AXI_PORT to another port, or set LAVISH_AXI_STATE_DIR to ${dir} to use that installation`],
+  );
+}
+
+// Returns where a Lavish server actually answered, plus any OTHER Lavish daemon of this
+// installation found on the same port at an address the chosen one does not serve. Every candidate
+// is probed in parallel and each probe is bounded, so a hanging or foreign address cannot mask
+// loopback, and a response whose app is lavish-axi wins over a foreign /health. When nothing
+// answers, the primary URL is still returned so callers have something to spawn against and report.
+async function findRunningServer(port, { reconcileNetwork = false } = {}) {
+  const controlHosts = new Set([clientHost(), LOOPBACK_HOST]);
+  const probed = await Promise.all(
+    serverCandidateHosts().map(async (host) => {
+      const baseUrl = serverBaseUrl(host, port);
+      const health = await probeHealth(baseUrl, { reconcileNetwork: false, timeoutMs: HEALTH_PROBE_TIMEOUT_MS });
+      return health ? { host, baseUrl, health } : null;
+    }),
+  );
+  const found = probed.filter((entry) => entry !== null);
+  const owned = found.filter((entry) => isOwnedServer(entry, controlHosts));
+  const foreign =
+    found.find(
+      (entry) =>
+        controlHosts.has(entry.host) && entry.health.app === "lavish-axi" && !isOwnedServer(entry, controlHosts),
+    ) ?? null;
+  const chosen = owned[0];
+  if (!chosen) {
+    const other = found.find((entry) => controlHosts.has(entry.host));
+    return other
+      ? { baseUrl: other.baseUrl, health: other.health, duplicates: [], foreign }
+      : { baseUrl: serverBaseUrl(clientHost(), port), health: null, duplicates: [], foreign };
+  }
+  let health = chosen.health;
+  if (reconcileNetwork) {
+    health =
+      (await probeHealth(chosen.baseUrl, { reconcileNetwork: true, timeoutMs: HEALTH_RECONCILE_TIMEOUT_MS })) ?? health;
+  }
+  return { baseUrl: chosen.baseUrl, health, duplicates: ownedDuplicates(owned, chosen), foreign };
+}
+
+// Other Lavish daemons of this installation on the same port. An address the chosen server itself
+// reports as bound is the chosen server, not a duplicate. A server too old to report its addresses
+// is about to be replaced by version, so every other address is retired with it: an old daemon left
+// holding loopback would otherwise make the upgraded server refuse to start.
+function ownedDuplicates(owned, chosen) {
+  const covered = new Set([chosen.host, ...(Array.isArray(chosen.health.hosts) ? chosen.health.hosts : [])]);
+  const duplicates = [];
+  for (const entry of owned) {
+    if (entry === chosen || covered.has(entry.host)) continue;
+    duplicates.push(entry);
+    for (const host of Array.isArray(entry.health.hosts) ? entry.health.hosts : [entry.host]) covered.add(host);
+  }
+  return duplicates;
+}
+
+// Duplicates are retired over their own /shutdown, never by process name or port-wide signal, so
+// nothing but an identified Lavish server of this installation is ever stopped.
+async function stopDuplicateServers(duplicates, { reloadKey = "", reason = "" } = {}) {
+  for (const duplicate of duplicates) {
+    await requestShutdown(duplicate.baseUrl, {
+      reloadKey,
+      reason: reason || serverReplacementReason(VERSION, duplicate.health),
+    });
+    await waitForPortFree(duplicate.baseUrl, 3000);
+  }
+}
+
+// Keep the running server, retiring any same-port duplicate first. Only duplicates whose addresses
+// the kept server already requests reach here (`hostsToServe`), and the reconcile afterwards makes
+// it bind an address the duplicate was holding right away, instead of on its next background retry.
+async function adoptServer(baseUrl, duplicates, reloadKey) {
+  if (duplicates.length === 0) return baseUrl;
+  await stopDuplicateServers(duplicates, { reloadKey });
+  await probeHealth(baseUrl, { reconcileNetwork: true, timeoutMs: HEALTH_RECONCILE_TIMEOUT_MS });
+  return baseUrl;
+}
+
+// The concrete addresses this CLI's own LAVISH_AXI_HOST needs a server to serve. Without an explicit
+// host any running server will do: loopback is always served. A name that does not resolve right
+// now is still required as the name, so the server is asked to serve it, retries it, and reports it
+// as network_warning instead of it being dropped.
+async function requiredServerHosts(env = process.env) {
+  const envHost = env.LAVISH_AXI_HOST?.trim();
+  if (!envHost || isWildcardHost(envHost)) return [];
+  return resolveConcreteListenHosts([clientHost(env)], { keepUnresolved: true });
+}
+
+// Which required addresses a running server was never asked to serve. An address it was asked for
+// but has not bound yet is NOT missing: that server is already retrying it, and a replacement could
+// not bind it either. A server too old to report its requested addresses is judged by version.
+export function missingServerHosts(healthBody, requiredHosts) {
+  if (!healthBody || !Array.isArray(healthBody.requested_hosts)) return [];
+  return requiredHosts.filter((host) => !healthBody.requested_hosts.includes(host));
+}
+
+// Every address the replaced servers were asked to serve, so a replacement - for an upgrade, a
+// changed network, or a missing host - never drops another agent's address and its review links.
+// This CLI's own hosts come from its environment. An address that is no longer on this machine is
+// left out, so the replacement does not retry it forever; one still on a local interface is kept.
+export function inheritedListenHosts(
+  healthBodies,
+  requiredHosts,
+  inherited = [],
+  localAddresses = localInterfaceAddresses(),
+) {
+  const hosts = [...inherited];
+  for (const health of healthBodies) {
+    if (!health || !Array.isArray(health.requested_hosts)) continue;
+    for (const host of health.requested_hosts) {
+      if (host === LOOPBACK_HOST || requiredHosts.includes(host)) continue;
+      if (isIP(host) && !localAddresses.includes(host)) continue;
+      if (!hosts.includes(host)) hosts.push(host);
+    }
+  }
+  return hosts;
+}
+
+// Every address a kept server has to be asked to serve: this CLI's own, and every address a
+// same-port duplicate serves, so retiring that duplicate never takes its review links with it.
+function hostsToServe(requiredHosts, duplicates) {
+  return inheritedListenHosts(
+    duplicates.map((duplicate) => duplicate.health),
+    [],
+    requiredHosts,
+  );
+}
+
+async function probeHealth(baseUrl, { reconcileNetwork, timeoutMs }) {
+  const health = await fetchHealth(baseUrl, { reconcileNetwork, timeoutMs });
+  return health && typeof health === "object" ? health : null;
+}
+
 // `reloadKey` names the session this invocation is about to open. A version-driven replacement
 // reloads that chrome only; every other open review page is told it is outdated and left alone.
+// Three things replace a running server: a version mismatch, a local build whose source changed
+// (`build`), and a network identity change (`network_stale`). The network replacement happens at
+// most once per invocation; the version and build replacements do not consume that bound.
 async function ensureServer({ forceRestart = false, reloadKey = "" } = {}) {
   const port = defaultPort();
-  const baseUrl = `http://${hostForUrl(clientHost())}:${port}`;
-  const existing = await fetchHealth(baseUrl);
+  const requiredHosts = await requiredServerHosts();
+  const { baseUrl, health: existing, duplicates, foreign } = await findRunningServer(port, { reconcileNetwork: true });
+  if (foreign) throw otherInstallationError(port, foreign);
   const build = forceRestart ? localBuildId() : undefined;
-  if (existing && !shouldRestartServer(VERSION, existing, forceRestart, build)) {
-    return baseUrl;
+  const missingHosts =
+    existing?.app === "lavish-axi" ? missingServerHosts(existing, hostsToServe(requiredHosts, duplicates)) : [];
+  if (existing && !shouldRestartServer(VERSION, existing, forceRestart, build) && missingHosts.length === 0) {
+    return adoptServer(baseUrl, duplicates, reloadKey);
   }
+  let alsoListen = inheritedListenHosts([existing, ...duplicates.map((duplicate) => duplicate.health)], requiredHosts);
+  let unidentified = "";
   if (existing) {
-    if (!(await canControlServerOnPort(port, existing, processOnPortMatchesLavish))) {
+    if (!(await canControlServerOnPort(baseUrl, existing, listenerMatchesLavish))) {
       throw new AxiError(`Port ${port} is occupied by a non-Lavish server`, "SERVER_ERROR", [
         `Stop the process using port ${port}, or set LAVISH_AXI_PORT to another port`,
       ]);
     }
+    await stopDuplicateServers(duplicates, { reloadKey });
     // Stale server from an older release is squatting on the port. Ask it to shut down
     // gracefully so the upgraded client doesn't keep handing users an old chrome.
     await requestShutdown(baseUrl, {
@@ -882,23 +1099,82 @@ async function ensureServer({ forceRestart = false, reloadKey = "" } = {}) {
       // so the POST 404'd. Fall back to SIGTERM by PID so the very first upgrade still
       // works, then keep waiting.
       if (shouldKillProcessOnPort(VERSION, existing)) {
-        killProcessOnPort(port);
-        await waitForPortFree(baseUrl, 3000);
+        if (killLavishListener(baseUrl)) await waitForPortFree(baseUrl, 3000);
+        else unidentified = baseUrl;
       }
     }
   }
-  await startServer(port);
-  const deadline = Date.now() + 5000;
+  await startServer(port, { alsoListen });
+  const replacedForNetwork =
+    Boolean(existing) &&
+    existing.app === "lavish-axi" &&
+    existing.network_stale === true &&
+    !forceRestart &&
+    typeof existing.version === "string" &&
+    existing.version === VERSION;
+  let networkRestarted = replacedForNetwork;
+  let raceRestarted = false;
+  let deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
-    const health = await fetchHealth(baseUrl);
+    const {
+      baseUrl: liveUrl,
+      health,
+      duplicates: liveDuplicates,
+      foreign: liveForeign,
+    } = await findRunningServer(port, { reconcileNetwork: true });
+    if (liveForeign) throw otherInstallationError(port, liveForeign);
+    const liveMissing =
+      health?.app === "lavish-axi" ? missingServerHosts(health, hostsToServe(requiredHosts, liveDuplicates)) : [];
+    // Once is the bound: every replacement carries the hosts of the server it replaces, so two CLIs
+    // that each need their own address converge on one server instead of replacing each other.
     if (health && !shouldRestartServer(VERSION, health)) {
-      return baseUrl;
+      if (liveMissing.length === 0) return adoptServer(liveUrl, liveDuplicates, reloadKey);
+      if (raceRestarted) throw missingHostsError(port, liveMissing);
+    }
+    // Another daemon won the port while ours was starting (ours exits when a Lavish server already
+    // owns loopback) - an older release, or one missing an address this CLI needs. Retire it and
+    // start once more rather than wait it out.
+    if (health?.app === "lavish-axi" && health.network_stale !== true && !raceRestarted) {
+      raceRestarted = true;
+      alsoListen = inheritedListenHosts(
+        [health, ...liveDuplicates.map((duplicate) => duplicate.health)],
+        requiredHosts,
+        alsoListen,
+      );
+      await stopDuplicateServers(liveDuplicates, { reloadKey });
+      await requestShutdown(liveUrl, { reloadKey, reason: serverReplacementReason(VERSION, health) });
+      if (!(await waitForPortFree(liveUrl, 3000))) break;
+      await startServer(port, { alsoListen });
+      deadline = Date.now() + 5000;
+      continue;
+    }
+    if (health?.network_stale === true && health.app === "lavish-axi") {
+      if (networkRestarted) {
+        if (liveMissing.length > 0) throw missingHostsError(port, liveMissing);
+        return adoptServer(liveUrl, liveDuplicates, reloadKey);
+      }
+      alsoListen = inheritedListenHosts([health], requiredHosts, alsoListen);
+      await requestShutdown(liveUrl, { reloadKey, reason: "" });
+      if (!(await waitForPortFree(liveUrl, 3000))) break;
+      await startServer(port, { alsoListen });
+      networkRestarted = true;
+      deadline = Date.now() + 5000;
+      continue;
     }
     await delay(100);
   }
+  if (unidentified) throw unidentifiedListenerError(unidentified);
   throw new AxiError("Lavish Editor server did not start", "SERVER_ERROR", [
     `Run \`lavish-axi server --port ${port}\` to inspect server startup`,
   ]);
+}
+
+function missingHostsError(port, missingHosts) {
+  return new AxiError(
+    `The Lavish server on port ${port} does not serve ${missingHosts.join(", ")}, and replacing it did not stick`,
+    "SERVER_ERROR",
+    ["Run `lavish-axi stop`, then retry"],
+  );
 }
 
 // Pure helper so the upgrade-detection logic is unit-testable without spinning up HTTP.
@@ -912,20 +1188,22 @@ export function shouldRestartServer(currentVersion, healthBody, forceRestart = f
   if (forceRestart && healthBody.app === "lavish-axi") {
     if (typeof currentBuild !== "string" || healthBody.build !== currentBuild) return true;
   }
+  if (healthBody.network_stale === true && healthBody.app === "lavish-axi") return true;
   if (typeof healthBody.version !== "string" || healthBody.version === "") return true;
   return healthBody.version !== currentVersion;
 }
 
 // Which branch of `shouldRestartServer` actually fired, because that is what the other open
 // review pages are told. A local-build force replaces a server of the SAME version, so calling it
-// an upgrade would be false on both counts; only a version this CLI does not match is one.
+// an upgrade would be false on both counts; only a version this CLI does not match is one. A
+// network-driven replacement names nothing: the banner has no true line for it.
 export function serverReplacementReason(currentVersion, healthBody, forceRestart = false, currentBuild = undefined) {
   if (!shouldRestartServer(currentVersion, healthBody, forceRestart, currentBuild)) return "";
   const runningVersion = healthBody.version;
   if (typeof runningVersion !== "string" || runningVersion === "" || runningVersion !== currentVersion) {
     return "upgrade";
   }
-  return "local-build";
+  return forceRestart ? "local-build" : "";
 }
 
 export function shouldForceRestartForLocalBuild(
@@ -984,21 +1262,61 @@ export function shouldKillProcessOnPort(currentVersion, healthBody) {
   return healthBody.version !== currentVersion;
 }
 
-async function canControlServerOnPort(port, healthBody, processMatchesLavish) {
+async function canControlServerOnPort(baseUrl, healthBody, processMatchesLavish) {
   if (!healthBody || typeof healthBody !== "object") return false;
   if (healthBody.app === "lavish-axi") return true;
   if (typeof healthBody.version === "string" && healthBody.version !== "") return false;
-  return processMatchesLavish(port);
+  return processMatchesLavish(baseUrl);
 }
 
-async function fetchHealth(baseUrl) {
-  try {
-    const response = await fetch(`${baseUrl}/health`);
-    if (!response.ok) return null;
-    return await response.json();
-  } catch {
-    return null;
-  }
+// Plain node:http with the socket destroyed on every exit path, not fetch: an aborted fetch leaves
+// its TCP connect running, so a probe of an address that silently drops connections kept every CLI
+// invocation alive for the OS connect timeout (~10s) after printing its result.
+/**
+ * @param {string} baseUrl
+ * @param {{ reconcileNetwork?: boolean, timeoutMs?: number }} [options]
+ */
+function fetchHealth(baseUrl, { reconcileNetwork = false, timeoutMs = DEFAULT_HEALTH_TIMEOUT_MS } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    /** @type {import("node:http").ClientRequest | null} */
+    let request = null;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      request?.destroy();
+      resolve(value);
+    };
+    const abort = () => finish(null);
+    const timer = setTimeout(abort, timeoutMs);
+    try {
+      const url = new URL(`${baseUrl}/health${reconcileNetwork ? "?reconcile_network=1" : ""}`);
+      request = httpGet(url, { agent: false }, (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > MAX_HEALTH_BODY_BYTES) finish(null);
+        });
+        response.on("end", () => {
+          if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+            finish(null);
+            return;
+          }
+          try {
+            finish(JSON.parse(body));
+          } catch {
+            finish(null);
+          }
+        });
+        response.on("error", abort);
+      });
+      request.on("error", abort);
+    } catch {
+      abort();
+    }
+  });
 }
 
 // `reason` is what every other open review page is told: this has exactly two callers, and each
@@ -1027,48 +1345,56 @@ async function waitForPortFree(baseUrl, timeoutMs) {
   return false;
 }
 
-// Last-resort fallback for the bootstrap upgrade case: a pre-handshake server is squatting
-// on the port and doesn't expose /shutdown, so we resolve its PID via lsof and SIGTERM it.
-// macOS/Linux only - Windows users would need to kill manually, but lavish-axi isn't
-// shipped for Windows today.
-function killProcessOnPort(port) {
+// PIDs listening on exactly this server's address and port whose command is Lavish. Other
+// processes can share the port at other addresses, so nothing is identified by port alone.
+// macOS/Linux only (lsof) - lavish-axi isn't shipped for Windows today.
+function lavishListenerPids(baseUrl) {
+  const { hostname, port } = new URL(baseUrl);
   try {
-    const result = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
-    if (result.status !== 0) return;
-    for (const line of result.stdout.split("\n")) {
-      const pid = Number(line.trim());
-      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
-        try {
-          process.kill(pid, "SIGTERM");
-        } catch {
-          // Process already gone or permission denied - either way nothing we can do.
-        }
-      }
-    }
-  } catch {
-    // lsof missing or unsupported platform - the outer caller will surface SERVER_ERROR.
-  }
-}
-
-function processOnPortMatchesLavish(port) {
-  try {
-    const pids = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
-    if (pids.status !== 0) return false;
-    for (const line of pids.stdout.split("\n")) {
+    const listing = spawnSync("lsof", ["-t", `-iTCP@${hostname}:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+    if (listing.status !== 0) return [];
+    const pids = [];
+    for (const line of listing.stdout.split("\n")) {
       const pid = Number(line.trim());
       if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
       const command = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
-      if (command.status === 0 && /lavish-axi/.test(command.stdout)) {
-        return true;
-      }
+      if (command.status === 0 && /lavish-axi/.test(command.stdout)) pids.push(pid);
     }
+    return pids;
   } catch {
-    return false;
+    return [];
   }
-  return false;
 }
 
-async function startServer(port) {
+function listenerMatchesLavish(baseUrl) {
+  return lavishListenerPids(baseUrl).length > 0;
+}
+
+// Last-resort fallback for the bootstrap upgrade case: a pre-handshake server is squatting on the
+// port and doesn't expose /shutdown, so its PID is resolved and SIGTERM'd. Reports whether a Lavish
+// process was found to signal.
+function killLavishListener(baseUrl) {
+  const pids = lavishListenerPids(baseUrl);
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // Process already gone or permission denied - either way nothing we can do.
+    }
+  }
+  return pids.length > 0;
+}
+
+function unidentifiedListenerError(baseUrl) {
+  const { host } = new URL(baseUrl);
+  return new AxiError(
+    `The server at ${host} did not shut down, and no Lavish process listening there could be identified`,
+    "SERVER_ERROR",
+    [`Stop the process listening on ${host} yourself, or set LAVISH_AXI_PORT to another port`],
+  );
+}
+
+async function startServer(port, { alsoListen = [] } = {}) {
   await ensureStateDir();
   const entry = resolveServerEntry();
   let logFd = null;
@@ -1078,21 +1404,23 @@ async function startServer(port) {
     // If logging cannot be initialized, keep the server behavior unchanged.
   }
   try {
-    const child = spawn(process.execPath, [entry, "server", "--port", String(port)], createServerSpawnOptions(logFd));
+    const args = [entry, "server", "--port", String(port)];
+    for (const host of alsoListen) args.push("--also-listen", host);
+    const child = spawn(process.execPath, args, createServerSpawnOptions(logFd));
     child.unref();
   } finally {
     if (logFd !== null) closeSync(logFd);
   }
 }
 
-// The detached server child must point at a node-executable entry that actually invokes
-// run(). In source layout that's `../bin/lavish-axi.js` (which calls run on import). In the
-// published bundle, only `dist/cli.mjs` ships and it self-invokes via the bundled bin
-// wrapper. Pick whichever exists.
+// The detached server child must stamp stdio before evaluating the CLI. In source layout that
+// is `../bin/lavish-axi-server.js`. In the published bundle only `dist/` ships, so the sibling
+// `server.mjs` bootstrap (emitted by scripts/build.js next to cli.mjs) is the entry. Ordinary
+// user-facing commands still use `bin/lavish-axi.js` / `dist/cli.mjs`.
 export function resolveServerEntry() {
-  const binEntry = fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url));
-  if (existsSync(binEntry)) return binEntry;
-  return fileURLToPath(import.meta.url);
+  const sourceEntry = fileURLToPath(new URL("../bin/lavish-axi-server.js", import.meta.url));
+  if (existsSync(sourceEntry)) return sourceEntry;
+  return fileURLToPath(new URL("./server.mjs", import.meta.url));
 }
 
 /**
@@ -1203,6 +1531,21 @@ function flagValue(args, flag) {
   return null;
 }
 
+function flagValues(args, flag) {
+  const values = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--") break;
+    if (arg === flag && args[i + 1]) {
+      values.push(args[i + 1]);
+      i += 1;
+    } else if (arg.startsWith(`${flag}=`) && arg.length > flag.length + 1) {
+      values.push(arg.slice(flag.length + 1));
+    }
+  }
+  return values;
+}
+
 function isValueFlagToken(arg, flags) {
   for (const flag of flags) {
     if (arg === flag || arg.startsWith(`${flag}=`)) return true;
@@ -1240,7 +1583,7 @@ function createCommandHelp() {
     playbook: `Usage: lavish-axi playbook [playbook_id]\n\nList focused artifact guidance playbooks, or show one playbook by ID. Known IDs: diagram, table, comparison, plan, code, input, explanation, slides.\n\n${PLAYBOOK_ROUTER_HELP}\n\nExamples:\n  lavish-axi playbook\n  lavish-axi playbook diagram\n  lavish-axi playbook input\n`,
     design: `Usage: lavish-axi design\n\nShow a copy-pasteable CDN snippet for Tailwind CSS browser runtime v4 + DaisyUI v5 + themes, the Mermaid opt-in snippet, a content-to-playbook router, an optional layout safety CSS snippet, plus technical reference for DaisyUI components. ${PLAYBOOK_ROUTER_HELP} Lavish artifacts stay portable HTML. This CDN snippet is the design fallback, not the default: inspect the subject project before falling back, and paste the layout safety CSS only when useful for dense nested grid/flex layouts, badges, wide fonts, or local media. ${DESIGN_PRIORITY_RULE}\n`,
     setup: `The \`setup hooks\` command is disabled in this fork (askzy/lavish-axi). Wire up any lavish-axi ambient context manually in your agent settings if desired.\n`,
-    server: `Usage: lavish-axi server [--port 4387] [--verbose]\n\nRun the local Lavish Editor server. Pass --verbose (or set LAVISH_AXI_DEBUG=1) to log session and watcher events to stderr. Detached server output is appended to ~/.lavish-axi/server.log, or LAVISH_AXI_STATE_DIR/server.log when set, for startup and crash diagnostics.\n\nLAVISH_AXI_HOST sets the bind address (default 127.0.0.1; a wildcard 0.0.0.0 or :: binds every interface). Binding beyond loopback exposes an unauthenticated server that can read and serve arbitrary local files to anything that can reach it, so only do so on a trusted network. LAVISH_AXI_LINK_HOST sets the hostname written into generated session links (default: the bind address, or loopback when bound to a wildcard). LAVISH_AXI_NO_OPEN=1 (or --no-open) suppresses the local browser launch.\n`,
+    server: `Usage: lavish-axi server [--port 4387] [--verbose] [--also-listen <host>...]\n\nRun the local Lavish Editor server. Pass --verbose (or set LAVISH_AXI_DEBUG=1) to log session and watcher events to stderr. Detached server output is appended with UTC timestamps to ~/.lavish-axi/server.log, or LAVISH_AXI_STATE_DIR/server.log when set, for startup, shutdown-cause, and crash diagnostics.\n\nThe server always listens on 127.0.0.1, so every local CLI finds it whatever its own LAVISH_AXI_HOST says. LAVISH_AXI_HOST adds a concrete bind address beside loopback; wildcard values such as 0.0.0.0 or :: are restricted to loopback and never bind every interface. --also-listen adds further concrete addresses (the CLI passes it when it replaces a server, to keep every address the old one served). An address that cannot be bound is retried in the background and reported as network_warning. Binding beyond loopback exposes an unauthenticated server that can read and serve arbitrary local files to anything that can reach it, so only do so on a trusted network. LAVISH_AXI_LINK_HOST sets the hostname written into generated session links (default: the bind address while it is bound, else loopback). See README's Allowed hosts section for Host allowlisting and LAVISH_AXI_ALLOWED_HOSTS. LAVISH_AXI_NO_OPEN=1 (or --no-open) suppresses the local browser launch.\n`,
   };
 }
 
