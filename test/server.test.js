@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -120,6 +120,15 @@ test("server delegates artifact SDK generation to a dedicated source module", as
   assert.match(source, /from "\.\/artifact-sdk\.js"/);
 });
 
+test("artifact iframe sandbox lets popups escape without granting same-origin", () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const match = html.match(/<iframe id="artifact" sandbox="([^"]+)"/);
+  assert.ok(match, "artifact iframe must declare a sandbox");
+  const tokens = new Set(match[1].split(/\s+/).filter(Boolean));
+  assert.equal(tokens.has("allow-popups-to-escape-sandbox"), true);
+  assert.equal(tokens.has("allow-same-origin"), false);
+});
+
 test("server serves chrome browser behavior from a dedicated source file", async () => {
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
@@ -146,11 +155,71 @@ test("export content disposition uses a safe fallback and encoded UTF-8 filename
   );
 });
 
-test("artifact assets resolve within the artifact directory", () => {
+test("artifact assets resolve within the artifact directory", async () => {
   const root = path.resolve("/tmp/lavish-artifact");
 
-  assert.equal(resolveArtifactAsset(root, "style.css"), path.join(root, "style.css"));
-  assert.equal(resolveArtifactAsset(root, "../secret.txt"), null);
+  assert.equal(await resolveArtifactAsset(root, "style.css"), path.join(root, "style.css"));
+  assert.equal(await resolveArtifactAsset(root, "../secret.txt"), null);
+});
+
+test("artifact assets reject a symlink that escapes the artifact directory", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const outside = await mkdtemp(path.join(tmpdir(), "lavish-outside-"));
+  try {
+    const secret = path.join(outside, "secret.txt");
+    await writeFile(secret, "outside-secret\n");
+    const link = path.join(dir, "leak.txt");
+    await symlink(secret, link);
+
+    assert.equal(await resolveArtifactAsset(dir, "leak.txt"), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("artifact assets reject a path that escapes through an intermediate directory symlink", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const outside = await mkdtemp(path.join(tmpdir(), "lavish-outside-"));
+  try {
+    await writeFile(path.join(outside, "secret.txt"), "outside-secret\n");
+    // The escaping link is a *directory* component, so the leaf name looks ordinary.
+    await symlink(outside, path.join(dir, "vendor"));
+
+    assert.equal(await resolveArtifactAsset(dir, "vendor/secret.txt"), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("artifact assets still resolve a symlink that stays inside the artifact directory", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  try {
+    const real = path.join(dir, "real.css");
+    await writeFile(real, "body { color: rgb(1 2 3); }\n");
+    await symlink(real, path.join(dir, "alias.css"));
+
+    // Confinement must not over-block, and the resolved (symlink-free) path is what callers
+    // get, so nothing re-follows the link after the check.
+    assert.equal(await resolveArtifactAsset(dir, "alias.css"), await realpath(real));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact asset resolution fails closed when realpath errors", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  try {
+    const linkA = path.join(dir, "loop-a");
+    const linkB = path.join(dir, "loop-b");
+    await symlink(linkB, linkA);
+    await symlink(linkA, linkB);
+
+    await assert.rejects(resolveArtifactAsset(dir, "loop-a"), { code: "ELOOP" });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("chrome sandbox does not grant modal prompts", () => {
@@ -1301,6 +1370,10 @@ test("/artifact serves files copied under the artifact directory", async () => {
     '<!doctype html><html><head><link rel="stylesheet" href="assets/style.css"></head><body><img src="./assets/icon.svg"></body></html>',
   );
   await writeFile(path.join(assetDir, "style.css"), "body { color: rgb(1 2 3); }\n");
+  await writeFile(
+    path.join(assetDir, "popup.html"),
+    "<!doctype html><script>document.title = 'artifact popup'</script>",
+  );
   await writeFile(path.join(assetDir, "icon.svg"), '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>');
   const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
   try {
@@ -1311,15 +1384,114 @@ test("/artifact serves files copied under the artifact directory", async () => {
       body: JSON.stringify({ file: artifact }),
     });
     const session = await sessionRes.json();
+    const load = await beginArtifactLoad(base, session.key);
+    const documentResponse = await fetch(artifactLoadUrl(base, session.key, load));
+    const popup = await fetch(`${base}/artifact/${session.key}/assets/popup.html`);
     const css = await fetch(`${base}/artifact/${session.key}/assets/style.css`);
     const svg = await fetch(`${base}/artifact/${session.key}/assets/icon.svg`);
+    const expectedSandbox =
+      "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads";
 
+    assert.equal(documentResponse.status, 200);
+    assert.equal(documentResponse.headers.get("content-security-policy"), expectedSandbox);
+    assert.equal(popup.status, 200);
+    assert.equal(popup.headers.get("content-security-policy"), expectedSandbox);
     assert.equal(css.status, 200);
     assert.match(css.headers.get("content-type") || "", /text\/css/);
     assert.equal(await css.text(), "body { color: rgb(1 2 3); }\n");
     assert.equal(svg.status, 200);
+    assert.equal(svg.headers.get("content-security-policy"), expectedSandbox);
     assert.match(svg.headers.get("content-type") || "", /image\/svg\+xml/);
     assert.match(await svg.text(), /<svg/);
+  } finally {
+    await server.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("/artifact refuses to serve a symlink that escapes the artifact directory", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const outside = await mkdtemp(path.join(tmpdir(), "lavish-outside-"));
+  const dir = path.join(parent, ".lavish");
+  const artifact = path.join(dir, "artifact.html");
+  await mkdir(dir);
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const secret = path.join(outside, "secret.txt");
+  await writeFile(secret, "outside-secret\n");
+  await symlink(secret, path.join(dir, "leak.txt"));
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+    const leak = await fetch(`${base}/artifact/${session.key}/leak.txt`);
+
+    assert.equal(leak.status, 403);
+    assert.doesNotMatch(await leak.text(), /outside-secret/);
+  } finally {
+    await server.close();
+    await rm(parent, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("/artifact refuses a path that escapes through an intermediate directory symlink", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const outside = await mkdtemp(path.join(tmpdir(), "lavish-outside-"));
+  const dir = path.join(parent, ".lavish");
+  const artifact = path.join(dir, "artifact.html");
+  await mkdir(dir);
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(path.join(outside, "secret.txt"), "outside-secret\n");
+  await symlink(outside, path.join(dir, "vendor"));
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+    const leak = await fetch(`${base}/artifact/${session.key}/vendor/secret.txt`);
+
+    assert.equal(leak.status, 403);
+    assert.doesNotMatch(await leak.text(), /outside-secret/);
+  } finally {
+    await server.close();
+    await rm(parent, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+// The realpath hardening must not cost us the original lexical guard, and `fetch` collapses
+// `..` in a URL before it ever reaches the wire - only a raw request proves the server itself
+// still rejects the traversal.
+test("/artifact still rejects lexical .. traversal that reaches the server unnormalized", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const dir = path.join(parent, ".lavish");
+  const artifact = path.join(dir, "artifact.html");
+  await mkdir(dir);
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  await writeFile(path.join(parent, "secret.txt"), "outside-secret\n");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const sessionRes = await fetch(`http://127.0.0.1:${server.port}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const session = await sessionRes.json();
+
+    for (const suffix of ["../secret.txt", "%2e%2e/secret.txt", "assets/../../secret.txt"]) {
+      const res = await rawRequest(server.port, `/artifact/${session.key}/${suffix}`);
+      assert.equal(res.status, 403, `expected 403 for ${suffix}`);
+      assert.doesNotMatch(res.body, /outside-secret/);
+    }
   } finally {
     await server.close();
     await rm(parent, { recursive: true, force: true });
@@ -2255,6 +2427,10 @@ test("GET /api/:key/export inlines local assets and leaves remote references int
 
     const exportRes = await fetch(`${base}/api/${session.key}/export`);
     assert.equal(exportRes.status, 200);
+    assert.equal(
+      exportRes.headers.get("content-security-policy"),
+      "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads",
+    );
     assert.match(exportRes.headers.get("content-disposition") || "", /attachment; filename="artifact\.export\.html"/);
     const body = await exportRes.text();
     // local stylesheet + image inlined
@@ -3468,7 +3644,7 @@ test("layout gate curtain reuses the ended overlay card styling", async () => {
   assert.match(html, /<body class="lavish layout-gate-active">/);
   assert.match(
     html,
-    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="\/artifact\/abc\/index\.html"><\/iframe>/,
+    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="\/artifact\/abc\/index\.html"><\/iframe>/,
   );
   assert.doesNotMatch(html, /<iframe id="artifact"[^>]* src=/);
   assert.match(html, /class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"/);
