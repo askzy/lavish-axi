@@ -15,7 +15,7 @@ import {
   serializeLayoutWarnings,
 } from "./layout-warnings.js";
 import { AsyncMutex } from "./async-mutex.js";
-import { chatEntryForPrompt, normalizePromptId } from "./chat-messages.js";
+import { boundStoredChat, chatEntryForPrompt, collectChatAckIds, normalizePromptId } from "./chat-messages.js";
 import { normalizeMermaidNodeTarget } from "./mermaid-node.js";
 import { EXCALIDRAW_SCENE_TARGET_TYPE, normalizeExcalidrawSceneTarget } from "./whiteboard-core.js";
 
@@ -270,6 +270,7 @@ export class SessionStore {
       const userMessages = acceptedPrompts.map((prompt) => chatEntryForPrompt(prompt, at)).filter(Boolean);
       session.prompts = [...(session.prompts || []), ...acceptedPrompts.map(agentFacingPrompt)];
       session.chat = [...(session.chat || []), ...userMessages];
+      applyTranscriptBound(session);
       if (userMessages.length > 0) session.chat_revision = normalizeRevision(session.chat_revision) + 1;
       session.pending_prompts = session.prompts.length;
       session.dom_snapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
@@ -704,6 +705,7 @@ export class SessionStore {
       }
       const at = new Date().toISOString();
       session.chat = [...(session.chat || []), { role: "agent", text: String(text || ""), at }];
+      applyTranscriptBound(session);
       session.chat_revision = normalizeRevision(session.chat_revision) + 1;
       // A reply means the agent acted on everything delivered so far, so every lease is retired
       // even when the poll that took it never acked.
@@ -779,7 +781,17 @@ export class SessionStore {
     try {
       const raw = await readFile(this.file, "utf8");
       const parsed = JSON.parse(raw);
-      return { sessions: parsed.sessions || {} };
+      const state = { sessions: parsed.sessions || {} };
+      // A transcript written before the bound existed is bounded on first load and persisted, so
+      // the session is never served over the cap and the evicted acks survive the next write.
+      let changed = false;
+      for (const session of Object.values(state.sessions)) {
+        if (!session || typeof session !== "object" || !applyTranscriptBound(session)) continue;
+        session.chat_revision = normalizeRevision(session.chat_revision) + 1;
+        changed = true;
+      }
+      if (changed) await this.writeState(state);
+      return state;
     } catch (error) {
       if (error && error.code === "ENOENT") {
         return { sessions: {} };
@@ -1115,6 +1127,23 @@ function parseSequenceValue(value) {
 function normalizeRevision(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? Math.trunc(number) : 0;
+}
+
+// Keeps `session.chat` within MAX_CHAT_STORED_BYTES and moves the prompt_id of every evicted
+// user entry onto `chat_ack_ids`, so the identity still settles the chrome's queued bubble and
+// still dedups a retried POST after the visible entry is gone. Returns whether anything changed.
+function applyTranscriptBound(session) {
+  const originalChat = Array.isArray(session.chat) ? session.chat : [];
+  const { chat, evicted } = boundStoredChat(session.chat);
+  const chatChanged =
+    !Array.isArray(session.chat) ||
+    chat.length !== originalChat.length ||
+    chat.some((entry, index) => entry !== originalChat[index]);
+  session.chat = chat;
+  if (evicted.length === 0) return chatChanged;
+  const existingAckCount = Array.isArray(session.chat_ack_ids) ? session.chat_ack_ids.length : 0;
+  session.chat_ack_ids = collectChatAckIds(evicted, session.chat_ack_ids);
+  return chatChanged || session.chat_ack_ids.length !== existingAckCount;
 }
 
 function parseRevisionValue(value) {

@@ -690,3 +690,40 @@ test("an annotation-only transcript counts as a user message for the unreplied r
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("prune --dry-run keeps an annotation-only session the unreplied window would otherwise remove, and the help says so", async () => {
+  const dir = await makeTemp();
+  const stateDir = path.join(dir, "state");
+  await mkdir(stateDir);
+  try {
+    const annotated = await writeArtifact(dir, "annotated.html", new Date());
+    const silent = await writeArtifact(dir, "silent.html", new Date());
+    await writeStore(stateDir, [
+      sessionRecord(annotated, "open", daysAgo(15), ANNOTATION_ONLY),
+      sessionRecord(silent, "open", daysAgo(15), AGENT_ONLY),
+    ]);
+    const env = { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_TELEMETRY: "0" };
+
+    const dry = spawnSync(process.execPath, [BIN, "prune", "--dry-run", "--unreplied-older-than", "14d"], {
+      encoding: "utf8",
+      env,
+      cwd: os.tmpdir(),
+    });
+    assert.equal(dry.status, 0, dry.stderr || dry.stdout);
+    assert.match(dry.stdout.trim(), /^Would remove 1 session and 0 files, .* freed$/);
+    const remaining = JSON.parse(await readFile(path.join(stateDir, "state.json"), "utf8")).sessions;
+    assert.deepEqual(
+      Object.values(remaining)
+        .map((session) => session.file)
+        .sort(),
+      [annotated, silent].sort(),
+      "a dry run writes nothing",
+    );
+
+    const help = spawnSync(process.execPath, [BIN, "prune", "--help"], { encoding: "utf8", env });
+    assert.equal(help.status, 0, help.stderr || help.stdout);
+    assert.match(help.stdout, /an annotation or whiteboard the user sent counts as a message/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
