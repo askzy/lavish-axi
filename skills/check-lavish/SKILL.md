@@ -43,8 +43,12 @@ that next poll.
    prompt is an explicit repair request; apply every listed fix in one pass.
 5. If the session is still open and you want to carry on in the browser, reply with
    `npx -y lavish-axi poll <html-file> --agent-reply "<message>"` and follow the `/lavish` wake-path
-   rules from there. If the user is done, or you will not poll again in this conversation, run
-   `npx -y lavish-axi end <html-file>`.
+   rules from there. If the user is done, or you will not poll again in this conversation, post
+   the result with `npx -y lavish-axi reply <html-file> --agent-reply "<message>"` - it exits once the
+   server accepts the reply, so the review page stops showing Working - then run
+   `npx -y lavish-axi end <html-file>`. A reply claims no listener, so it is never refused while
+   another poll holds the session; on an ended session it exits with `SESSION_ENDED` and the
+   update belongs in this conversation instead.
 
 ## When the queue is empty but the user says they sent feedback
 
@@ -53,12 +57,14 @@ the feedback and then exited before acknowledging it - typically a poll a subage
 behind - leaves that lease to expire, and the next drain delivers the batch again. Signals: the
 browser is stuck on "Working" or a spinner, or the drain came back `waiting` with a
 `retry_after_ms`. Wait that long, then drain again with `--timeout-ms 0`; the prompts come back.
-Apply them normally, then reply into the browser so it stops spinning.
+Apply them normally, then reply into the browser so it stops spinning - `npx -y lavish-axi reply
+<html-file> --agent-reply "<message>"` does that without opening a long poll, and it retires the
+lease.
 
 ## Rules
 
 - To collect queued feedback later - the `/check-lavish` path - start from the artifact you already know: the html file this session or its subagents passed to `npx -y lavish-axi`, else the newest file under `.lavish/` in the working directory. Drain it directly with `npx -y lavish-axi poll <html-file> --timeout-ms 0`, which returns immediately instead of waiting. Do this whether or not the file appears in the no-argument session list: a session the user ended is absent from that list but still delivers its queued feedback once, and `session_ended: true` in the result means stop after this drain and do not reopen. Only when the conversation names no artifact, run `npx -y lavish-axi` with no arguments and pick from the list it prints; each listed session carries a pending prompts count, and `open` sessions accumulate across conversations, so the list is neither complete nor live.
 - Do NOT silently re-run the poll after a reap. Every wake re-reads the whole conversation, so an unbounded re-poll loop is a standing token cost that grows with the session, and it is the reason an agent eventually decides it is stuck and abandons a review the user is still working through. Hand back instead: say in one line that you have stopped listening, that anything already sent is safely queued, and that `/check-lavish` will collect it.
-- One poll listens per session: a second `npx -y lavish-axi poll` without `--takeover` fails with `LISTENER_ACTIVE` instead of silently returning waiting, and the error names the current listener's label and age. Treat it as a live poll elsewhere - usually one this conversation or a subagent left running - not as a server fault: do not retry it in a loop and do not start another listener to look. The zero-timeout drain (`npx -y lavish-axi poll <html-file> --timeout-ms 0`, the `/check-lavish` path) is never refused - it claims no listener and returns the queue at once - so collect queued feedback that way while the holder keeps waiting. Pass `--takeover` only when you mean to displace the holder; it exits with `LISTENER_REPLACED` and stops listening. Pass `--owner <label>` to make your listener visible in session listings and in the refusal others see.
+- One poll listens per session: a second `npx -y lavish-axi poll` without `--takeover` fails with `LISTENER_ACTIVE` instead of silently returning waiting, and the error names the current listener's label and age. Treat it as a live poll elsewhere - usually one this conversation or a subagent left running - not as a server fault: do not retry it in a loop and do not start another listener to look. The zero-timeout drain (`npx -y lavish-axi poll <html-file> --timeout-ms 0`, the `/check-lavish` path) is never refused - it claims no listener and returns the queue at once - so collect queued feedback that way while the holder keeps waiting. `npx -y lavish-axi reply <html-file> --agent-reply "<message>"` is never refused either: it posts the reply and exits once the server accepts it, claims no listener, and leaves the holder listening. Pass `--takeover` only when you mean to displace the holder; it exits with `LISTENER_REPLACED` and stops listening. Pass `--owner <label>` to make your listener visible in session listings and in the refusal others see.
 - A subagent must NEVER own a Lavish poll. The poll delivers to whoever started it, so when the subagent exits the prompts land in an output file nobody reads and no completion notification reaches the session that can act on them. When delegating artifact edits, forbid `npx -y lavish-axi` in the brief; the parent polls after the subagent returns.
 - `Send & End` ends the session. Its final feedback is still delivered once. After that response, polling stops, and the agent must not reopen the session uninvited.

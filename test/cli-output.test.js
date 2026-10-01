@@ -760,6 +760,9 @@ test("open output keeps the user URL in session data and next_step focused on po
   assert.doesNotMatch(output.next_step, /http:\/\/localhost:4387\/session\/abc123/);
   assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
   assert.match(output.next_step, /lavish-axi poll \/tmp\/artifact\.html/);
+  assert.match(output.next_step, /keep waiting for more feedback/);
+  assert.match(output.next_step, /lavish-axi reply \/tmp\/artifact\.html --agent-reply/);
+  assert.match(output.next_step, /without starting another long-poll/);
   assert.match(output.next_step, /Layout issues inbox/);
   assert.doesNotMatch(output.next_step, /layout_warnings/);
   assert.match(output.next_step, /never kill it/);
@@ -945,7 +948,7 @@ test("feedback next step keeps the next poll completion observable", () => {
   assert.match(output.next_step, /without --timeout-ms/);
   assertObservablePollWakePath(output.next_step);
   assert.match(output.next_step, /queued feedback is never lost/);
-  assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
+  assert.match(output.next_step, /Do not respond to the user just yet\. If you are continuing to wait for feedback/);
   assert.doesNotMatch(output.next_step, /above 10 minutes/);
 });
 
@@ -962,6 +965,10 @@ test("detected layout warnings never appear in poll output", () => {
   assert.equal("layout_warnings" in output, false);
   assert.equal("artifact_failures" in output, false);
   assert.match(output.next_step, /Apply the requested changes/);
+  assert.match(output.next_step, /lavish-axi poll \/tmp\/report\.html --agent-reply/);
+  assert.match(output.next_step, /continuing to wait for feedback/);
+  assert.match(output.next_step, /lavish-axi reply \/tmp\/report\.html --agent-reply/);
+  assert.match(output.next_step, /without starting another long-poll/);
 });
 
 test("a queued layout-warnings batch reads as ordinary feedback with lifecycle guidance", () => {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createHomeOutput } from "../src/cli.js";
-import { SKILL_DESCRIPTION, createSkillMarkdown } from "../src/skill.js";
+import { SKILL_DESCRIPTION, createCheckSkillMarkdown, createSkillMarkdown } from "../src/skill.js";
 
 function skillCommandText(text) {
   return text.replaceAll("`lavish-axi", "`npx -y lavish-axi");
@@ -127,4 +127,30 @@ test("createSkillMarkdown uses non-interactive npx commands", () => {
   assert.match(md, /run it as `npx -y lavish-axi/);
   assert.doesNotMatch(md, /`npx lavish-axi/);
   assert.doesNotMatch(md, /Run `lavish-axi/);
+});
+
+test("fork: both skills route a hand-back reply through `reply` and keep the drain rules intact", () => {
+  const lavish = createSkillMarkdown();
+  const check = createCheckSkillMarkdown();
+
+  const workflow = lavish.slice(lavish.indexOf("## Workflow"), lavish.indexOf("## Visual guidance"));
+  assert.match(workflow, /`npx -y lavish-axi reply <html-file> --agent-reply "<message>"`/);
+  assert.match(workflow, /without starting another long-poll/);
+  assert.match(workflow, /exits 0 only once the server accepts it/);
+  assert.match(workflow, /claims no listener/);
+  assert.match(workflow, /`npx -y lavish-axi reply --help`/);
+  // The hand-back on a reaped poll and the /check-lavish drain stay the recovery path.
+  assert.match(workflow, /hand the review back rather than looping/);
+  assert.match(workflow, /`\/check-lavish` will collect it/);
+  assert.match(workflow, /poll <html-file> --timeout-ms 0/);
+
+  assert.match(check, /`npx -y lavish-axi reply <html-file> --agent-reply "<message>"`/);
+  assert.match(check, /SESSION_ENDED/);
+  assert.match(check, /never refused while\s+another poll holds the session/);
+  assert.match(check, /it retires the\s+lease/);
+  // Rendered from POLL_LISTENER_RULE into both skills: a reply is not a listener either.
+  for (const md of [lavish, check]) {
+    assert.match(md, /`npx -y lavish-axi reply <html-file> --agent-reply "<message>"` is never refused either/);
+    assert.match(md, /LISTENER_ACTIVE/);
+  }
 });
