@@ -2681,8 +2681,11 @@ test("a refreshed chrome receives a new handoff and establishes the newest load"
     const restartedChrome = chromeSessionData(
       await fetch(`${restartedBase}/session/${key}`).then((response) => response.text()),
     );
-    assert.equal(restartedChrome.initialArtifactLoadToken, "");
-    assert.equal((await fetch(artifactLoadUrl(restartedBase, key, refreshedLoad))).status, 409);
+    // The replacement server adopts the live load from state.json, so a chrome that renders
+    // against it is handed the same token the previous server issued, and the artifact the
+    // reviewer already has open keeps answering.
+    assert.equal(restartedChrome.initialArtifactLoadToken, refreshedLoad.artifact_load_token);
+    assert.equal((await fetch(artifactLoadUrl(restartedBase, key, refreshedLoad))).status, 200);
     const restartedLoad = await fetch(`${restartedBase}/api/${key}/artifact-loads/begin`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -2694,6 +2697,113 @@ test("a refreshed chrome receives a new handoff and establishes the newest load"
     }).then((response) => response.json());
     assert.equal(restartedLoad.artifact_revision, refreshedLoad.artifact_revision + 1);
     assert.equal((await fetch(artifactLoadUrl(restartedBase, key, restartedLoad))).status, 200);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Issue #369: an `npx -y lavish-axi ...` that resolves a newer CLI restarts the server under a
+// reviewer who never asked for it. Every open review then answered 409 "Artifact load expired"
+// and the chrome showed an empty middle, which reads as the page being gone.
+test("a live artifact load survives the server restart the reviewer never asked for", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const stateFile = path.join(dir, "state.json");
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  let server = await serve({ port: 0, stateFile, version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const load = await beginArtifactLoad(base, key);
+    assert.equal((await fetch(artifactLoadUrl(base, key, load))).status, 200);
+
+    await server.close();
+    server = await serve({ port: 0, stateFile, version: "9.9.9-test" });
+    const restartedBase = `http://127.0.0.1:${server.port}`;
+
+    // The open tab re-requests with the token it is already holding: the document, its probe,
+    // and the SDK the document boots all have to keep answering it.
+    assert.equal((await fetch(artifactLoadUrl(restartedBase, key, load))).status, 200);
+    assert.equal((await fetch(artifactLoadUrl(restartedBase, key, load, { probe: true }))).status, 200);
+    const sdk = await fetch(
+      `${restartedBase}/sdk.js?key=${key}&artifact_revision=${load.artifact_revision}&artifact_load_token=${encodeURIComponent(load.artifact_load_token)}`,
+    );
+    assert.equal(sdk.status, 200);
+
+    // Only the restart stopped fencing the old token. A newer begun load still does.
+    const newer = await beginArtifactLoad(restartedBase, key);
+    assert.notEqual(newer.artifact_load_token, load.artifact_load_token);
+    assert.equal((await fetch(artifactLoadUrl(restartedBase, key, newer))).status, 200);
+    assert.equal((await fetch(artifactLoadUrl(restartedBase, key, load))).status, 409);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// The fork's restart guard (`shouldRestartServer`) still restarts the server for a new local
+// build id. That restart used to drop every open tab's load: the chrome re-rendered against a
+// blank load and the artifact answered 409. Fewer restarts is the guard's job; the ones it keeps
+// have to be invisible to the tab.
+test("a new local build id restart keeps the open tab's artifact load and reviewer handoff", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const stateFile = path.join(dir, "state.json");
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  let server = await serve({ port: 0, stateFile, version: "9.9.9-test", build: "build-one" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const chrome = chromeSessionData(await fetch(`${base}/session/${key}`).then((response) => response.text()));
+    const begun = await fetch(`${base}/api/${key}/artifact-loads/begin`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ request_id: "live-load", request_sequence: 1, chrome_load_token: chrome.chromeLoadToken }),
+    });
+    assert.equal(begun.status, 200);
+    const load = await begun.json();
+    assert.equal((await fetch(artifactLoadUrl(base, key, load))).status, 200);
+
+    await server.close();
+    server = await serve({ port: 0, stateFile, version: "9.9.9-test", build: "build-two" });
+    const restartedBase = `http://127.0.0.1:${server.port}`;
+    const health = await fetch(`${restartedBase}/health`).then((response) => response.json());
+    assert.equal(health.build, "build-two");
+
+    assert.equal((await fetch(artifactLoadUrl(restartedBase, key, load))).status, 200);
+    const sdk = await fetch(
+      `${restartedBase}/sdk.js?key=${key}&artifact_revision=${load.artifact_revision}&artifact_load_token=${encodeURIComponent(load.artifact_load_token)}`,
+    );
+    assert.equal(sdk.status, 200);
+
+    // The tab that owned the review still owns it: its next begin on the pre-restart handoff is
+    // a new epoch, not a `no-handoff` re-handshake.
+    const resumed = await fetch(`${restartedBase}/api/${key}/artifact-loads/begin`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        request_id: "resumed-load",
+        request_sequence: 2,
+        chrome_load_token: chrome.chromeLoadToken,
+      }),
+    });
+    assert.equal(resumed.status, 200);
+    const resumedLoad = await resumed.json();
+    assert.equal(resumedLoad.stale, undefined);
+    assert.equal(resumedLoad.artifact_revision, load.artifact_revision + 1);
+    assert.equal((await fetch(artifactLoadUrl(restartedBase, key, resumedLoad))).status, 200);
+    assert.equal((await fetch(artifactLoadUrl(restartedBase, key, load))).status, 409);
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
