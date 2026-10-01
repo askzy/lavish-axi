@@ -665,6 +665,27 @@ export class SessionStore {
     });
   }
 
+  // Expires one lease now. The poll that took the batch was displaced or its client went away
+  // before the response left, so nothing reached an agent; the next take delivers it again at
+  // once instead of after the TTL. Ack and reply still retire leases; this only re-times one.
+  async releaseFeedback(key, deliveryId) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) {
+        return null;
+      }
+      const leases = normalizeLeases(session.leases);
+      const lease = leases.find((entry) => entry.delivery_id === deliveryId);
+      if (!lease) return { session, released: false };
+      lease.leased_at = new Date(0).toISOString();
+      session.leases = leases;
+      session.updated_at = new Date().toISOString();
+      await this.writeState(state);
+      return { session, released: true };
+    });
+  }
+
   leaseExpired(lease, now) {
     const leasedAt = Date.parse(lease.leased_at);
     return !Number.isFinite(leasedAt) || now - leasedAt >= this.feedbackLeaseTtlMs;

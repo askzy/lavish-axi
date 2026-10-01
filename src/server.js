@@ -74,6 +74,7 @@ import {
   resolvePruneUnrepliedMaxAgeMs,
 } from "./prune.js";
 import { formatServerLogLine, serverStdioIsTimestamped } from "./server-log.js";
+import { AsyncMutex } from "./async-mutex.js";
 import { canonicalFile, canonicalSessionFile, SessionStore, sessionKey } from "./session-store.js";
 import { detectTailscale } from "./tailscale.js";
 import {
@@ -127,6 +128,8 @@ const ATTACHMENT_SWEEP_INTERVAL_MS = 60 * 60_000;
 // in the chrome's outdated banner, so an unknown value is dropped rather than passed through to
 // text the user would read as a fact.
 const SHUTDOWN_REASONS = new Set(["upgrade", "local-build", "stop"]);
+// The listener label a bare `lavish-axi poll` holds a session under; `--owner <label>` replaces it.
+const AGENT_LISTENER_LABEL = "agent-listener";
 // An escaped popup can navigate to an artifact-owned HTML or SVG asset on the
 // server origin. Keep every artifact response sandboxed at the response layer
 // so active documents stay opaque-origin even when they are top-level.
@@ -341,13 +344,19 @@ export async function serve({
   const store = new SessionStore(stateFile, feedbackLeaseTtlMs === undefined ? {} : { feedbackLeaseTtlMs });
   const events = new EventEmitter();
   const watchers = new Map();
+  // Session key -> the one poll holder listening on it. Ownership is exclusive and lives only
+  // here: a second poll is refused with LISTENER_ACTIVE unless it takes over.
   const activePolls = new Map();
   const deliveredFeedback = new Set();
+  const pollOwnershipLock = new AsyncMutex();
   // Live-event client -> session key, so a session can tell whether any browser chrome still holds
   // it and a version-driven shutdown can reload the one chrome whose artifact is being reopened.
   // Current chromes use a WebSocket; the legacy SSE route only tells an old chrome to reload.
   const liveEventClients = new Map();
   const browserDisconnectTimers = new Map();
+  // Sessions whose grace timer fired while no poll had its listeners armed yet (the take was in
+  // flight); the poll reconciles it right after arming instead of waiting for nothing.
+  const browserDisconnectPending = new Set();
   let shuttingDown = false;
   // Sessions with at least one warning the user queued that has not been re-checked yet.
   const outstandingRepairBatches = new Set();
@@ -586,6 +595,7 @@ export async function serve({
       requested_hosts: [...new Set([...listenHosts, ...requestedListenHosts])],
       ...(networkStale ? { network_stale: true } : {}),
       ...(networkWarning ? { network_warning: networkWarning } : {}),
+      listeners: [...activePolls].map(([key, holder]) => ({ key, label: listenerLabel(holder) })),
     });
   });
 
@@ -637,7 +647,86 @@ export async function serve({
     }
   });
 
-  app.get("/api/poll", async (req, res, next) => {
+  async function publishAgentReply(key, text) {
+    const session = await store.addAgentReply(key, text);
+    if (!session) return null;
+    const last = session.chat?.at(-1);
+    const entry = serializeChat([last?.role === "agent" ? last : { role: "agent", text, at: session.updated_at }])[0];
+    events.emit("agent-reply", key, entry);
+    events.emit("chat-sync", key, session);
+    // The reply concludes the delivered-feedback "working" state. Without this, a poll that
+    // drains feedback and then releases leaves presence stuck on "working" - the chrome keeps
+    // Send disabled - until some future poll happens to attach, even though the agent already
+    // answered. See "event WebSocket agent-presence returns to waiting after an agent reply".
+    clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+    return session;
+  }
+
+  function finishFeedbackDelivery(key, result) {
+    if (result.status !== "feedback") return;
+    markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+    // Every take leases its batch for FEEDBACK_LEASE_TTL_MS. A poll waiting on this session did
+    // not run that take, so it never armed a timer for the lease; this is how it learns about it.
+    events.emit("lease", key, store.feedbackLeaseTtlMs);
+  }
+
+  // `takeFeedback` leases the batch before anything is written to the response. When the poll
+  // that took it was displaced or its client went away, nothing reached an agent, so expire the
+  // lease now instead of letting the successor wait out the TTL. The wake matters as much as the
+  // expiry: a poll already waiting took "waiting" before this lease existed and would otherwise
+  // sit until some later event. The caller is a socket nobody reads anymore, so a store failure
+  // is logged rather than raised; the lease then expires on its own schedule.
+  async function releaseUndeliveredFeedback(key, result) {
+    if (result.status !== "feedback") return;
+    try {
+      const released = await store.releaseFeedback(key, result.delivery_id);
+      if (released?.released) events.emit("feedback", key);
+    } catch (error) {
+      logEvent?.(`lease release failed key=${key} delivery=${result.delivery_id}: ${error?.message || error}`);
+    }
+  }
+
+  const handlePoll = async (req, res, next) => {
+    const takeover = req.query.takeover === "1";
+    const agentReply =
+      req.method === "POST" && req.body?.agent_reply !== undefined ? String(req.body.agent_reply) : null;
+    if (takeover && req.method !== "POST") {
+      res.status(405).json({ error: "poll takeover requires POST" });
+      return;
+    }
+    if (req.method === "POST" && (agentReply === null ? !takeover : !agentReply.trim())) {
+      res.status(405).json({ error: "POST /api/poll requires agent_reply or takeover=1" });
+      return;
+    }
+    // `close` is subscribed before the first `await` and re-checked after the listeners are armed,
+    // because a client that disconnects while `takeFeedback` is in flight would otherwise arrive
+    // too late for its own cleanup: the handler marks the poll active afterwards and nothing left
+    // would clear it, leaving presence stuck on "listening" for an agent that is already gone.
+    let requestClosed = Boolean(req.aborted || (req.method !== "POST" && req.destroyed));
+    let cleanupPoll = null;
+    let claimedHolder = null;
+    const onRequestClose = () => {
+      // A POST request emits `close` when its JSON body stream ends, before the long-poll
+      // response has been written. `aborted` distinguishes that normal parser lifecycle from a
+      // client that actually went away.
+      if (req.method === "POST" && !req.aborted) return;
+      requestClosed = true;
+      cleanupPoll?.();
+    };
+    const onResponseClose = () => {
+      // Once the body has been parsed, a POST request's close event is no longer useful: the
+      // response socket is the authoritative signal for a client that aborts its long-poll.
+      if (req.method === "POST" && !res.writableEnded) {
+        requestClosed = true;
+        cleanupPoll?.();
+      }
+    };
+    res.on("close", onResponseClose);
+    const detachRequestClose = () => {
+      req.off("close", onRequestClose);
+      res.off("close", onResponseClose);
+    };
+    req.on("close", onRequestClose);
     try {
       // Lenient on purpose: queued feedback belongs to the session record, not to the file, so a
       // deleted artifact must not make the queue unreachable.
@@ -645,10 +734,119 @@ export async function serve({
       const key = sessionKey(file);
       const timeoutMs =
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
+      const ownerValue = typeof req.query.owner === "string" ? req.query.owner.trim() : "";
+      if (ownerValue.toLowerCase() === "none" || ownerValue.startsWith("-")) {
+        detachRequestClose();
+        res.status(400).json({
+          status: "error",
+          code: "VALIDATION_ERROR",
+          error: "--owner none is reserved; pass a different listener label",
+        });
+        return;
+      }
+      const owner = ownerValue || null;
+      if (hasPresentOriginOrReferer(req) && !isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        detachRequestClose();
+        res.status(403).json({ error: "cross-origin poll takeover rejected" });
+        return;
+      }
+      if (timeoutMs === 0) {
+        // A zero-timeout drain is the /check-lavish hand-back path. It never waits, so it is not a
+        // listener: it claims no ownership, changes no presence, and is never refused while another
+        // poll holds the session. There is nothing for it to take over either.
+        if (takeover) {
+          detachRequestClose();
+          res.status(400).json({
+            status: "error",
+            code: "VALIDATION_ERROR",
+            error: "--takeover needs a waiting poll; a --timeout-ms 0 drain never listens",
+          });
+          return;
+        }
+        if (agentReply !== null && !(await publishAgentReply(key, agentReply))) {
+          detachRequestClose();
+          res.status(404).json({ error: "session not found" });
+          return;
+        }
+        const drained = await store.takeFeedback(key);
+        if (requestClosed || res.writableEnded) {
+          await releaseUndeliveredFeedback(key, drained);
+          detachRequestClose();
+          return;
+        }
+        finishFeedbackDelivery(key, drained);
+        if (drained.session_ended) clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+        detachRequestClose();
+        res.json(drained);
+        return;
+      }
+      const { holder, previousPresence, conflict, missing } = await pollOwnershipLock.runExclusive(async () => {
+        const currentHolder = activePolls.get(key);
+        if (currentHolder && !takeover) return { conflict: listenerConflict(currentHolder, "LISTENER_ACTIVE") };
+        const nextHolder = { key, owner, startedAt: Date.now(), replaced: false, replace: null };
+        claimedHolder = nextHolder;
+        const priorPresence = presenceSignature(key, activePolls, deliveredFeedback);
+        if (currentHolder) {
+          // Install the successor before releasing the old response so its cleanup cannot emit a
+          // transient "waiting" state or clear the successor's listener ownership.
+          currentHolder.replaced = true;
+          activePolls.set(key, nextHolder);
+          currentHolder.replace?.();
+        } else {
+          activePolls.set(key, nextHolder);
+        }
+        // Attaching a fresh round retires the prior delivery marker; releasing a poll never does.
+        deliveredFeedback.delete(key);
+        if (agentReply !== null) {
+          const session = await publishAgentReply(key, agentReply);
+          if (!session) {
+            activePolls.delete(key);
+            return { missing: true };
+          }
+        }
+        return { holder: nextHolder, previousPresence: priorPresence };
+      });
+      if (conflict) {
+        detachRequestClose();
+        res.status(409).json(conflict);
+        return;
+      }
+      if (missing) {
+        detachRequestClose();
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
       const immediate = await store.takeFeedback(key);
       if (immediate.status !== "waiting") {
-        if (immediate.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+        if (holder.replaced) {
+          await releaseUndeliveredFeedback(key, immediate);
+          detachRequestClose();
+          res.json(listenerConflict(holder, "LISTENER_REPLACED"));
+          releasePollListener(holder, activePolls, deliveredFeedback, events);
+          return;
+        }
+        if (requestClosed || res.writableEnded) {
+          await releaseUndeliveredFeedback(key, immediate);
+          releasePollListener(holder, activePolls, deliveredFeedback, events);
+          detachRequestClose();
+          return;
+        }
+        finishFeedbackDelivery(key, immediate);
+        releasePollListener(holder, activePolls, deliveredFeedback, events);
+        if (immediate.session_ended) clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+        detachRequestClose();
         res.json(immediate);
+        return;
+      }
+      if (holder.replaced) {
+        detachRequestClose();
+        res.json(listenerConflict(holder, "LISTENER_REPLACED"));
+        releasePollListener(holder, activePolls, deliveredFeedback, events);
+        return;
+      }
+      if (requestClosed || res.writableEnded) {
+        releasePollListener(holder, activePolls, deliveredFeedback, events);
+        detachRequestClose();
         return;
       }
       const streamHeartbeat = timeoutMs === null;
@@ -661,20 +859,29 @@ export async function serve({
         }, pollHeartbeatMs);
         heartbeat.unref?.();
       }
-      setPollActive(key, activePolls, deliveredFeedback, events, true);
       refreshIdleTimer();
-      const timer = timeoutMs === null ? null : setTimeout(() => respond().catch(handleRespondError), timeoutMs);
-      // A batch leased to a poll that died is re-delivered when the lease expires. Nothing
-      // emits an event at that moment, so a poll already waiting arms its own timer for it.
+      let timer = null;
+      let cleaned = false;
+      let responding = false;
+      // A batch leased to a poll that died is re-delivered when the lease expires. Nothing in the
+      // store fires at that moment, so the waiting poll keeps a timer for the soonest lease it
+      // knows about: its own take's `retry_after_ms`, or a `lease` event from a take elsewhere.
       let leaseTimer = null;
+      let leaseDeadline = Infinity;
       const armLeaseTimer = (retryAfterMs) => {
         if (cleaned || typeof retryAfterMs !== "number") return;
         if (timeoutMs !== null && retryAfterMs >= timeoutMs) return;
-        leaseTimer = setTimeout(() => respond({ leaseExpiry: true }).catch(handleRespondError), retryAfterMs);
+        const deadline = Date.now() + retryAfterMs;
+        if (leaseTimer && deadline >= leaseDeadline) return;
+        if (leaseTimer) clearTimeout(leaseTimer);
+        leaseDeadline = deadline;
+        leaseTimer = setTimeout(() => {
+          leaseTimer = null;
+          leaseDeadline = Infinity;
+          respond({ keepWaitingIfEmpty: true }).catch(handleRespondError);
+        }, retryAfterMs);
         leaseTimer.unref?.();
       };
-      let cleaned = false;
-      let responding = false;
       const cleanup = () => {
         if (cleaned) return;
         cleaned = true;
@@ -683,34 +890,75 @@ export async function serve({
         if (heartbeat) clearInterval(heartbeat);
         events.off("feedback", onFeedback);
         events.off("ended", onFeedback);
+        events.off("lease", onLease);
         events.off("browser-disconnected", onBrowserDisconnected);
-        setPollActive(key, activePolls, deliveredFeedback, events, false);
-        if (!activePolls.has(key)) clearBrowserDisconnectTimer(key);
+        releasePollListener(holder, activePolls, deliveredFeedback, events);
+        if (!activePolls.has(key)) {
+          clearBrowserDisconnectTimer(key);
+          browserDisconnectPending.delete(key);
+        }
         refreshIdleTimer();
+        cleanupPoll = null;
+        detachRequestClose();
       };
-      const respond = async ({ leaseExpiry = false, browserDisconnected = false } = {}) => {
+      const respondReplacement = () => {
         if (responding || res.writableEnded) return;
         responding = true;
         try {
+          const replacement = listenerConflict(holder, "LISTENER_REPLACED");
+          if (streamHeartbeat) res.end(JSON.stringify(replacement));
+          else res.json(replacement);
+        } finally {
+          cleanup();
+        }
+      };
+      holder.replace = respondReplacement;
+      const respond = async ({ forcedResult = null, keepWaitingIfEmpty = false } = {}) => {
+        if (responding || res.writableEnded) return;
+        responding = true;
+        let finalSessionEnded = false;
+        let keepWaiting = false;
+        try {
           const result = await store.takeFeedback(key);
-          if (leaseExpiry && result.status === "waiting") {
-            // The lease was acked in the meantime; keep waiting for real feedback.
+          if (holder.replaced) {
+            await releaseUndeliveredFeedback(key, result);
+            if (!requestClosed && !res.writableEnded) {
+              const replacement = listenerConflict(holder, "LISTENER_REPLACED");
+              if (streamHeartbeat) res.end(JSON.stringify(replacement));
+              else res.json(replacement);
+            }
+            return;
+          }
+          if (requestClosed || res.writableEnded) {
+            await releaseUndeliveredFeedback(key, result);
+            return;
+          }
+          if (keepWaitingIfEmpty && result.status === "waiting") {
+            // Woken for a lease that was acked in the meantime, or for a batch a zero-timeout
+            // drain took first: there is nothing to say, so keep waiting instead of answering a
+            // no-timeout poll with "waiting". Any lease the take reported is timed from here.
+            keepWaiting = true;
             responding = false;
             armLeaseTimer(result.retry_after_ms);
             return;
           }
-          // Feedback or an end that raced the grace timer wins. The disconnect result only
-          // replaces a poll that would otherwise keep waiting, and it touches no lease: a batch
-          // still leased to an earlier poll is left for the next drain.
-          const body = browserDisconnected && result.status === "waiting" ? { status: "browser_disconnected" } : result;
-          if (body.status === "feedback") markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
+          // Feedback or an explicit end that raced the grace timer wins. The disconnect result
+          // is only the non-terminal replacement for a poll that would otherwise keep waiting,
+          // and it touches no lease: a batch still leased to an earlier poll is left for the
+          // next drain.
+          const responseResult = forcedResult && result.status === "waiting" ? forcedResult : result;
+          finalSessionEnded = responseResult.session_ended === true;
+          finishFeedbackDelivery(key, responseResult);
           if (streamHeartbeat) {
-            res.end(JSON.stringify(body));
+            res.end(JSON.stringify(responseResult));
           } else {
-            res.json(body);
+            res.json(responseResult);
           }
         } finally {
-          cleanup();
+          if (!keepWaiting) {
+            cleanup();
+            if (finalSessionEnded) clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+          }
         }
       };
       function handleRespondError(error) {
@@ -725,21 +973,51 @@ export async function serve({
         if (changedKey !== key || res.writableEnded) {
           return;
         }
-        respond().catch(handleRespondError);
+        respond({ keepWaitingIfEmpty: true }).catch(handleRespondError);
+      };
+      const onLease = (changedKey, retryAfterMs) => {
+        if (changedKey !== key || res.writableEnded) return;
+        armLeaseTimer(retryAfterMs);
       };
       const onBrowserDisconnected = (changedKey) => {
         if (changedKey !== key || res.writableEnded) return;
-        respond({ browserDisconnected: true }).catch(handleRespondError);
+        respond({ forcedResult: { status: "browser_disconnected" } }).catch(handleRespondError);
       };
       events.on("feedback", onFeedback);
       events.on("ended", onFeedback);
+      events.on("lease", onLease);
       events.on("browser-disconnected", onBrowserDisconnected);
-      req.on("close", cleanup);
+      cleanupPoll = cleanup;
+      if (holder.replaced) {
+        respondReplacement();
+        return;
+      }
+      if (requestClosed || res.writableEnded) {
+        cleanup();
+        return;
+      }
+      // A browser can disappear while the initial take is in flight. The disconnect timer may
+      // have fired before this request installed its event listeners, so reconcile that state now.
+      if (browserDisconnectPending.has(key)) {
+        browserDisconnectPending.delete(key);
+        onBrowserDisconnected(key);
+        return;
+      }
+      const nextPresence = presenceSignature(key, activePolls, deliveredFeedback);
+      if (nextPresence !== previousPresence) {
+        events.emit("agent-presence", key, computePresence(key, activePolls, deliveredFeedback));
+      }
+      timer = timeoutMs === null ? null : setTimeout(() => respond().catch(handleRespondError), timeoutMs);
       armLeaseTimer(immediate.retry_after_ms);
     } catch (error) {
+      cleanupPoll?.();
+      if (claimedHolder) releasePollListener(claimedHolder, activePolls, deliveredFeedback, events);
+      detachRequestClose();
       next(error);
     }
-  });
+  };
+  app.get("/api/poll", handlePoll);
+  app.post("/api/poll", handlePoll);
 
   // Retires a delivered batch. The CLI sends this only after the batch is fully on stdout, so a
   // poll that dies first leaves the lease to expire and the batch is delivered again.
@@ -944,21 +1222,11 @@ export async function serve({
 
   app.post("/api/:key/agent-reply", async (req, res, next) => {
     try {
-      const text = String(req.body?.text || "");
-      const session = await store.addAgentReply(req.params.key, text);
+      const session = await publishAgentReply(req.params.key, String(req.body?.text || ""));
       if (!session) {
         res.status(404).json({ error: "session not found" });
         return;
       }
-      const last = session.chat?.at(-1);
-      const entry = serializeChat([last?.role === "agent" ? last : { role: "agent", text, at: session.updated_at }])[0];
-      events.emit("agent-reply", req.params.key, entry);
-      events.emit("chat-sync", req.params.key, session);
-      // The reply concludes the delivered-feedback "working" state. Without this, a poll that
-      // drains feedback and then releases leaves presence stuck on "working" - the chrome keeps
-      // Send disabled - until some future poll happens to attach, even though the agent already
-      // answered. See "event WebSocket agent-presence returns to waiting after an agent reply".
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
       res.json({ status: "sent" });
     } catch (error) {
       next(error);
@@ -1190,7 +1458,10 @@ export async function serve({
     if (shuttingDown || hasLiveEventClient(key) || !activePolls.has(key)) return;
     const timer = setTimeout(() => {
       browserDisconnectTimers.delete(key);
-      if (!hasLiveEventClient(key) && activePolls.has(key)) events.emit("browser-disconnected", key);
+      if (!hasLiveEventClient(key) && activePolls.has(key)) {
+        browserDisconnectPending.add(key);
+        events.emit("browser-disconnected", key);
+      }
     }, browserDisconnectGraceMs);
     timer.unref?.();
     browserDisconnectTimers.set(key, timer);
@@ -1212,7 +1483,9 @@ export async function serve({
   // with its rendered html, user entries ship as text with their anchor, never as html.
   events.on("agent-reply", (key, entry) => broadcastLiveEvent("agent-reply", key, entry));
   events.on("chat-sync", (key, session) => broadcastLiveEvent("chat-sync", key, serializeChatSync(session)));
-  events.on("agent-presence", (key, state) => broadcastLiveEvent("agent-presence", key, { state }));
+  events.on("agent-presence", (key, state) =>
+    broadcastLiveEvent("agent-presence", key, presenceEventData(key, state, activePolls, deliveredFeedback)),
+  );
   events.on("layout-warnings", (key, warnings) => broadcastLiveEvent("layout-warnings", key, { warnings }));
   events.on("ended", (key, endedBy) => broadcastLiveEvent("ended", key, { ended_by: endedBy || null }));
 
@@ -1222,6 +1495,7 @@ export async function serve({
   function attachLiveEventClient(client, key, onClose) {
     liveEventClients.set(client, key);
     clearBrowserDisconnectTimer(key);
+    browserDisconnectPending.delete(key);
     refreshIdleTimer();
     let cleanedUp = false;
     const cleanup = () => {
@@ -1244,7 +1518,8 @@ export async function serve({
       return;
     }
     client.sendEvent("chat-sync", serializeChatSync(session));
-    client.sendEvent("agent-presence", { state: computePresence(key, activePolls, deliveredFeedback) });
+    const presence = computePresence(key, activePolls, deliveredFeedback);
+    client.sendEvent("agent-presence", presenceEventData(key, presence, activePolls, deliveredFeedback));
     // A connection that attaches (or reconnects) to a session already ended - including one that
     // misses the live "ended" event entirely by connecting after it fired - still needs to learn
     // that on its own; `markSessionEnded()` is idempotent, so a duplicate is harmless.
@@ -2434,19 +2709,30 @@ export function hasLiveReloadRootOptIn(html) {
   return /<meta\b(?=[^>]*name=["']lavish-live-reload["'])(?=[^>]*content=["']root["'])[^>]*>/i.test(searchableHtml);
 }
 
-function setPollActive(key, activePolls, deliveredFeedback, events, active) {
-  const previousPresence = computePresence(key, activePolls, deliveredFeedback);
-  const count = activePolls.get(key) || 0;
-  const nextCount = active ? count + 1 : Math.max(0, count - 1);
-  if (nextCount === count) return;
-  if (nextCount === 0) {
-    activePolls.delete(key);
-  } else {
-    activePolls.set(key, nextCount);
-    deliveredFeedback.delete(key);
-  }
-  const nextPresence = computePresence(key, activePolls, deliveredFeedback);
-  if (nextPresence !== previousPresence) events.emit("agent-presence", key, nextPresence);
+// Drops the holder only while it still owns the session: a displaced poll's cleanup must not
+// release the successor that replaced it.
+function releasePollListener(holder, activePolls, deliveredFeedback, events) {
+  if (activePolls.get(holder.key) !== holder) return;
+  const previousPresence = computePresence(holder.key, activePolls, deliveredFeedback);
+  activePolls.delete(holder.key);
+  const nextPresence = computePresence(holder.key, activePolls, deliveredFeedback);
+  if (nextPresence !== previousPresence) events.emit("agent-presence", holder.key, nextPresence);
+}
+
+function listenerLabel(holder) {
+  return holder.owner || AGENT_LISTENER_LABEL;
+}
+
+function listenerConflict(holder, code) {
+  return {
+    status: "error",
+    code,
+    error:
+      code === "LISTENER_ACTIVE"
+        ? "Lavish Editor already has an active poll listener"
+        : "Lavish Editor poll listener was replaced",
+    holder: { label: listenerLabel(holder), age_ms: Math.max(0, Date.now() - holder.startedAt) },
+  };
 }
 
 function markFeedbackDelivered(key, activePolls, deliveredFeedback, events) {
@@ -2467,10 +2753,30 @@ function clearFeedbackDelivery(key, activePolls, deliveredFeedback, events) {
   }
 }
 
+// Working outranks listening: a poll that attaches while a delivered batch is still unanswered
+// is the same agent coming back for more, not a sign the work is done.
 export function computePresence(key, activePolls, deliveredFeedback) {
-  if (activePolls.has(key)) return "listening";
   if (deliveredFeedback.has(key)) return "working";
-  return "waiting";
+  return activePolls.has(key) ? "listening" : "waiting";
+}
+
+function presenceSignature(key, activePolls, deliveredFeedback) {
+  return `${computePresence(key, activePolls, deliveredFeedback)}:${presenceMode(key, activePolls, deliveredFeedback)}`;
+}
+
+export function presenceMode(key, activePolls, deliveredFeedback) {
+  if (deliveredFeedback.has(key)) return "agent-busy";
+  const holder = activePolls.get(key);
+  if (!holder) return "waiting-on-captain";
+  // --owner is used by a supervisor process listening on behalf of a worker. A bare poll is the
+  // agent's own waiting round; an identified holder must not make the composer invite user
+  // input while the owning worker is busy elsewhere.
+  return holder.owner ? "external-listener" : "agent-listener";
+}
+
+function presenceEventData(key, state, activePolls, deliveredFeedback) {
+  const mode = presenceMode(key, activePolls, deliveredFeedback);
+  return mode === "waiting-on-captain" ? { state } : { state, mode };
 }
 
 function chromeIcon(paths, size = 16, strokeWidth = 1.7) {

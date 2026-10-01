@@ -3,6 +3,7 @@ import path from "node:path";
 
 import {
   POLL_HANDOFF_RULE,
+  POLL_LISTENER_RULE,
   POLL_PICKUP_RULE,
   POLL_SEND_AND_END_RULE,
   POLL_WAKE_PATH_RULES,
@@ -231,8 +232,9 @@ that next poll.
    every listed session - \`open\` sessions accumulate across conversations, and the list omits
    sessions the user has ended, so it is neither complete nor live.
 2. Drain it with \`${invocation} poll <html-file> --timeout-ms 0\`. That returns immediately
-   instead of waiting. Run it whether or not the file appears in the list: a session the user ended
-   is absent from the list but still delivers its queued feedback once.
+   instead of waiting, and it is never refused: a drain claims no listener, so it works while another
+   poll holds the session. Run it whether or not the file appears in the list: a session the user
+   ended is absent from the list but still delivers its queued feedback once.
 3. Read the result. \`session_ended: true\` means the user is done - apply what came back, deliver
    any further updates in this conversation, and do not reopen. An empty result means the queue is
    empty _right now_, not that the user sent nothing; rule out a leased batch (below) before
@@ -259,6 +261,7 @@ Apply them normally, then reply into the browser so it stops spinning.
 
 - ${skillCommandText(POLL_PICKUP_RULE)}
 - ${skillCommandText(POLL_HANDOFF_RULE)}
+- ${skillCommandText(POLL_LISTENER_RULE)}
 - A subagent must NEVER own a Lavish poll. The poll delivers to whoever started it, so when the subagent exits the prompts land in an output file nobody reads and no completion notification reaches the session that can act on them. When delegating artifact edits, forbid \`${invocation}\` in the brief; the parent polls after the subagent returns.
 - ${POLL_SEND_AND_END_RULE}
 `;
