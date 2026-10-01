@@ -96,7 +96,14 @@ export class SessionStore {
       }
       const prompts = Array.isArray(payload.prompts) ? payload.prompts : [];
       const shouldEndSession = Boolean(payload.endSession || payload.end_session);
-      const alreadyEnded = session.status === "ended";
+      // A session already ended by someone else (an agent's `lavish-axi end`, or the user in
+      // another tab) must not accept a further batch as if it were queued for delivery: no agent
+      // will ever poll it again, so a 200 here would be a promise the server cannot keep. This
+      // applies even to a batch that also requests `endSession` - a redundant end of an
+      // already-ended session is still a late batch nobody will read.
+      if (session.status === "ended") {
+        return { ended: true, ended_by: session.ended_by };
+      }
       const normalizedPrompts = prompts.map(normalizePrompt);
       const revision = normalizeRevision(session.artifact_revision);
       const at = new Date().toISOString();
@@ -146,7 +153,7 @@ export class SessionStore {
       session.chat = [...(session.chat || []), ...userMessages];
       session.pending_prompts = session.prompts.length;
       session.dom_snapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
-      session.status = shouldEndSession || alreadyEnded ? "ended" : session.prompts.length > 0 ? "feedback" : "open";
+      session.status = shouldEndSession ? "ended" : session.prompts.length > 0 ? "feedback" : "open";
       if (shouldEndSession) session.ended_by = "user";
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
