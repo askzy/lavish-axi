@@ -539,7 +539,7 @@ async function disconnectFixture({ browserDisconnectGraceMs, feedbackLeaseTtlMs 
     queue: (prompt) =>
       fetch(`${base}/api/${key}/prompts`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", origin: base },
         body: JSON.stringify({
           prompts: [{ uid: "", prompt, selector: "", tag: "message", text: "Freeform message" }],
         }),
