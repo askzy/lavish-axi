@@ -1044,7 +1044,7 @@ test("sending with an empty composer nudges instead of blocking", async () => {
   const css = await chromeCssSource();
 
   assert.match(html, /class="send-hint" id="sendHint" hidden>Write a message or annotate an element first\.<\/div>/);
-  assert.match(js, /function showSendHint\(copy = SEND_EMPTY_COPY\)/);
+  assert.match(js, /function showSendHint\(copy = SEND_EMPTY_COPY, holdMs = 2600\)/);
   assert.match(js, /sendHint\.hidden = false/);
   assert.match(js, /chatInput\.focus\(\)/);
   assert.match(css, /\.send-hint\{/);
@@ -4828,7 +4828,8 @@ test("annotation card queues prompt on Enter and inserts newline on Shift+Enter"
   assert.match(js, /textarea\.addEventListener\(["']keydown["']/);
   assert.match(js, /event\.key === ["']Enter["'] && !event\.shiftKey/);
   assert.match(js, /event\.preventDefault\(\)/);
-  assert.match(js, /sendButton\.click\(\)/);
+  // Enter routes through tryQueue(), which gates on in-flight uploads.
+  assert.match(js, /const queued = tryQueue\(\)/);
 });
 
 test("annotation card queues and sends immediately on Ctrl+Enter or Cmd+Enter", () => {
@@ -4837,7 +4838,7 @@ test("annotation card queues and sends immediately on Ctrl+Enter or Cmd+Enter", 
   assert.match(js, /event\.ctrlKey \|\| event\.metaKey/);
   assert.match(js, /sendQueuedPrompts\(\)/);
   assert.match(js, /class="lavish-hint"/);
-  assert.match(js, /\+Enter to send now/);
+  assert.match(js, /\+Enter to send/);
   assert.match(js, /\.lavish-annotation-card \.lavish-hint\{/);
 });
 
@@ -5180,4 +5181,14 @@ test("POST /api/:key/prompts answers a real over-2MB body with 413, not 500", as
     await server.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("every id in the chrome markup appears exactly once", () => {
+  // chrome-client.js resolves each control with getElementById, which returns only the first
+  // match, so a duplicated id leaves a second, dead copy of the control in the page.
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
+  const duplicates = ids.filter((id, index) => ids.indexOf(id) !== index);
+  assert.deepEqual(duplicates, []);
+  assert.ok(ids.length >= 30, `only ${ids.length} ids found`);
 });

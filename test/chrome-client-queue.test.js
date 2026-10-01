@@ -16,7 +16,7 @@ const servedChromeIds = new Set(
   ),
 );
 
-/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, initialEnded?: boolean, initialEndedBy?: string | null }} HarnessSessionData */
+/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, initialEnded?: boolean, initialEndedBy?: string | null, attachmentMaxBytes?: number }} HarnessSessionData */
 /** @type {HarnessSessionData} */
 const defaultSessionData = { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "i" };
 
@@ -29,6 +29,8 @@ async function createChromeHarness({
   storage = new Map(),
   beginLoadResponses = [],
   handoffResponses = [],
+  // A queue already persisted by an earlier page load, seeded before the client boots.
+  storedQueue = null,
   // Opt-in frozen clock. `reloadChromeAfterServerRestart` waits on wall-clock deadlines, so a
   // test that needs one to expire has to own `Date.now()` rather than sleep through it.
   fakeClock = false,
@@ -38,6 +40,7 @@ async function createChromeHarness({
   mobile = false,
 } = {}) {
   const source = await readFile(sourceUrl, "utf8");
+  if (storedQueue) storage.set(`lavish-axi:queued:${sessionData.key}`, JSON.stringify(storedQueue));
   const postedToFrame = [];
   const eventSources = [];
   const windowListeners = new Map();
@@ -2726,4 +2729,456 @@ test("crossing the breakpoint in either direction leaves no sheet state behind",
   assert.equal(state.scrollInert, true);
   assert.equal(chrome.focusLog.at(-1), "panelToggle");
   assert.equal(chrome.storage.has("lavish-axi:sheet-open:abc"), false);
+});
+
+test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confused-deputy guard)", async () => {
+  let fetches = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => {
+      fetches += 1;
+      return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
+    },
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:uploadAttachment",
+    localId: "invalid",
+    mime: "image/png",
+    bytes: { byteLength: 16 },
+  });
+  await flushPromises();
+  assert.equal(fetches, 0, "an invalid payload never hits the network");
+  const invalidResult = chrome.postedToFrame.find(
+    (m) => m.type === "lavish:attachmentResult" && m.localId === "invalid",
+  );
+  assert.equal(invalidResult.ok, false);
+  assert.equal(invalidResult.error, "invalid upload payload");
+
+  // A single oversized (>256 MiB session quota) upload is refused BEFORE the network.
+  // The size check only reads `byteLength`, so allocating a real 300 MiB buffer here
+  // is pure CI OOM risk with no test value: spoof a real view that REPORTS an
+  // over-quota length (a shadowing own property) without reserving the bytes.
+  const oversized = new Uint8Array(0);
+  Object.defineProperty(oversized, "byteLength", { value: 300 * 1024 * 1024, configurable: true });
+  chrome.sendFrameMessage({
+    type: "lavish:uploadAttachment",
+    localId: "big",
+    mime: "image/png",
+    bytes: oversized,
+  });
+  await flushPromises();
+  assert.equal(fetches, 0, "quota-exceeding upload never hits the network");
+  const quotaResult = chrome.postedToFrame.find((m) => m.type === "lavish:attachmentResult" && m.localId === "big");
+  assert.equal(quotaResult.ok, false);
+  assert.match(quotaResult.error, /Upload limit reached/);
+
+  // Small uploads flow until the per-window rate cap (30), then are throttled. Each
+  // is let settle before the next so the in-flight bound (its own test) never blocks;
+  // here we are exercising the RATE cap, which counts uploads that reached the network.
+  for (let i = 0; i < 30; i += 1) {
+    chrome.sendFrameMessage({
+      type: "lavish:uploadAttachment",
+      localId: "ok-" + i,
+      mime: "image/png",
+      bytes: new ArrayBuffer(16),
+    });
+    await flushPromises();
+  }
+  assert.equal(fetches, 30, "the first 30 uploads within the window are allowed");
+
+  chrome.sendFrameMessage({
+    type: "lavish:uploadAttachment",
+    localId: "throttled",
+    mime: "image/png",
+    bytes: new ArrayBuffer(16),
+  });
+  await flushPromises();
+  assert.equal(fetches, 30, "the 31st upload in the window is throttled, not sent");
+  const throttled = chrome.postedToFrame.find((m) => m.type === "lavish:attachmentResult" && m.localId === "throttled");
+  assert.equal(throttled.ok, false);
+  assert.match(throttled.error, /Too many uploads/);
+});
+
+test("chrome only mediates uploads carrying the current artifact load token", async () => {
+  let fetches = 0;
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialArtifactLoadToken: "live-load" },
+    fetchImpl: async () => {
+      fetches += 1;
+      return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
+    },
+  });
+
+  // event.source alone is NOT the gate: an upload message from the artifact frame
+  // without the current load token is dropped before the upload handler runs, so
+  // the real SDK must stamp it (postArtifactMessage) on every upload.
+  chrome.sendFrameMessage({
+    type: "lavish:uploadAttachment",
+    nonce: "n",
+    localId: "no-token",
+    mime: "image/png",
+    bytes: new ArrayBuffer(16),
+  });
+  await flushPromises();
+  assert.equal(fetches, 0, "a token-less upload message never reaches the network");
+  assert.equal(
+    chrome.postedToFrame.some((m) => m.type === "lavish:attachmentResult" && m.localId === "no-token"),
+    false,
+    "a token-less upload message gets no result either - it is dropped, not handled",
+  );
+
+  // The same message stamped with the current load token is mediated normally.
+  chrome.sendFrameMessage({
+    artifact_load_token: "live-load",
+    type: "lavish:uploadAttachment",
+    nonce: "n",
+    localId: "with-token",
+    mime: "image/png",
+    bytes: new ArrayBuffer(16),
+  });
+  await flushPromises();
+  assert.equal(fetches, 1);
+  const result = chrome.postedToFrame.find((m) => m.type === "lavish:attachmentResult" && m.localId === "with-token");
+  assert.equal(result.ok, true);
+});
+
+test("chrome uploads captured attachment bytes and reports the server id to the card", async () => {
+  const requests = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true, json: async () => ({ status: "stored", attachment: { id: "a".repeat(64) + ".png" } }) };
+    },
+  });
+
+  const bytes = new Uint8Array([1, 2, 3]).buffer;
+  chrome.sendFrameMessage({
+    type: "lavish:uploadAttachment",
+    localId: "att-1",
+    name: "mock.png",
+    mime: "image/png",
+    bytes,
+  });
+  await flushPromises();
+
+  assert.equal(requests[0].url, "/api/abc/attachments");
+  assert.equal(requests[0].options.method, "POST");
+  assert.equal(requests[0].options.headers["content-type"], "image/png");
+  assert.equal(requests[0].options.body, bytes);
+  const result = chrome.postedToFrame.at(-1);
+  assert.equal(result.type, "lavish:attachmentResult");
+  assert.equal(result.localId, "att-1");
+  assert.equal(result.ok, true);
+  assert.equal(result.id, "a".repeat(64) + ".png");
+});
+
+test("chrome reports an upload failure back to the card", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: false, json: async () => ({ error: "unsupported image type" }) }),
+  });
+  chrome.sendFrameMessage({
+    type: "lavish:uploadAttachment",
+    localId: "att-9",
+    name: "bad.svg",
+    mime: "image/svg+xml",
+    bytes: new Uint8Array([0]).buffer,
+  });
+  await flushPromises();
+  const result = chrome.postedToFrame.at(-1);
+  assert.equal(result.type, "lavish:attachmentResult");
+  assert.equal(result.localId, "att-9");
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "unsupported image type");
+});
+
+// The two tests that used to pin "chrome deletes a removed attachment through the
+// server" (and its queued-reference exception) are intentionally gone: E2 removed
+// that eager delete outright, and the replacement contract - the chrome never
+// honors an iframe-driven delete - is pinned above.
+
+test("chrome renders queued-prompt attachment thumbnails from the server endpoint", async () => {
+  const chrome = await createChromeHarness();
+  const id = "a".repeat(64) + ".png";
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "", selector: "h1", tag: "annotation", text: "", attachments: [{ id, name: "mock.png" }] },
+  });
+  const html = chrome.element("annotationPills").innerHTML;
+  assert.match(html, /pill-attachment/);
+  assert.match(html, new RegExp("/api/abc/attachments/" + id));
+  // An image-only annotation still shows a readable label.
+  assert.match(html, /Image annotation/);
+});
+
+test("a queued prompt over the thumbnail limit shows the hidden images as a +N badge (W-A)", async () => {
+  // LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT is configurable, so a prompt can legitimately
+  // carry more images than the compact pill can show. The overflow must be counted, not
+  // silently dropped - otherwise the queue looks like it lost the extra attachments.
+  const chrome = await createChromeHarness();
+  const attachments = Array.from({ length: 7 }, (_, i) => ({ id: String(i).repeat(64) + ".png", name: `i${i}.png` }));
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "seven", selector: "h1", tag: "annotation", text: "", attachments },
+  });
+  const html = chrome.element("annotationPills").innerHTML;
+  assert.equal(html.match(/class="pill-attachment"/g)?.length, 4, "the pill renders its four thumbnails");
+  assert.match(html, /class="pill-attachment-more"[^>]*>\+3</, "the other three are counted, not hidden");
+  assert.match(html, /title="3 more images"/);
+});
+
+test("a queued prompt at or under the thumbnail limit shows no +N badge (W-A)", async () => {
+  const chrome = await createChromeHarness();
+  const attachments = Array.from({ length: 4 }, (_, i) => ({ id: String(i).repeat(64) + ".png", name: `i${i}.png` }));
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "four", selector: "h1", tag: "annotation", text: "", attachments },
+  });
+  const html = chrome.element("annotationPills").innerHTML;
+  assert.equal(html.match(/class="pill-attachment"/g)?.length, 4);
+  assert.doesNotMatch(html, /pill-attachment-more/);
+});
+
+test("the +N badge stays singular for a single hidden image (W-A)", async () => {
+  const chrome = await createChromeHarness();
+  const attachments = Array.from({ length: 5 }, (_, i) => ({ id: String(i).repeat(64) + ".png", name: `i${i}.png` }));
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "five", selector: "h1", tag: "annotation", text: "", attachments },
+  });
+  assert.match(chrome.element("annotationPills").innerHTML, /title="1 more image"/);
+});
+
+test("chrome rejects an over-cap image before it hits the network", async () => {
+  const requests = [];
+  const chrome = await createChromeHarness({
+    sessionData: { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "i", attachmentMaxBytes: 4 },
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true, json: async () => ({ attachment: { id: "x" } }) };
+    },
+  });
+  const bytes = new Uint8Array([1, 2, 3, 4, 5, 6]).buffer; // 6 bytes > 4-byte cap
+  chrome.sendFrameMessage({
+    type: "lavish:uploadAttachment",
+    localId: "att-x",
+    name: "big.png",
+    mime: "image/png",
+    bytes,
+  });
+  await flushPromises();
+  assert.equal(requests.length, 0, "an over-cap image must not be uploaded");
+  const result = chrome.postedToFrame.at(-1);
+  assert.equal(result.type, "lavish:attachmentResult");
+  assert.equal(result.localId, "att-x");
+  assert.equal(result.ok, false);
+  assert.match(result.error, /larger than/);
+});
+
+test("a poisoned attachments array cannot wedge the queue or the tab (E5)", async () => {
+  const chrome = await createChromeHarness();
+
+  // An untrusted artifact controls the queued prompt wholesale. Dereferencing each
+  // entry unvalidated throws inside render() - but the prompt is persisted BEFORE
+  // the render, so the poison survives in sessionStorage and re-throws on every
+  // reload, wedging the tab for good.
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "poison", selector: "h1", tag: "annotation", text: "", attachments: [null] },
+  });
+
+  assert.deepEqual(chrome.queued(), [{ prompt: "poison", selector: "h1", tag: "annotation", text: "" }]);
+  assert.doesNotMatch(chrome.element("annotationPills").innerHTML, /pill-attachment/);
+});
+
+test("only well-formed attachment refs survive the enqueue path (E5)", async () => {
+  const chrome = await createChromeHarness();
+  const good = "a".repeat(64) + ".png";
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: {
+      prompt: "mixed",
+      selector: "h1",
+      tag: "annotation",
+      text: "",
+      attachments: [null, { id: good, name: "ok.png" }, "nope", { name: "no-id.png" }, ["nested"], { id: "" }],
+    },
+  });
+
+  // The one real ref is kept; every malformed entry is dropped before persisting,
+  // so what reaches the server (and the +N count) reflects only deliverable images.
+  assert.deepEqual(chrome.queued()[0].attachments, [{ id: good, name: "ok.png" }]);
+  assert.equal(chrome.element("annotationPills").innerHTML.match(/class="pill-attachment"/g)?.length, 1);
+});
+
+test("a non-array attachments field cannot wedge the queue (E5)", async () => {
+  const chrome = await createChromeHarness();
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "bad", selector: "h1", tag: "annotation", text: "", attachments: "not-an-array" },
+  });
+
+  assert.deepEqual(chrome.queued(), [{ prompt: "bad", selector: "h1", tag: "annotation", text: "" }]);
+});
+
+test("a poisoned prompt already in sessionStorage cannot wedge a reload (E5)", async () => {
+  const chrome = await createChromeHarness({
+    storedQueue: [{ prompt: "old poison", selector: "h1", tag: "annotation", text: "", attachments: [null] }],
+  });
+
+  // A tab poisoned before this fix still has the bad prompt on disk; loading it
+  // must not throw, or the tab stays wedged even after upgrading.
+  assert.doesNotMatch(chrome.element("annotationPills").innerHTML, /pill-attachment/);
+  assert.match(chrome.element("annotationPills").innerHTML, /old poison/);
+});
+
+test("the chrome never honors an attachment delete driven by the artifact iframe (E2)", async () => {
+  const requests = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true, json: async () => ({ status: "removed" }) };
+    },
+  });
+
+  // The iframe is untrusted, and the chrome cannot see chips that are ready but
+  // not yet queued in ANOTHER tab. Honoring this delete lets one tab (or a
+  // malicious artifact) destroy bytes another live card still needs, which then
+  // fails as not-found on send. Reclamation belongs to the reference-aware sweeper.
+  chrome.sendFrameMessage({ type: "lavish:removeAttachment", id: "a".repeat(64) + ".png" });
+  await flushPromises();
+
+  assert.deepEqual(
+    requests.filter((request) => request.options?.method === "DELETE"),
+    [],
+  );
+});
+
+test("a queued attachment ref is projected to primitives, not kept by reference (E5)", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      posts.push({ url, body: JSON.parse(init.body) });
+      return { ok: true };
+    },
+  });
+  const id = "a".repeat(64) + ".png";
+
+  // structuredClone (what postMessage really uses) faithfully carries BigInt and
+  // cycles, and neither survives JSON. Filtering entries but keeping the artifact's
+  // own objects lets that junk ride along into sessionStorage and the POST body,
+  // where JSON.stringify throws and the queue can no longer be sent - a subtler
+  // repeat of the poisoned-queue wedge.
+  const hostile = { id, name: "ok.png", big: 10n };
+  hostile.self = hostile;
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "hostile", selector: "h1", tag: "annotation", text: "", attachments: [hostile] },
+  });
+
+  assert.deepEqual(chrome.queued()[0].attachments, [{ id, name: "ok.png" }]);
+
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+
+  assert.equal(posts.length, 1, "the queue is still sendable");
+  assert.deepEqual(posts[0].body.prompts[0].attachments, [{ id, name: "ok.png" }]);
+});
+
+test("a non-string attachment name is dropped rather than carried (E5)", async () => {
+  const chrome = await createChromeHarness();
+  const id = "b".repeat(64) + ".png";
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "x", selector: "h1", tag: "annotation", text: "", attachments: [{ id, name: { evil: true } }] },
+  });
+  assert.deepEqual(chrome.queued()[0].attachments, [{ id }]);
+});
+
+test("the chrome bounds concurrent in-flight uploads (D8)", async () => {
+  let started = 0;
+  /** @type {(value?: any) => void} */
+  let releaseAll = () => {};
+  const gate = new Promise((resolve) => {
+    releaseAll = resolve;
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => {
+      started += 1;
+      // Hang every upload so they all stay in flight until released.
+      await gate;
+      return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
+    },
+  });
+
+  // Eight small uploads at once: under the rate cap (30) and the byte quota, so only
+  // an in-flight bound can stop them. Without it, all eight hit the network at once,
+  // holding eight large bodies (structured clones + server buffers) concurrently.
+  for (let i = 0; i < 8; i += 1) {
+    chrome.sendFrameMessage({
+      type: "lavish:uploadAttachment",
+      localId: "u-" + i,
+      mime: "image/png",
+      bytes: new ArrayBuffer(16),
+    });
+  }
+  await flushPromises();
+
+  assert.ok(started <= 4, `at most the in-flight bound reach the network at once, got ${started}`);
+  // The ones over the bound are refused (not left hanging "uploading" forever), so
+  // the card can retry once capacity frees.
+  const refused = chrome.postedToFrame.filter(
+    (m) =>
+      m.type === "lavish:attachmentResult" &&
+      m.ok === false &&
+      /in flight|in-flight|concurrent|Wait a moment/i.test(m.error || ""),
+  );
+  assert.ok(refused.length >= 4, `the over-bound uploads are refused with a retry hint, got ${refused.length}`);
+
+  releaseAll();
+  await flushPromises();
+});
+
+test("a settled upload frees an in-flight slot for the next (D8)", async () => {
+  /** @type {Array<() => void>} */
+  const resolvers = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: () =>
+      new Promise((resolve) => {
+        resolvers.push(() =>
+          resolve(
+            /** @type {any} */ ({ ok: true, json: async () => ({ attachment: { id: "b".repeat(64) + ".png" } }) }),
+          ),
+        );
+      }),
+  });
+
+  // Fill the in-flight bound.
+  for (let i = 0; i < 4; i += 1) {
+    chrome.sendFrameMessage({
+      type: "lavish:uploadAttachment",
+      localId: "a-" + i,
+      mime: "image/png",
+      bytes: new ArrayBuffer(16),
+    });
+  }
+  await flushPromises();
+  const startedBefore = resolvers.length;
+
+  // Settle one; its slot must free so a fresh upload can proceed.
+  resolvers[0]();
+  await flushPromises();
+  await flushPromises();
+
+  chrome.sendFrameMessage({
+    type: "lavish:uploadAttachment",
+    localId: "next",
+    mime: "image/png",
+    bytes: new ArrayBuffer(16),
+  });
+  await flushPromises();
+
+  assert.equal(resolvers.length, startedBefore + 1, "a freed slot admits the next upload");
 });

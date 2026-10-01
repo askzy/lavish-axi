@@ -20,6 +20,59 @@ const retiredDraftNodes = [];
 const internalQueueKeyField = "_lavishQueueKey";
 const initialChat = Array.isArray(sessionData.initialChat) ? sessionData.initialChat : [];
 const MODE_TOGGLE_HOTKEY_KEY = String(sessionData.modeToggleHotkeyKey || "").toLowerCase();
+const attachmentMaxBytes = Number(sessionData.attachmentMaxBytes) || 0;
+
+// The chrome is the only path from the sandboxed (opaque-origin) artifact iframe to
+// the loopback server, so it is the sole place a same-origin confused-deputy can be
+// mediated: the frame's postMessage source check proves a message came from the
+// artifact frame but NOT that a user gesture (paste/drop/pick) drove it, so hostile
+// artifact script could otherwise drive unbounded uploads. Bound both the rate and
+// the cumulative bytes per chrome session here; the server keeps a bounded disk
+// quota as the durable backstop.
+const UPLOAD_RATE_WINDOW_MS = 60_000;
+const UPLOAD_RATE_MAX = 30;
+const UPLOAD_SESSION_BYTE_QUOTA = 256 * 1024 * 1024;
+// The rate and cumulative-byte guards bound uploads over time, but not how many run
+// AT ONCE: each accepted message starts fetch() immediately, so a hostile artifact
+// could post ~30 large bodies in one tick and hold hundreds of MiB of structured
+// clones + server body buffers concurrently before the cumulative quota trips.
+// Cap the number in flight; the over-cap ones are refused with a retry hint (like the
+// rate guard) and a freed slot admits the next.
+const UPLOAD_MAX_IN_FLIGHT = 4;
+const uploadTimestamps = [];
+let uploadedBytesTotal = 0;
+let uploadsInFlight = 0;
+
+function formatByteLimit(bytes) {
+  if (bytes >= 1024 * 1024) return Math.round(bytes / (1024 * 1024)) + " MB";
+  if (bytes >= 1024) return Math.round(bytes / 1024) + " KB";
+  return bytes + " bytes";
+}
+
+// Turn the server's atomic-reject detail into one human line naming the cap that
+// was hit, so the user knows what to fix. Nothing was delivered - the queue is
+// preserved - so the wording is about correcting, not about a partial send.
+function describeAttachmentRejection(rejected, caps) {
+  const reasons = new Set(rejected.map((ref) => ref && ref.reason));
+  const parts = [];
+  if (reasons.has("prompt-bytes-exceeded") && caps && caps.maxPromptBytes) {
+    parts.push("images exceed the " + formatByteLimit(caps.maxPromptBytes) + " per-annotation limit");
+  }
+  if (reasons.has("too-many") && caps && caps.maxPerPrompt) {
+    parts.push("more than " + caps.maxPerPrompt + " images on one annotation");
+  }
+  if (reasons.has("too-many-in-request")) {
+    parts.push("too many images queued at once");
+  }
+  if (reasons.has("malformed")) {
+    parts.push("an image attachment was malformed");
+  }
+  if (reasons.has("not-found")) {
+    parts.push("an image is no longer available");
+  }
+  const detail = parts.length ? parts.join("; ") : "some attachments could not be delivered";
+  return "Not sent - " + detail + ". Remove or fix the image, then send again.";
+}
 
 function isModeToggleHotkeyEvent(event) {
   if (event.shiftKey || event.altKey) return false;
@@ -214,10 +267,48 @@ function saveJsonState(storageKey, value) {
   }
 }
 
+// A queued prompt is authored by the untrusted artifact iframe, so its attachment
+// refs are validated at the single boundary every prompt crosses before it is
+// persisted or rendered. Anything that is not a well-formed `{id}` object is
+// dropped: the queue is written to sessionStorage BEFORE it renders, so one bad
+// entry would throw out of render(), stay on disk, and throw again on every
+// reload - wedging the tab permanently instead of failing once. The card's own
+// flow only ever produces `{id, name}`, so a malformed entry is fabricated and
+// there is no user image to preserve. The server re-validates independently.
+// Each surviving ref is PROJECTED onto a fresh primitives-only object rather than
+// kept by reference: postMessage delivers a structured clone, which faithfully
+// preserves BigInt values and cycles that `JSON.stringify` then refuses. Passing
+// the artifact's own object through would carry that junk into sessionStorage and
+// the POST body, where the throw makes the queue unsendable.
+function sanitizeAttachmentRefs(value) {
+  if (!Array.isArray(value)) return [];
+  const refs = [];
+  for (const ref of value) {
+    if (!ref || typeof ref !== "object" || Array.isArray(ref)) continue;
+    if (typeof ref.id !== "string" || !ref.id) continue;
+    const projected = { id: ref.id };
+    if (typeof ref.name === "string" && ref.name) projected.name = ref.name;
+    refs.push(projected);
+  }
+  return refs;
+}
+
+function sanitizeQueuedPrompt(prompt) {
+  if (!prompt || typeof prompt !== "object") return null;
+  if (!("attachments" in prompt)) return prompt;
+  const clean = { ...prompt };
+  const refs = sanitizeAttachmentRefs(clean.attachments);
+  if (refs.length) clean.attachments = refs;
+  else delete clean.attachments;
+  return clean;
+}
+
 function loadQueuedPrompts() {
   try {
     const parsed = JSON.parse(sessionStorage.getItem(queueStorageKey) || "[]");
-    return Array.isArray(parsed) ? parsed.filter((prompt) => prompt && typeof prompt === "object") : [];
+    // Also sanitize on restore: a tab poisoned before this guard existed still has
+    // the bad prompt on disk and would otherwise stay wedged after an upgrade.
+    return Array.isArray(parsed) ? parsed.map(sanitizeQueuedPrompt).filter(Boolean) : [];
   } catch {
     return [];
   }
@@ -250,8 +341,10 @@ function render() {
       const showLocator = targetLabel && prompt.selector && targetLabel !== prompt.selector;
       return (
         '<div class="pill-wrap"><div class="pill"><span class="pill-preview">' +
-        escapeHtml(prompt.prompt) +
-        '</span><button class="pill-close" type="button" aria-label="Remove queued prompt" data-index="' +
+        escapeHtml(prompt.prompt || (attachmentCount(prompt) ? "Image annotation" : "")) +
+        "</span>" +
+        pillAttachmentsHtml(prompt) +
+        '<button class="pill-close" type="button" aria-label="Remove queued prompt" data-index="' +
         index +
         '"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><div class="pill-tooltip">' +
         (targetLabel
@@ -286,13 +379,62 @@ function updateSendState() {
   if (warningsQueueButton) updateWarningSelectionState();
 }
 
-function showSendHint(copy = SEND_EMPTY_COPY) {
+function attachmentCount(prompt) {
+  return Array.isArray(prompt.attachments) ? prompt.attachments.length : 0;
+}
+
+// How many thumbnails the compact pill shows before the rest collapse into a badge.
+const PILL_THUMBNAIL_LIMIT = 4;
+
+// Thumbnails for a queued prompt's images, served straight from the same-origin
+// attachment endpoint (the ids are already server-vetted at upload time). The pill
+// has room for only a few, but the per-prompt cap is configurable
+// (LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT), so a prompt can legitimately carry more
+// than fit: the remainder collapses into a +N badge rather than being dropped from
+// the preview, which would make the queue look like it lost the extra images.
+function pillAttachmentsHtml(prompt) {
+  const count = attachmentCount(prompt);
+  if (!count) return "";
+  const hidden = count - PILL_THUMBNAIL_LIMIT;
+  return (
+    '<span class="pill-attachments">' +
+    prompt.attachments
+      .slice(0, PILL_THUMBNAIL_LIMIT)
+      .map((attachment) => {
+        const alt = escapeHtml(attachment.name || "image");
+        return (
+          '<img class="pill-attachment" src="/api/' +
+          encodeURIComponent(key) +
+          "/attachments/" +
+          encodeURIComponent(attachment.id) +
+          '" alt="' +
+          alt +
+          '" title="' +
+          alt +
+          '">'
+        );
+      })
+      .join("") +
+    (hidden > 0
+      ? '<span class="pill-attachment-more" title="' +
+        hidden +
+        " more image" +
+        (hidden === 1 ? "" : "s") +
+        '">+' +
+        hidden +
+        "</span>"
+      : "") +
+    "</span>"
+  );
+}
+
+function showSendHint(copy = SEND_EMPTY_COPY, holdMs = 2600) {
   sendHint.textContent = copy;
   sendHint.hidden = false;
   clearTimeout(sendHintTimer);
   sendHintTimer = setTimeout(() => {
     sendHint.hidden = true;
-  }, 2600);
+  }, holdMs);
   chatInput.focus();
 }
 
@@ -729,8 +871,9 @@ function promptQueueKey(prompt) {
   return prompt && typeof prompt[internalQueueKeyField] === "string" ? prompt[internalQueueKeyField].trim() : "";
 }
 
-function enqueuePrompt(prompt) {
-  if (!prompt || typeof prompt !== "object") return;
+function enqueuePrompt(rawPrompt) {
+  const prompt = sanitizeQueuedPrompt(rawPrompt);
+  if (!prompt) return;
 
   const queueKey = promptQueueKey(prompt);
   if (queueKey) {
@@ -863,6 +1006,17 @@ async function submitQueuedOnce() {
       if (Array.isArray(data?.warnings)) setLayoutWarnings(data.warnings);
       endAfterSubmit = false;
       return false;
+    }
+    // The server persisted nothing (atomic reject) - the queue below is left intact
+    // because the splice only runs on success. Surface exactly what failed so the
+    // user can fix the offending attachment(s) rather than losing them.
+    if (response?.status === 400) {
+      const detail = await response.json().catch(() => ({}));
+      if (Array.isArray(detail.rejected) && detail.rejected.length) {
+        showSendHint(describeAttachmentRejection(detail.rejected, detail.caps), 6000);
+        endAfterSubmit = false;
+        return false;
+      }
     }
     showSendError(SEND_FAILED_COPY);
     return false;
@@ -1882,10 +2036,138 @@ window.addEventListener("message", (event) => {
       messageToken,
     ).catch(() => {});
   }
+  if (msg.type === "lavish:uploadAttachment") uploadAttachment(msg);
+  // There is deliberately no attachment-delete message. See removeAttachment's
+  // removal note below: the iframe cannot be trusted to decide a delete, and the
+  // chrome cannot see every live reference, so reclamation is the sweeper's job.
   if (msg.type === "lavish:sendQueuedPrompts") sendQueued();
   if (msg.type === "lavish:endSession") endSession();
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
 });
+
+// The sandboxed artifact iframe can't reach the loopback server (opaque origin),
+// so it hands captured image bytes here and the chrome performs the same-origin
+// upload, then reports the server-vetted id back to the card.
+async function uploadAttachment(message) {
+  const localId = String(message.localId || "");
+  if (!localId) return;
+  // Echoed verbatim on every result so the artifact can tell a reply to ITS upload
+  // from one still in flight for a previous document. The chrome never interprets
+  // it; it only round-trips it.
+  const nonce = message.nonce;
+  const bytes = message.bytes;
+  let size;
+  if (ArrayBuffer.isView(bytes)) {
+    size = bytes.byteLength;
+  } else {
+    try {
+      const byteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")?.get;
+      size = byteLengthGetter ? byteLengthGetter.call(bytes) : NaN;
+    } catch {
+      size = NaN;
+    }
+  }
+  if (!Number.isFinite(size) || size < 0) {
+    postToFrame({
+      type: "lavish:attachmentResult",
+      nonce,
+      localId,
+      ok: false,
+      error: "invalid upload payload",
+    });
+    return;
+  }
+  // Reject over-cap images before they hit the network: an over-cap upload aborts
+  // mid-stream, and the browser can hang or reset instead of surfacing the 413, so
+  // the chip would never leave "uploading". Catching it here guarantees the card
+  // reaches its error+retry state. The server still enforces the cap authoritatively.
+  if (attachmentMaxBytes > 0 && size > attachmentMaxBytes) {
+    postToFrame({
+      type: "lavish:attachmentResult",
+      nonce,
+      localId,
+      ok: false,
+      error: "Image is larger than the " + formatByteLimit(attachmentMaxBytes) + " limit",
+    });
+    return;
+  }
+  // Confused-deputy guard: rate + cumulative-byte ceiling before touching the network.
+  const now = Date.now();
+  while (uploadTimestamps.length && now - uploadTimestamps[0] > UPLOAD_RATE_WINDOW_MS) uploadTimestamps.shift();
+  if (uploadTimestamps.length >= UPLOAD_RATE_MAX) {
+    postToFrame({
+      type: "lavish:attachmentResult",
+      nonce,
+      localId,
+      ok: false,
+      error: "Too many uploads. Wait a moment and retry.",
+    });
+    return;
+  }
+  if (uploadedBytesTotal + size > UPLOAD_SESSION_BYTE_QUOTA) {
+    postToFrame({
+      type: "lavish:attachmentResult",
+      nonce,
+      localId,
+      ok: false,
+      error: "Upload limit reached for this session (" + formatByteLimit(UPLOAD_SESSION_BYTE_QUOTA) + ").",
+    });
+    return;
+  }
+  // In-flight ceiling: refuse rather than pile another large body onto the network
+  // while the bound is full. The card keeps its retry affordance, and a settled
+  // upload (below) frees a slot for the next.
+  if (uploadsInFlight >= UPLOAD_MAX_IN_FLIGHT) {
+    postToFrame({
+      type: "lavish:attachmentResult",
+      nonce,
+      localId,
+      ok: false,
+      error: "Too many uploads in flight. Wait a moment and retry.",
+    });
+    return;
+  }
+  uploadTimestamps.push(now);
+  uploadedBytesTotal += size;
+  uploadsInFlight += 1;
+  try {
+    const response = await fetch("/api/" + key + "/attachments", {
+      method: "POST",
+      headers: { "content-type": String(message.mime || "application/octet-stream") },
+      body: bytes,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "Upload failed");
+    postToFrame({
+      type: "lavish:attachmentResult",
+      nonce,
+      localId,
+      ok: true,
+      id: (data.attachment && data.attachment.id) || "",
+    });
+  } catch (error) {
+    postToFrame({
+      type: "lavish:attachmentResult",
+      nonce,
+      localId,
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    uploadsInFlight -= 1;
+  }
+}
+
+// There is intentionally no eager attachment delete here. Removing a chip used to
+// ask the chrome to DELETE the stored file once no queued prompt referenced it,
+// but that check is not authoritative: attachments are content-addressed, so two
+// tabs (or two cards) can hold the SAME id, and a chip that is ready but not yet
+// queued in another tab is invisible from here. The delete was also driven by the
+// untrusted iframe, making the chrome a confused deputy - a malicious artifact
+// could destroy bytes a live card still needed, which then failed as `not-found`
+// on send. Unreferenced files are reclaimed by the server's reference-aware TTL
+// sweeper and the disk-cap backstop, which see every session's pending prompts
+// at once. Deleting late is cheap; deleting bytes someone still needs is not.
 
 loadFrame();
 
