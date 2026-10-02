@@ -1,35 +1,28 @@
 # Contributing
 
-Thanks for wanting to contribute.
-One rule up front:
-
-**Human-authored pull requests targeting `main` must be raised through [`no-mistakes`](https://github.com/kunchenguid/no-mistakes).**
-We require this to reduce the maintainer's burden of reviewing and merging contributions.
-
-`no-mistakes` puts a local git proxy in front of your real remote.
-Pushing through it runs an AI-driven review/test/lint pipeline in an isolated worktree, forwards the push upstream only after every check passes, and opens a clean PR automatically.
-
-A GitHub Actions check (`Require no-mistakes`) runs on PRs targeting `main` and fails if the body is missing the deterministic signature that no-mistakes writes.
-The release and dependency bots are exempt so their automation keeps working, but regular contributor PRs without the signature will not be reviewed or merged.
+This is [askzy/lavish-axi](https://github.com/askzy/lavish-axi), a fork of [kunchenguid/lavish-axi](https://github.com/kunchenguid/lavish-axi). Changes here land in the fork; they are not sent upstream from this repo.
+Upstream requires human-authored PRs to go through [`no-mistakes`](https://github.com/kunchenguid/no-mistakes). That gate does not apply to the fork.
 
 ## Workflow
 
-Fork routing requires `no-mistakes` v1.30.1 or newer.
-
-1. Fork the repo, then clone the parent repo or set your local `origin` back to the parent repo (`git@github.com:kunchenguid/lavish-axi.git`).
-2. Create a branch and make your changes.
-3. Initialize or refresh the gate with your fork as the push target: `no-mistakes init --fork-url git@github.com:<you>/lavish-axi.git`.
-4. Commit your changes.
-5. Push through the gate instead of pushing to `origin`:
+1. Clone the fork and install from source:
 
    ```sh
-   git push no-mistakes
+   git clone https://github.com/askzy/lavish-axi.git
+   cd lavish-axi
+   corepack pnpm install --frozen-lockfile
+   npm run build
    ```
 
-6. Run `no-mistakes` to attach to the pipeline, watch findings, and auto-fix or review as needed.
-7. Once the pipeline passes, it pushes the branch to your fork and opens the PR against this parent repo for you.
+   Install with `corepack pnpm`, never `npm install`: `npm` ignores `pnpm-lock.yaml`, so the Prettier it resolves disagrees with the one CI pins. `dist/` is gitignored; the CLI is `node dist/cli.mjs` and exists only after `npm run build`.
 
-See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/start-here/quick-start/) for the full first-run walkthrough.
+2. Create a branch named `type/slug` (for example `fix/update-from-source`) and make your changes.
+3. Run `pnpm run check` before pushing.
+4. Push the branch to this repo and open a PR against `main`. Use Conventional Commits for commit messages.
+
+## Syncing with upstream
+
+The fork tracks upstream releases by replaying upstream commits onto `main`. The deliberate divergences are listed in AGENTS.md and guarded by `test/fork-customizations.test.js`; a sync that turns one of those guards red has silently restored upstream behaviour the fork removed, so fix the sync, not the test.
 
 ## Repo Conventions
 
@@ -41,4 +34,4 @@ See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/star
 
 ## Questions
 
-Open an issue, or talk to me on [Discord](https://discord.gg/Wsy2NpnZDu).
+Open an issue on [askzy/lavish-axi](https://github.com/askzy/lavish-axi/issues). For upstream Lavish questions, use upstream's [Discord](https://discord.gg/Wsy2NpnZDu).
