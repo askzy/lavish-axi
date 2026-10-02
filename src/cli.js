@@ -18,7 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { AxiError, RESERVED_COMMANDS, runAxiCli } from "axi-sdk-js";
+import { AxiError, RESERVED_COMMANDS, runAxiCli, runUpdate } from "axi-sdk-js";
 
 import { createDesignOutput, DESIGN_PRIORITY_RULE, DESIGN_SYSTEM_HINT } from "./design-reference.js";
 import {
@@ -186,6 +186,7 @@ export async function run(argv) {
         export: exportCommand,
         share: shareCommand,
         prune: pruneCommand,
+        update: updateCommand,
       },
       getCommandHelp,
     });
@@ -822,6 +823,34 @@ export async function setupCommand(_args) {
     "This fork of lavish-axi (askzy/lavish-axi) removes automated SessionStart hook installation.",
     "If you want lavish-axi ambient context in your agent, wire it up manually in your agent settings.",
   ]);
+}
+
+// `update` is the SDK's npm self-updater. On a from-source install it would `npm install -g`
+// upstream's package beside the checkout - a second lavish-axi that is not this one - so the
+// command is shadowed to refuse there and print the checkout recipe instead. A real global
+// install keeps the SDK path untouched.
+export const FROM_SOURCE_UPDATE_RECIPE = "git pull && corepack pnpm install --frozen-lockfile && npm run build";
+
+// A checkout is a package root with a `.git` entry (a directory, or the file a git worktree
+// leaves behind) or one that no `node_modules` directory contains, which is where every npm and
+// pnpm global install lives. `..` from this module is the package root whether it runs from src/
+// or from the dist/ bundle.
+export function isFromSourceInstall(packageRoot = fileURLToPath(new URL("..", import.meta.url))) {
+  const root = path.resolve(packageRoot);
+  if (existsSync(path.join(root, ".git"))) return true;
+  return !root.split(path.sep).includes("node_modules");
+}
+
+// Exported for test/fork-customizations.test.js, like shareCommand above. The third parameter
+// is a test seam the SDK runner never fills in.
+export async function updateCommand(args, _context, { fromSource = isFromSourceInstall(), update = runUpdate } = {}) {
+  if (fromSource) {
+    throw new AxiError("`lavish-axi update` does not apply to a from-source install.", "VALIDATION_ERROR", [
+      "This CLI runs from a git checkout, not from an npm global install, so npm has nothing here to upgrade.",
+      `Update the checkout instead: ${FROM_SOURCE_UPDATE_RECIPE}`,
+    ]);
+  }
+  return update({ args, stdout: process.stdout, version: VERSION });
 }
 
 export function resolveHookHomeDir(env = process.env, fallback = os.homedir()) {
@@ -1916,7 +1945,7 @@ export function getCommandHelp(command) {
 // last three syncs each paid. The bodies stay the fork's de-branded text: no ht-ml.app, no
 // `lavish-axi share` or `setup hooks` in the usage block, and disabled notices for both commands.
 function createTopLevelHelp() {
-  return `lavish-axi - Lavish Editor AXI (askzy fork: share + setup hooks disabled)\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--owner <label>] [--takeover] [--agent-reply "..."] [--agent-reply-file <path>]\n  lavish-axi reply <html-file> (--agent-reply "..." | --agent-reply-file <path>)\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi stop\n  lavish-axi prune [--older-than 30d] [--unreplied-older-than 14d] [--open-older-than 60d] [--dry-run] [--cwd <dir>]\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback, ends the session, or closes the review page, staying silent while it waits - never kill it. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance()} ${POLL_SEND_AND_END_RULE} Use \`lavish-axi reply\` when handing a result back without waiting for more feedback: it exits 0 only after the server accepts the reply, so the review page stops showing Working. \`poll --agent-reply\` posts a reply and then keeps waiting.\n\n`;
+  return `lavish-axi - Lavish Editor AXI (askzy fork: share + setup hooks disabled)\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--owner <label>] [--takeover] [--agent-reply "..."] [--agent-reply-file <path>]\n  lavish-axi reply <html-file> (--agent-reply "..." | --agent-reply-file <path>)\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi stop\n  lavish-axi update [--check]\n  lavish-axi prune [--older-than 30d] [--unreplied-older-than 14d] [--open-older-than 60d] [--dry-run] [--cwd <dir>]\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback, ends the session, or closes the review page, staying silent while it waits - never kill it. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance()} ${POLL_SEND_AND_END_RULE} Use \`lavish-axi reply\` when handing a result back without waiting for more feedback: it exits 0 only after the server accepts the reply, so the review page stops showing Working. \`poll --agent-reply\` posts a reply and then keeps waiting.\n\n`;
 }
 
 function createCommandHelp() {
@@ -1931,6 +1960,7 @@ function createCommandHelp() {
     prune: `Usage: lavish-axi prune [--older-than <duration>] [--unreplied-older-than <duration>] [--open-older-than <duration>] [--dry-run] [--cwd <dir>]\n\nRemove stale review state. Sessions go when they are ended and last updated before the cutoff, when their artifact file no longer exists, when they are open with no message from the user in the chat (an annotation or whiteboard the user sent counts as a message) and last updated more than --unreplied-older-than ago (default 14d), or when they are open and last updated more than --open-older-than ago (default 60d). An open session with queued or unacknowledged feedback is kept whatever its age. Then \`.lavish/*.html\` files older than the cutoff are deleted from every .lavish/ directory the store has a session in, except files an open session still points at. --cwd <dir> narrows that sweep to <dir>/.lavish/ alone; sessions are still pruned store-wide. The cutoff defaults to 30d; every duration accepts d, h, or m units, and the two open-session windows accept 0 or off to disable them. --dry-run prints the same summary and changes nothing.\n\nThe server runs this same store-wide prune once with the default cutoffs each time it starts. LAVISH_AXI_PRUNE_MAX_AGE overrides the cutoff; 0 or off disables the prune. LAVISH_AXI_PRUNE_UNREPLIED_MAX_AGE and LAVISH_AXI_PRUNE_OPEN_MAX_AGE override the two open-session windows the same way.\n`,
     playbook: `Usage: lavish-axi playbook [playbook_id]\n\nList focused artifact guidance playbooks, or show one playbook by ID. Known IDs: diagram, table, comparison, plan, code, input, explanation, slides.\n\n${PLAYBOOK_ROUTER_HELP}\n\nExamples:\n  lavish-axi playbook\n  lavish-axi playbook diagram\n  lavish-axi playbook input\n`,
     design: `Usage: lavish-axi design\n\nShow a copy-pasteable CDN snippet for Tailwind CSS browser runtime v4 + DaisyUI v5 + themes, the whiteboard (Mermaid) opt-in snippet, a content-to-playbook router, an optional layout safety CSS snippet, plus technical reference for DaisyUI components. ${PLAYBOOK_ROUTER_HELP} Lavish artifacts stay portable HTML. This CDN snippet is the design fallback, not the default: inspect the subject project before falling back, and paste the layout safety CSS only when useful for dense nested grid/flex layouts, badges, wide fonts, or local media. ${DESIGN_PRIORITY_RULE}\n`,
+    update: `Usage: lavish-axi update [--check]\n\nUpgrade an npm global install of lavish-axi to the latest published version; --check reports the current and latest versions without installing. On a from-source install (a git checkout, or any package root outside a global node_modules) the command refuses and exits non-zero, because npm would install upstream's package beside the checkout instead of updating it. Update a checkout with: ${FROM_SOURCE_UPDATE_RECIPE}\n`,
     setup: `The \`setup hooks\` command is disabled in this fork (askzy/lavish-axi). Wire up any lavish-axi ambient context manually in your agent settings if desired.\n`,
     server: `Usage: lavish-axi server [--port 4387] [--verbose] [--also-listen <host>...]\n\nRun the local Lavish Editor server. Pass --verbose (or set LAVISH_AXI_DEBUG=1) to log session and watcher events to stderr. Detached server output is appended with UTC timestamps to ~/.lavish-axi/server.log, or LAVISH_AXI_STATE_DIR/server.log when set, for startup, shutdown-cause, and crash diagnostics.\n\nBy default Lavish binds to 127.0.0.1 and, when Tailscale is running, this machine's Tailscale IPv4; the server always listens on 127.0.0.1, so every local CLI finds it whatever its own LAVISH_AXI_HOST says. Any explicit LAVISH_AXI_HOST overrides automatic Tailscale binding (LAVISH_AXI_HOST=127.0.0.1 forces loopback-only); wildcard values such as 0.0.0.0 or :: are restricted to loopback and never bind every interface. An explicit non-wildcard LAVISH_AXI_HOST sets the bind address beside loopback; --also-listen adds further concrete addresses (the CLI passes it when it replaces a server, to keep every address the old one served). An address that cannot be bound is retried in the background and reported as network_warning. Binding beyond loopback exposes an unauthenticated server that can read and serve arbitrary local files to anything that can reach it, so only do so on a trusted network. With automatic binding enabled, a successfully bound Tailscale listener uses its MagicDNS name in generated session links; otherwise LAVISH_AXI_LINK_HOST sets the hostname written into generated session links (default: the bind address while it is bound, else loopback). See README's Allowed hosts section for Host allowlisting and LAVISH_AXI_ALLOWED_HOSTS. LAVISH_AXI_NO_OPEN=1 (or --no-open) suppresses the local browser launch.\n`,
   };

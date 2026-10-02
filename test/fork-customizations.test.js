@@ -818,3 +818,105 @@ test("fork: both skills say how to handle LISTENER_ACTIVE and that the drain is 
   assert.match(cli.getCommandHelp("poll"), /LISTENER_ACTIVE/);
   assert.match(cli.getCommandHelp("poll"), /\[--owner <label>\] \[--takeover\]/);
 });
+
+// `lavish-axi update` is the SDK's npm self-updater. On this checkout it would install upstream's
+// package globally beside the fork, so the fork shadows it: refuse with the from-source recipe on
+// a checkout, defer to the SDK on a real global install.
+test("fork: isFromSourceInstall recognises a checkout, a worktree, and a global install", async () => {
+  assert.equal(typeof cli.isFromSourceInstall, "function", "src/cli.js no longer exports isFromSourceInstall");
+
+  const dir = await mkdtemp(path.join(os.tmpdir(), "lavish-fork-update-"));
+  try {
+    const checkout = path.join(dir, "checkout");
+    await mkdir(path.join(checkout, ".git"), { recursive: true });
+    assert.equal(cli.isFromSourceInstall(checkout), true, "a .git directory marks a checkout");
+
+    const worktree = path.join(dir, "worktree");
+    await mkdir(worktree, { recursive: true });
+    await writeFile(path.join(worktree, ".git"), "gitdir: /elsewhere/.git/worktrees/worktree\n", "utf8");
+    assert.equal(cli.isFromSourceInstall(worktree), true, "a .git file (git worktree) marks a checkout");
+
+    const bare = path.join(dir, "bare");
+    await mkdir(bare, { recursive: true });
+    assert.equal(cli.isFromSourceInstall(bare), true, "a package root outside node_modules is from source");
+
+    const globalInstall = path.join(dir, "lib", "node_modules", "lavish-axi");
+    await mkdir(globalInstall, { recursive: true });
+    assert.equal(
+      cli.isFromSourceInstall(globalInstall),
+      false,
+      "a package root under node_modules is a global install",
+    );
+
+    const globalFromGit = path.join(dir, "lib", "node_modules", "lavish-axi-git");
+    await mkdir(path.join(globalFromGit, ".git"), { recursive: true });
+    assert.equal(cli.isFromSourceInstall(globalFromGit), true, "a .git entry wins even under node_modules");
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+
+  assert.equal(cli.isFromSourceInstall(), true, "the default package root is this checkout");
+});
+
+test("fork: the update command refuses on a from-source install without reaching npm", async () => {
+  assert.equal(typeof cli.updateCommand, "function", "src/cli.js no longer exports updateCommand");
+
+  let sdkCalls = 0;
+  await assert.rejects(
+    () =>
+      cli.updateCommand(["--check"], undefined, {
+        fromSource: true,
+        update: async () => {
+          sdkCalls += 1;
+          return {};
+        },
+      }),
+    (error) => {
+      assert.ok(error instanceof AxiError, `expected an AxiError, got ${error}`);
+      assert.equal(error.code, "VALIDATION_ERROR");
+      assert.match(error.message, /does not apply to a from-source install/);
+      assert.ok(
+        error.suggestions.some((line) => line.includes(cli.FROM_SOURCE_UPDATE_RECIPE)),
+        "the refusal does not carry the from-source recipe",
+      );
+      return true;
+    },
+  );
+  assert.equal(sdkCalls, 0, "the SDK self-updater ran on a from-source install");
+  assert.equal(cli.FROM_SOURCE_UPDATE_RECIPE, "git pull && corepack pnpm install --frozen-lockfile && npm run build");
+});
+
+test("fork: the update command defers to the SDK self-updater on a global install", async () => {
+  const calls = [];
+  const output = await cli.updateCommand(["--check"], undefined, {
+    fromSource: false,
+    update: async (options) => {
+      calls.push(options);
+      return { update: "ok" };
+    },
+  });
+  assert.deepEqual(output, { update: "ok" });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args, ["--check"]);
+  assert.equal(calls[0].version, cli.VERSION);
+  assert.equal(typeof calls[0].stdout?.write, "function", "runUpdate needs a stdout for its running: line");
+});
+
+test("fork: `lavish-axi update` on this checkout exits non-zero with the recipe and never spawns npm", () => {
+  // No LAVISH_AXI_* network stubs: the refusal must happen before the registry lookup, so a
+  // sandboxed run with no network passes the same way.
+  const result = spawnSync(process.execPath, [BIN, "update", "--check"], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+    env: { ...process.env, LAVISH_AXI_TELEMETRY: "0" },
+  });
+  assert.equal(result.status, 2, `expected exit 2, got ${result.status}\n${result.stdout}${result.stderr}`);
+  assert.match(result.stdout, /does not apply to a from-source install/);
+  assert.match(result.stdout, /git pull && corepack pnpm install --frozen-lockfile && npm run build/);
+  assert.doesNotMatch(result.stdout, /running: npm/);
+
+  const help = spawnSync(process.execPath, [BIN, "update", "--help"], { cwd: REPO_ROOT, encoding: "utf8" });
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /from-source install/);
+  assert.match(help.stdout, /git pull && corepack pnpm install --frozen-lockfile && npm run build/);
+});
