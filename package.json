@@ -67,12 +67,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kunchenguid/lavish-axi.git"
+    "url": "git+https://github.com/askzy/lavish-axi.git"
   },
   "bugs": {
-    "url": "https://github.com/kunchenguid/lavish-axi/issues"
+    "url": "https://github.com/askzy/lavish-axi/issues"
   },
-  "homepage": "https://github.com/kunchenguid/lavish-axi#readme",
+  "homepage": "https://github.com/askzy/lavish-axi#readme",
   "publishConfig": {
     "access": "public"
   }

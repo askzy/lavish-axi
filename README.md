@@ -1,22 +1,13 @@
 <h1 align="center">lavish-axi</h1>
 <p align="center">
-  <a href="https://github.com/kunchenguid/lavish-axi/actions/workflows/ci.yml"
-    ><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/kunchenguid/lavish-axi/ci.yml?style=flat-square&label=ci"
+  <a href="https://github.com/askzy/lavish-axi/actions/workflows/ci.yml"
+    ><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/askzy/lavish-axi/ci.yml?style=flat-square&label=ci"
   /></a>
-  <a href="https://github.com/kunchenguid/lavish-axi/actions/workflows/release-please.yml"
-    ><img alt="Release" src="https://img.shields.io/github/actions/workflow/status/kunchenguid/lavish-axi/release-please.yml?style=flat-square&label=release"
-  /></a>
-  <a href="https://www.npmjs.com/package/lavish-axi"
-    ><img alt="npm" src="https://img.shields.io/npm/v/lavish-axi?style=flat-square"
+  <a href="https://github.com/kunchenguid/lavish-axi"
+    ><img alt="Fork of kunchenguid/lavish-axi" src="https://img.shields.io/badge/fork%20of-kunchenguid%2Flavish--axi-lightgrey?style=flat-square"
   /></a>
   <a href="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue?style=flat-square"
     ><img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue?style=flat-square"
-  /></a>
-  <a href="https://x.com/kunchenguid"
-    ><img alt="X" src="https://img.shields.io/badge/X-@kunchenguid-black?style=flat-square"
-  /></a>
-  <a href="https://discord.gg/Wsy2NpnZDu"
-    ><img alt="Discord" src="https://img.shields.io/discord/1439901831038763092?style=flat-square&label=discord"
   /></a>
 </p>
 
@@ -55,13 +46,15 @@ The npm package `lavish-axi` is upstream's build, so `npx lavish-axi` and `npx s
 
 ## Quick Start
 
-Install the Lavish skill in the [Agent Skills](https://agentskills.io) format with [`npx skills`](https://github.com/vercel-labs/skills):
+This fork is installed from source; see [From source](#from-source) for the steps. There is no fork package on npm.
+
+Upstream is installed as an [Agent Skills](https://agentskills.io) skill with [`npx skills`](https://github.com/vercel-labs/skills):
 
 ```sh
 npx skills add kunchenguid/lavish-axi --skill lavish
 ```
 
-Note: this installs upstream, not this fork. For the fork, see [From source](#from-source).
+That installs upstream, not this fork. The rest of this section describes the upstream skill; the fork's generated skills behave the same way but call the checkout's `dist/cli.mjs` instead of `npx -y lavish-axi`.
 
 That is the entire setup - no npm install needed.
 The skill teaches your agent to run Lavish through `npx -y lavish-axi`, so the CLI comes along on demand.
@@ -272,6 +265,8 @@ Figures are hand-authored inline SVG by default; open the diagram playbook befor
 | `lavish-axi server`      | `--also-listen <host>`         | Also listen on this concrete address (repeatable). The CLI passes it when it replaces a running server, so the replacement keeps every address the old one served; see One server per port.                                                                                                                                   |
 
 ## Development
+
+Set up a checkout the same way as a [from-source install](#from-source): `corepack pnpm install --frozen-lockfile && npm run build`. `dist/` is gitignored, so a fresh clone has no CLI until `npm run build` runs; the built CLI is `node <repo>/dist/cli.mjs`. After pulling, install and build again.
 
 ```sh
 pnpm run check          # Run all verification commands
