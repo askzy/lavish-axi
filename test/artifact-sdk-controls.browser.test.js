@@ -83,3 +83,23 @@ test("real browser: native and ARIA controls work while links stay annotatable",
     prevented: true,
   });
 });
+
+test("real browser: only the platform link modifier reaches the link handler", { skip }, async () => {
+  const result = await probeBrowser(`
+    const link = document.createElement("a");
+    link.href = "#destination";
+    link.innerHTML = "<span>Read more</span>";
+    document.body.append(link);
+    const inner = link.firstElementChild;
+    let followed = 0;
+    link.onclick = event => { followed++; event.preventDefault(); };
+    const cases = [["MacIntel", "metaKey", true], ["MacIntel", "ctrlKey", false], ["Linux x86_64", "ctrlKey", true], ["Linux x86_64", "metaKey", false], ["Win32", "ctrlKey", true], ["Win32", "metaKey", false]];
+    return cases.map(([platform, modifier, expected]) => {
+      Object.defineProperty(navigator, "platform", { configurable: true, value: platform });
+      const before = followed;
+      inner.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, [modifier]: true }));
+      return { platform, modifier, followed: followed > before, expected };
+    });
+  `);
+  for (const row of result) assert.equal(row.followed, row.expected, JSON.stringify(row));
+});

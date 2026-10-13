@@ -2449,6 +2449,10 @@ export function createArtifactSdk(
     scheduleReviewStateReport();
   }
 
+  function isApplePlatform() {
+    return /Mac|iP(hone|ad|od)/.test(navigator.platform);
+  }
+
   function showAnnotationCard(target, options = {}) {
     cancelPendingDraftRestore();
     const root = ensureShadow();
@@ -2494,7 +2498,7 @@ export function createArtifactSdk(
           : c.tag === "mermaid-node"
             ? "Tell the agent what to change about this diagram node..."
             : "Tell the agent what to change about this element...";
-    const sendNowHint = /Mac|iP(hone|ad|od)/.test(navigator.platform) ? "⌘" : "Ctrl";
+    const sendNowHint = isApplePlatform() ? "⌘" : "Ctrl";
     card.innerHTML =
       '<div class="lavish-heading">' +
       heading +
@@ -2794,6 +2798,11 @@ export function createArtifactSdk(
         isInteractiveControl(event.target)
       )
         return;
+      const followModifier = isApplePlatform() ? event.metaKey : event.ctrlKey;
+      if (followModifier && /** @type {Element} */ (event.target)?.closest?.("a[href]")) {
+        ignoreNextClick = false;
+        return;
+      }
       event.preventDefault();
       event.stopPropagation();
       if (ignoreNextClick) {
