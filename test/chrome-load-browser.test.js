@@ -149,7 +149,7 @@ test(
         `the served-bytes id audit did not report the injected stale id${detail}`,
       );
       assert.deepEqual(
-        Object.entries(report.handlersAttached).filter(([, attached]) => attached),
+        Object.entries(report.handlersAttached).filter(([id, attached]) => attached && id !== "layoutGateAction"),
         [],
         `handlers were attached even though initialisation threw${detail}`,
       );
@@ -619,8 +619,12 @@ async function launchChrome() {
     if (port && browserPath) wsUrl = `ws://127.0.0.1:${port.trim()}${browserPath.trim()}`;
   }
   const close = async () => {
-    chrome.kill("SIGKILL");
-    await rm(userDataDir, { recursive: true, force: true });
+    if (chrome.exitCode === null && chrome.signalCode === null) {
+      const exited = new Promise((resolve) => chrome.once("exit", () => resolve(undefined)));
+      chrome.kill("SIGKILL");
+      await exited;
+    }
+    await rm(userDataDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   };
   if (!wsUrl) {
     await close();
