@@ -41,13 +41,13 @@ function runFixture(dir, args = []) {
   });
 }
 
-test("test runner completes discovery before starting other suites and keeps them parallel", async () => {
+test("test runner completes discovery and version in order before the parallel suites", async () => {
   const peerSource = (name, peer) => `
 import assert from "node:assert/strict";
 import { access, writeFile } from "node:fs/promises";
 import test from "node:test";
 test("${name}", { timeout: 5000 }, async () => {
-  await access("discovery-complete");
+  await access("version-complete");
   await writeFile("${name}-started", "");
   const deadline = Date.now() + 4000;
   while (true) {
@@ -61,11 +61,22 @@ test("${name}", { timeout: 5000 }, async () => {
   await withRunner(
     {
       "server-discovery.test.js": `
-import { writeFile } from "node:fs/promises";
+import assert from "node:assert/strict";
+import { access, writeFile } from "node:fs/promises";
 import test from "node:test";
 test("discovery", async () => {
+  for (const file of ["version-complete", "a-started", "b-started"]) await assert.rejects(access(file), { code: "ENOENT" });
   await new Promise(resolve => setTimeout(resolve, 100));
   await writeFile("discovery-complete", "");
+});`,
+      "cli-version.test.js": `
+import assert from "node:assert/strict";
+import { access, writeFile } from "node:fs/promises";
+import test from "node:test";
+test("version", async () => {
+  await access("discovery-complete");
+  for (const file of ["a-started", "b-started"]) await assert.rejects(access(file), { code: "ENOENT" });
+  await writeFile("version-complete", "");
 });`,
       "a.test.js": peerSource("a", "b"),
       "nested/b.test.js": peerSource("b", "a"),
@@ -77,28 +88,38 @@ test("discovery", async () => {
   );
 });
 
-test("test runner forwards name filters to both groups", async () => {
+test("test runner forwards name filters to all three groups", async () => {
   const source = `
 import test from "node:test";
 test("selected", () => {});
 test("excluded", () => { throw new Error("filter was ignored"); });`;
-  await withRunner({ "server-discovery.test.js": source, "other.test.js": source }, async (dir) => {
-    const result = await runFixture(dir, ["--test-name-pattern=selected"]);
-    assert.equal(result.status, 0, result.output);
-  });
-});
-
-test("test runner stops after discovery fails and returns its exit code", async () => {
   await withRunner(
-    {
-      "server-discovery.test.js":
-        'import test from "node:test"; test("failure", () => { throw new Error("expected"); });',
-      "other.test.js": 'import { writeFileSync } from "node:fs"; writeFileSync("other-started", "");',
-    },
+    { "server-discovery.test.js": source, "cli-version.test.js": source, "other.test.js": source },
     async (dir) => {
-      const result = await runFixture(dir);
-      assert.equal(result.status, 1, result.output);
-      await assert.rejects(readFile(path.join(dir, "other-started")), { code: "ENOENT" });
+      const result = await runFixture(dir, ["--test-name-pattern=selected"]);
+      assert.equal(result.status, 0, result.output);
+      assert.equal(result.output.match(/✔ selected/g)?.length, 3, result.output);
+      assert.doesNotMatch(result.output, /excluded/);
     },
   );
 });
+
+for (const failed of ["server-discovery.test.js", "cli-version.test.js"]) {
+  test(`test runner stops after ${failed} fails and returns its exit code`, async () => {
+    const success = 'import test from "node:test"; test("success", () => {});';
+    await withRunner(
+      {
+        "server-discovery.test.js": success,
+        "cli-version.test.js": success,
+        [failed]: 'import test from "node:test"; test("failure", () => { throw new Error("expected"); });',
+        "other.test.js": 'import { writeFileSync } from "node:fs"; writeFileSync("other-started", "");',
+      },
+      async (dir) => {
+        const result = await runFixture(dir);
+        assert.equal(result.status, 1, result.output);
+        await assert.rejects(readFile(path.join(dir, "other-started")), { code: "ENOENT" });
+        if (failed === "server-discovery.test.js") assert.doesNotMatch(result.output, /✔ success/);
+      },
+    );
+  });
+}

@@ -8,10 +8,10 @@ const files = (await readdir(path.join(root, "test"), { recursive: true }))
   .filter((file) => file.endsWith(".test.js"))
   .map((file) => path.join("test", file))
   .sort();
-const discoveryFile = path.join("test", "server-discovery.test.js");
+const isolatedFiles = ["server-discovery.test.js", "cli-version.test.js"].map((file) => path.join("test", file));
 
-// Discovery releases and reuses ports across addresses and restarts, so other suites must not take them.
-const groups = [[discoveryFile], files.filter((file) => file !== discoveryFile)];
+// Discovery reuses ports; version timing needs startup free from parallel suite load.
+const groups = [...isolatedFiles.map((file) => [file]), files.filter((file) => !isolatedFiles.includes(file))];
 for (const group of groups) {
   const result = spawnSync(process.execPath, ["--test", ...process.argv.slice(2), ...group], {
     cwd: root,
