@@ -548,6 +548,9 @@ export function createArtifactSdk(
   let hovered = null;
   let selected = null;
   let ignoreNextClick = false;
+  // Selectors the chrome reports as carrying a queued note. A click on one opens that note in the
+  // chrome's panel instead of a fresh card; the note's words never enter this document.
+  let queuedAnchorSelectors = new Set();
   let shadow = null;
   let counter = 0;
   const ids = new WeakMap();
@@ -2688,6 +2691,13 @@ export function createArtifactSdk(
     if (msg.type === "lavish:restoreReviewState") restoreReviewState(msg.state);
     if (msg.type === "lavish:requestLayoutDiagnostics") scheduleLayoutAudit(true);
     if (msg.type === "lavish:revealElement") revealElement(msg.selector);
+    if (msg.type === "lavish:queuedAnchors") {
+      queuedAnchorSelectors = new Set(Array.isArray(msg.selectors) ? msg.selectors.map(String) : []);
+    }
+    if (msg.type === "lavish:annotateElement" && annotationMode) {
+      const target = safeQuerySelector(msg.selector);
+      if (target) showAnnotationCard(target);
+    }
   });
 
   // Bring a warning's element into view and flash it. The marker is Lavish UI, so it is excluded
@@ -2807,6 +2817,16 @@ export function createArtifactSdk(
       event.stopPropagation();
       if (ignoreNextClick) {
         ignoreNextClick = false;
+        return;
+      }
+      // The clicked element's own selector, plus its diagram node's, so any click inside a node
+      // finds the node's note again. A table cell's note stays on the exact element clicked.
+      const clicked = queuedAnchorSelectors.size ? context(event.target) : null;
+      const node = clicked?.target?.type === "mermaid-node" ? clicked.target.selector : "";
+      const selector = [clicked?.selector, node].find((candidate) => candidate && queuedAnchorSelectors.has(candidate));
+      if (selector) {
+        closeCard();
+        postArtifactMessage("lavish:editQueuedAnchor", { selector });
         return;
       }
       showAnnotationCard(event.target);

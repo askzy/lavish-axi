@@ -122,6 +122,9 @@ function bootSdk({ platform = "Linux" } = {}) {
   let selection = null;
   const posted = [];
   const documentListeners = [];
+  const windowListeners = [];
+  /** @type {(selector: string) => any} */
+  let documentQuery = () => null;
   const documentElement = createElement("html");
   const head = createElement("head");
   const body = createElement("body");
@@ -162,13 +165,13 @@ function bootSdk({ platform = "Linux" } = {}) {
       removeEventListener() {},
       createElement,
       getElementById: () => null,
-      querySelector: () => null,
+      querySelector: (selector) => documentQuery(selector),
       querySelectorAll: () => [],
       getSelection: () => selection,
     },
   };
   sandbox.window = {
-    addEventListener() {},
+    addEventListener: (type, handler) => windowListeners.push({ type, handler }),
     removeEventListener() {},
     setTimeout: () => 0,
     clearTimeout() {},
@@ -224,6 +227,19 @@ function bootSdk({ platform = "Linux" } = {}) {
       assert.ok(listener);
       listener.handler({ target });
       selection = null;
+    },
+    setDocumentQuery(query) {
+      documentQuery = query;
+    },
+    sendChromeMessage(data) {
+      for (const listener of windowListeners.filter((entry) => entry.type === "message")) {
+        listener.handler({ source: sandbox.parent, data });
+      }
+    },
+    cards() {
+      return documentElement.children
+        .flatMap((child) => child.shadowRoot?.children || [])
+        .filter((child) => child.className === "lavish-annotation-card");
     },
     card() {
       const card = documentElement.children
@@ -427,4 +443,101 @@ test("plain links and modifier-clicked prose stay annotatable", () => {
   const paragraph = appendTo(sdk.body, cell("p", "Just prose"));
   assert.equal(sdk.click(paragraph, { ctrlKey: true }).defaultPrevented, true);
   assert.match(sdk.card().innerHTML, /Annotate &lt;p&gt;/);
+});
+test("clicking an element with a queued note asks the chrome to edit it instead of opening a card", () => {
+  const sdk = bootSdk();
+  const paragraph = appendTo(sdk.body, cell("p", "Just prose"));
+  sdk.click(paragraph);
+  const queued = sdk.queue("Reword this");
+  sdk.sendChromeMessage({ type: "lavish:queuedAnchors", selectors: [queued.prompt.selector] });
+  // The stub shadow root keeps closed cards, so a new card shows as a higher count.
+  const cardsBefore = sdk.cards().length;
+
+  sdk.click(paragraph);
+
+  assert.equal(sdk.cards().length, cardsBefore);
+  const message = sdk.posted.at(-1);
+  assert.equal(message.type, "lavish:editQueuedAnchor");
+  assert.equal(message.selector, queued.prompt.selector);
+  assert.equal(message.artifact_load_token, "load-token");
+});
+
+test("an element whose queued note left the queue opens a fresh card again", () => {
+  const sdk = bootSdk();
+  const paragraph = appendTo(sdk.body, cell("p", "Just prose"));
+  sdk.click(paragraph);
+  const queued = sdk.queue("Reword this");
+  sdk.sendChromeMessage({ type: "lavish:queuedAnchors", selectors: [queued.prompt.selector] });
+  sdk.sendChromeMessage({ type: "lavish:queuedAnchors", selectors: [] });
+  const cardsBefore = sdk.cards().length;
+
+  sdk.click(paragraph);
+
+  assert.equal(sdk.cards().length, cardsBefore + 1);
+});
+
+test("the chrome can hand an element click back for a fresh card", () => {
+  const sdk = bootSdk();
+  const paragraph = appendTo(sdk.body, cell("p", "Just prose"));
+  sdk.setDocumentQuery((selector) => (selector === "body > p" ? paragraph : null));
+
+  sdk.sendChromeMessage({ type: "lavish:annotateElement", selector: "body > p" });
+
+  assert.match(sdk.card().innerHTML, /Annotate &lt;p&gt;/);
+});
+
+// A Mermaid node as the SDK sees one: a `<g class="node">` inside an SVG Mermaid rendered.
+function buildMermaidNode(sdk) {
+  const svg = appendTo(sdk.body, createElement("svg"));
+  svg.id = "mermaid-1";
+  const node = appendTo(svg, createElement("g"));
+  node.id = "flowchart-A-0";
+  const matchesTag = node.matches;
+  node.matches = (selectorList) =>
+    String(selectorList)
+      .split(",")
+      .some((part) => part.trim() === "g.node") || matchesTag(selectorList);
+  const label = appendTo(node, cell("span", "Start"));
+  const shape = appendTo(node, createElement("rect"));
+  return { label, shape };
+}
+
+test("a note queued from a diagram node's label opens again from the node's shape", () => {
+  const sdk = bootSdk();
+  const { label, shape } = buildMermaidNode(sdk);
+  sdk.click(label);
+  const queued = sdk.queue("Rename this step");
+  sdk.sendChromeMessage({
+    type: "lavish:queuedAnchors",
+    selectors: [queued.prompt.selector, queued.prompt.target.selector],
+  });
+  const cardsBefore = sdk.cards().length;
+
+  sdk.click(shape);
+
+  assert.equal(sdk.cards().length, cardsBefore);
+  const message = sdk.posted.at(-1);
+  assert.equal(message.type, "lavish:editQueuedAnchor");
+  assert.equal(message.selector, queued.prompt.target.selector);
+});
+
+test("a click inside a table cell opens only the note on the exact element clicked", () => {
+  const sdk = bootSdk();
+  const { evidence } = buildTable(sdk);
+  const strong = appendTo(evidence, cell("strong", "Drive"));
+  const em = appendTo(evidence, cell("em", "Cursor"));
+  sdk.click(evidence);
+  const cellNote = sdk.queue("Explain this cell");
+  sdk.click(strong);
+  const strongNote = sdk.queue("Explain this app");
+  sdk.sendChromeMessage({
+    type: "lavish:queuedAnchors",
+    selectors: [cellNote.prompt.selector, strongNote.prompt.selector],
+  });
+  const cardsBefore = sdk.cards().length;
+
+  sdk.click(em);
+
+  assert.equal(sdk.cards().length, cardsBefore + 1);
+  assert.notEqual(sdk.posted.at(-1)?.type, "lavish:editQueuedAnchor");
 });
