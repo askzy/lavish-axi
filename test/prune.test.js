@@ -23,7 +23,7 @@ import { serve } from "../src/server.js";
 import { SessionStore, sessionKey } from "../src/session-store.js";
 
 const DAY_MS = 24 * 60 * 60_000;
-const NOW = Date.parse("2026-09-28T12:00:00Z");
+const NOW = Date.now();
 const OLD = new Date(NOW - 45 * DAY_MS);
 const RECENT = new Date(NOW - 2 * DAY_MS);
 const BIN = fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url));
