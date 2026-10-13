@@ -2396,6 +2396,161 @@ test("/artifact refuses a path that escapes through an intermediate directory sy
 // The realpath hardening must not cost us the original lexical guard, and `fetch` collapses
 // `..` in a URL before it ever reaches the wire - only a raw request proves the server itself
 // still rejects the traversal.
+test("/api/sessions refuses a non-HTML path so its directory cannot become an artifact tree", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const secret = path.join(dir, "secret.txt");
+  await writeFile(secret, "outside-secret\n");
+  await writeFile(path.join(dir, ".env"), "hidden-secret\n");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const created = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: secret }),
+    });
+    const body = await created.json();
+    assert.equal(created.status, 400);
+    assert.equal(body.status, "error");
+    assert.equal(body.code, "VALIDATION_ERROR");
+    assert.match(body.error, /HTML file/);
+
+    const key = sessionKey(await canonicalFile(secret));
+    const leak = await fetch(`${base}/artifact/${key}/.env`);
+    assert.equal(leak.status, 404);
+    assert.doesNotMatch(await leak.text(), /hidden-secret/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("/api/sessions refuses an HTML symlink to a non-HTML file", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const secret = path.join(dir, "secret.txt");
+  const decoy = path.join(dir, "decoy.html");
+  await writeFile(secret, "outside-secret\n");
+  await symlink(secret, decoy);
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const created = await fetch(`http://127.0.0.1:${server.port}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: decoy }),
+    });
+    const body = await created.json();
+    assert.equal(created.status, 400);
+    assert.equal(body.code, "VALIDATION_ERROR");
+    assert.match(body.error, /HTML file/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("/api/sessions refuses HTML directories and missing or invalid paths", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const fake = path.join(dir, "directory.html");
+  await mkdir(fake);
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    for (const file of [fake, null, 42, {}]) {
+      const response = await fetch(`http://127.0.0.1:${server.port}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file }),
+      });
+      assert.equal(response.status, 400);
+      assert.equal((await response.json()).code, "VALIDATION_ERROR");
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("/artifact serves same-tree assets for an HTML session", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const dir = path.join(parent, ".lavish");
+  const assetDir = path.join(dir, "assets");
+  const artifact = path.join(dir, "artifact.html");
+  await mkdir(dir);
+  await mkdir(assetDir);
+  await writeFile(
+    artifact,
+    '<!doctype html><html><head><link rel="stylesheet" href="assets/style.css"></head><body><a href="about.htm">about</a></body></html>',
+  );
+  await writeFile(path.join(assetDir, "style.css"), "body { color: rgb(1 2 3); }\n");
+  await writeFile(path.join(dir, "about.htm"), "<!doctype html><html><body>about</body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const sessionRes = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    assert.equal(sessionRes.status, 200);
+    const session = await sessionRes.json();
+    const load = await beginArtifactLoad(base, session.key);
+    const documentResponse = await fetch(artifactLoadUrl(base, session.key, load));
+    const css = await fetch(`${base}/artifact/${session.key}/assets/style.css`);
+    const page = await fetch(`${base}/artifact/${session.key}/about.htm`);
+
+    assert.equal(documentResponse.status, 200);
+    assert.match(await documentResponse.text(), /<a href="about.htm">about<\/a>/);
+    assert.equal(css.status, 200);
+    assert.equal(await css.text(), "body { color: rgb(1 2 3); }\n");
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /about/);
+  } finally {
+    await server.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("leftover non-HTML sessions are refused before any session.file content read", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const secret = path.join(dir, "secret.txt");
+  await writeFile(secret, "outside-secret\n");
+  await writeFile(path.join(dir, ".env"), "hidden-secret\n");
+  const absolute = await canonicalFile(secret);
+  const key = sessionKey(absolute);
+  await writeFile(
+    path.join(dir, "state.json"),
+    `${JSON.stringify({ sessions: { [key]: { key, file: absolute, url: "http://127.0.0.1/session/test", status: "open", updated_at: new Date().toISOString() } } }, null, 2)}\n`,
+  );
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const documentResponse = await fetch(`${base}/artifact/${key}/index.html`);
+    const sibling = await fetch(`${base}/artifact/${key}/.env`);
+    const exported = await fetch(`${base}/api/${key}/export`);
+    const shared = await fetch(`${base}/api/${key}/share`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({}),
+    });
+    const mermaid = await fetch(`${base}/api/${key}/mermaid-sources`);
+    const chrome = await fetch(`${base}/session/${key}`);
+    assert.equal(documentResponse.status, 403);
+    assert.doesNotMatch(await documentResponse.text(), /outside-secret/);
+    assert.equal(sibling.status, 403);
+    assert.doesNotMatch(await sibling.text(), /hidden-secret/);
+    assert.equal(exported.status, 403);
+    assert.doesNotMatch(await exported.text(), /outside-secret/);
+    assert.equal(shared.status, 410);
+    assert.doesNotMatch(await shared.text(), /outside-secret/);
+    assert.equal(mermaid.status, 403);
+    assert.doesNotMatch(await mermaid.text(), /outside-secret/);
+    assert.equal(chrome.status, 403);
+    assert.doesNotMatch(await chrome.text(), /outside-secret/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("/artifact still rejects lexical .. traversal that reaches the server unnormalized", async () => {
   const parent = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const dir = path.join(parent, ".lavish");

@@ -74,6 +74,7 @@ State lives at `~/.lavish-axi/state.json` (`LAVISH_AXI_STATE_DIR`), shared acros
 ### Request flow
 
 1. `lavish-axi <file.html>` (`openCommand`) -> POST `/api/sessions` -> `SessionStore.upsertSession` -> the CLI opens the returned session URL in the browser.
+   `/api/sessions` requires a regular `.html` or `.htm` file at both the requested path and its real path, so a non-HTML file cannot establish a serving directory. Older non-HTML sessions are refused before artifact, chrome, export, or Mermaid-source routes read their content.
    `--no-gate` sends `noGate`, returns a one-open URL with `?no-gate=1`, and leaves the stored canonical session URL unchanged.
    Sessions record who ended them: `ended_by: "user"` for browser-initiated ends (including the composer's send-and-end, which posts final prompts and the `endSession` flag to `/api/:key/prompts` atomically) and `ended_by: "agent"` for `lavish-axi end <file>`.
    Idle self-shutdown never calls `endSession` - it only stops the server process, leaving session status untouched in `state.json`, so there is no third `ended_by` case to track.

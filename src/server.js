@@ -75,7 +75,8 @@ import {
 } from "./prune.js";
 import { formatServerLogLine, serverStdioIsTimestamped } from "./server-log.js";
 import { AsyncMutex } from "./async-mutex.js";
-import { canonicalFile, canonicalSessionFile, SessionStore, sessionKey } from "./session-store.js";
+import { artifactTreeRoot, isArtifactPathError, isHtmlPath, resolveAllowedArtifactFile } from "./artifact-path.js";
+import { canonicalSessionFile, SessionStore, sessionKey } from "./session-store.js";
 import { detectTailscale } from "./tailscale.js";
 import {
   ACCEPTED_IMAGE_MIME,
@@ -616,9 +617,16 @@ export async function serve({
     setImmediate(() => shutdown(reloadKey, reason, "shutdown-request"));
   });
 
+  // Older state files may still name a non-HTML file that must not be returned to callers.
+  function refuseNonHtmlArtifact(session, res) {
+    if (isHtmlPath(session.file)) return false;
+    res.status(403).send("Forbidden");
+    return true;
+  }
+
   app.post("/api/sessions", async (req, res, next) => {
     try {
-      const file = await canonicalFile(req.body.file);
+      const file = await resolveAllowedArtifactFile(req.body?.file);
       const key = sessionKey(file);
       const reopen = Boolean(req.body.reopen);
       const existing = await store.findByKey(key);
@@ -643,6 +651,10 @@ export async function serve({
       await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
       res.json({ key, file, url, status: "opened", ...networkWarningField() });
     } catch (error) {
+      if (isArtifactPathError(error)) {
+        res.status(error.statusCode).json({ status: "error", code: error.code, error: error.message });
+        return;
+      }
       next(error);
     }
   });
@@ -1249,6 +1261,7 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
+      if (refuseNonHtmlArtifact(session, res)) return;
       const source = await readFile(session.file, "utf8");
       const root = path.dirname(session.file);
       const { html, warnings } = await buildSelfContainedHtml(source, {
@@ -1309,6 +1322,7 @@ export async function serve({
         return;
       }
       const session = chromeLoad.session;
+      if (refuseNonHtmlArtifact(session, res)) return;
       await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
       const artifactHtml = await readFile(session.file, "utf8").catch(() => "");
       const { faviconTag, title } = extractArtifactHead(artifactHtml);
@@ -1394,6 +1408,7 @@ export async function serve({
         sendSessionNotFound(req, res);
         return;
       }
+      if (refuseNonHtmlArtifact(beforeRead.session, res)) return;
       if (!beforeRead.valid) {
         res
           .status(409)
@@ -1430,7 +1445,8 @@ export async function serve({
         sendSessionNotFound(req, res);
         return;
       }
-      const root = path.dirname(session.file);
+      if (refuseNonHtmlArtifact(session, res)) return;
+      const root = artifactTreeRoot(session.file);
       const file = await resolveArtifactAsset(root, assetPath);
       if (!file) {
         res.status(403).send("Forbidden");
@@ -1660,6 +1676,7 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
+      if (refuseNonHtmlArtifact(session, res)) return;
       const html = await readFile(session.file, "utf8").catch(() => "");
       const sources = extractMermaidSources(html).map(({ index, source }) => ({
         index,
