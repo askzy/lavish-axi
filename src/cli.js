@@ -53,6 +53,7 @@ import {
   resolvePruneUnrepliedMaxAgeMs,
 } from "./prune.js";
 import { resolveDesignAssetPath, serve } from "./server.js";
+import { isHtmlPath } from "./artifact-path.js";
 import { canonicalFile, canonicalSessionFile, sessionKey, SessionStore } from "./session-store.js";
 import { initDefaultTelemetry } from "./telemetry.js";
 
@@ -1040,10 +1041,6 @@ async function assertHtmlFile(file) {
       "Create the HTML artifact first, then run `lavish-axi <html-file>`",
     ]);
   }
-}
-
-function isHtmlPath(file) {
-  return file.toLowerCase().endsWith(".html") || file.toLowerCase().endsWith(".htm");
 }
 
 const HEALTH_PROBE_TIMEOUT_MS = 500;
