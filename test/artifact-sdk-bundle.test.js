@@ -118,7 +118,8 @@ function cell(tag, text) {
   return element;
 }
 
-function bootSdk() {
+function bootSdk({ platform = "Linux" } = {}) {
+  let selection = null;
   const posted = [];
   const documentListeners = [];
   const documentElement = createElement("html");
@@ -129,7 +130,7 @@ function bootSdk() {
 
   const sandbox = {
     parent: { postMessage: (message) => posted.push(message) },
-    navigator: { platform: "Linux" },
+    navigator: { platform },
     CSS: { escape: (value) => String(value) },
     Element: class Element {},
     MutationObserver: class MutationObserver {
@@ -163,7 +164,7 @@ function bootSdk() {
       getElementById: () => null,
       querySelector: () => null,
       querySelectorAll: () => [],
-      getSelection: () => null,
+      getSelection: () => selection,
     },
   };
   sandbox.window = {
@@ -187,11 +188,14 @@ function bootSdk() {
     posted,
     body,
     api: sandbox.window.lavish,
-    click(target) {
+    click(target, modifiers = {}) {
       const listener = documentListeners.find((entry) => entry.type === "click");
       assert.ok(listener, "the SDK registers a document click listener");
       const event = {
         target,
+        ctrlKey: false,
+        metaKey: false,
+        ...modifiers,
         defaultPrevented: false,
         preventDefault() {
           event.defaultPrevented = true;
@@ -200,6 +204,26 @@ function bootSdk() {
       };
       listener.handler(event);
       return event;
+    },
+    selectText(target, text) {
+      const textNode = { nodeType: 3, parentElement: target, parentNode: { childNodes: [] } };
+      textNode.parentNode.childNodes.push(textNode);
+      const range = {
+        collapsed: false,
+        commonAncestorContainer: textNode,
+        startContainer: textNode,
+        startOffset: 0,
+        endContainer: textNode,
+        endOffset: text.length,
+        cloneRange: () => range,
+        getClientRects: () => [],
+        getBoundingClientRect: () => target.getBoundingClientRect(),
+      };
+      selection = { rangeCount: 1, getRangeAt: () => range, toString: () => text };
+      const listener = documentListeners.find((entry) => entry.type === "mouseup");
+      assert.ok(listener);
+      listener.handler({ target });
+      selection = null;
     },
     card() {
       const card = documentElement.children
@@ -349,3 +373,58 @@ for (const nested of [false, true]) {
     assert.match(sdk.card().innerHTML, /Annotate &lt;span&gt;/);
   });
 }
+
+function buildLink(sdk) {
+  const link = appendTo(sdk.body, cell("a", "Read the spec"));
+  link.setAttribute("href", "https://example.com/spec");
+  const inner = appendTo(link, cell("span", "spec"));
+  return { link, inner };
+}
+
+for (const [platform, modifier] of [
+  ["MacIntel", "metaKey"],
+  ["iPad", "metaKey"],
+  ["Linux x86_64", "ctrlKey"],
+  ["Win32", "ctrlKey"],
+]) {
+  test(`${modifier}-click on ${platform} follows links and their descendants`, () => {
+    const sdk = bootSdk({ platform });
+    const { link, inner } = buildLink(sdk);
+    for (const target of [link, inner]) assert.equal(sdk.click(target, { [modifier]: true }).defaultPrevented, false);
+    assert.equal(
+      sdk.body.parentElement.children.some((child) => child.shadowRoot),
+      false,
+    );
+  });
+  test(`${modifier}-click on ${platform} clears the text-selection swallow`, () => {
+    const sdk = bootSdk({ platform });
+    const { link } = buildLink(sdk);
+    const paragraph = appendTo(sdk.body, cell("p", "Just prose"));
+    sdk.selectText(paragraph, "prose");
+    assert.match(sdk.card().innerHTML, /Annotate text/);
+    assert.equal(sdk.click(link, { [modifier]: true }).defaultPrevented, false);
+    sdk.click(paragraph);
+    assert.match(sdk.card().innerHTML, /Annotate &lt;p&gt;/);
+  });
+}
+for (const [platform, modifier] of [
+  ["Linux x86_64", "metaKey"],
+  ["Win32", "metaKey"],
+  ["MacIntel", "ctrlKey"],
+]) {
+  test(`${modifier}-click on ${platform} still annotates the link`, () => {
+    const sdk = bootSdk({ platform });
+    const { link } = buildLink(sdk);
+    assert.equal(sdk.click(link, { [modifier]: true }).defaultPrevented, true);
+    assert.match(sdk.card().innerHTML, /Annotate &lt;a&gt;/);
+  });
+}
+test("plain links and modifier-clicked prose stay annotatable", () => {
+  const sdk = bootSdk();
+  const { link } = buildLink(sdk);
+  assert.equal(sdk.click(link).defaultPrevented, true);
+  assert.match(sdk.card().innerHTML, /Annotate &lt;a&gt;/);
+  const paragraph = appendTo(sdk.body, cell("p", "Just prose"));
+  assert.equal(sdk.click(paragraph, { ctrlKey: true }).defaultPrevented, true);
+  assert.match(sdk.card().innerHTML, /Annotate &lt;p&gt;/);
+});
