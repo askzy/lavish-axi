@@ -684,10 +684,10 @@ test("fork: browser_disconnected poll output hands back without reopening or tou
   assert.match(output.next_step, /stop polling/i);
   assert.match(output.next_step, /do not reopen/i);
   assert.match(output.next_step, /remains open|resumable/i);
-  assert.match(output.next_step, /ask the user/i);
+  assert.doesNotMatch(output.next_step, /ask the user/i);
   assert.match(output.next_step, /safely leased/);
   assert.match(output.next_step, /`\/check-lavish`/);
-  assert.match(output.next_step, /run `lavish-axi end \/tmp\/report\.html` unless they do/);
+  assert.doesNotMatch(output.next_step, /lavish-axi end/);
   assert.doesNotMatch(output.next_step, /Run `lavish-axi \/tmp\/report\.html`/);
 });
 
@@ -697,7 +697,7 @@ test("fork: the browser_disconnected rule is a named wake-path rule rendered int
   assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /closed the review page/);
   assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /stop polling/i);
   assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /do not reopen it uninvited/);
-  assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /run `lavish-axi end <html-file>` unless they do/);
+  assert.doesNotMatch(cli.POLL_BROWSER_DISCONNECTED_RULE, /lavish-axi end/);
   assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /safely leased/);
   assert.match(cli.POLL_BROWSER_DISCONNECTED_RULE, /`\/check-lavish`/);
   // The hand-back pair is untouched: the new rule is added beside it, not folded into it.
@@ -706,15 +706,38 @@ test("fork: the browser_disconnected rule is a named wake-path rule rendered int
   assert.ok(skill.createSkillMarkdown().includes("browser_disconnected"));
 });
 
-test("fork: both skills tell the agent when to end a session instead of leaving it open", () => {
-  const lavish = skill.createSkillMarkdown();
-  assert.match(lavish, /8\. Run `npx -y lavish-axi end <html-file>` at two moments\./);
-  assert.match(lavish, /feedback whose text says the user is done/);
-  assert.match(lavish, /will not start another poll in this conversation/);
-  assert.match(lavish, /after a `browser_disconnected` poll result, unless the user asks to reopen/);
-  assert.doesNotMatch(lavish, /when the review is finished/);
-  const check = skill.createCheckSkillMarkdown();
-  assert.match(check, /this conversation will not poll again, run `npx -y lavish-axi end <html-file>`/);
+test("fork: ending an agent turn does not end either skill's review", () => {
+  for (const markdown of [skill.createSkillMarkdown(), skill.createCheckSkillMarkdown()]) {
+    assert.match(markdown, /End the session only when the user explicitly says the review is finished/i);
+    assert.match(markdown, /leave the session open/i);
+    assert.doesNotMatch(
+      markdown,
+      /will not (?:start another )?poll|will not poll again|unless they do|unless the user asks to reopen/i,
+    );
+    assert.doesNotMatch(markdown, /for example "looks good", "ship it", "thanks"/);
+  }
+});
+
+test("fork: every agent-facing poll surface distinguishes first poll, running handles, and reap", () => {
+  const outputs = [
+    cli.POLL_WAKE_PATH_RULES.join(" "),
+    cli.createHomeOutput({ bin: "lavish-axi", sessions: [] }).help.join(" "),
+    cli.getCommandHelp("poll"),
+    skill.createSkillMarkdown(),
+    skill.createCheckSkillMarkdown(),
+    cli.createOpenOutput({ file: "/tmp/report.html", url: "http://localhost/session/test", status: "open" }).next_step,
+    cli.createPollOutput({ file: "/tmp/report.html", response: { status: "waiting" } }).next_step,
+    cli.createPollOutput({ file: "/tmp/report.html", response: { status: "feedback", prompts: [] } }).next_step,
+  ];
+  for (const text of outputs) {
+    assert.match(text, /first indefinite poll immediately/i);
+    assert.match(text, /session_id.*write_stdin/);
+    assert.match(text, /functions\.exec.*functions\.wait/);
+    assert.match(text, /Claude.*tracked background task.*completion notification/i);
+    assert.match(text, /Continuing a running command is not starting another poll/i);
+    assert.match(text, /Do NOT silently re-run the poll after a reap/i);
+    assert.match(text, /leave the session open/i);
+  }
 });
 
 // Exclusive poll listeners (upstream #358): the CLI side of the fork's adaptation.
