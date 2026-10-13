@@ -2571,7 +2571,7 @@ test("every accepted prompt enters the chat history with its anchor, in batch or
     const updated = await store.findByKey(session.key);
     assert.ok(updated.chat.every((entry) => typeof entry.at === "string" && entry.at));
     assert.deepEqual(
-      updated.chat.map(({ at: _at, ...entry }) => entry),
+      updated.chat.map(({ at: _at, receipt: _receipt, ...entry }) => entry),
       [
         {
           role: "user",
@@ -2707,8 +2707,8 @@ test("an acknowledged layout prompt retry bypasses a later recurring-warning con
 
 // Fork lease model: the transcript is written once, at accept time in `queuePrompts`. Delivery
 // (`takeFeedback`), a lease that expires and redelivers, and the ack never touch `chat`, so a
-// redelivered batch never grows the conversation or moves its revision.
-test("a lease that expires and redelivers adds no chat entry and bumps no chat_revision", async () => {
+// Redelivery preserves transcript identity while updating its current receipt attempt.
+test("a lease that expires and redelivers updates its receipt without adding a chat entry", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {
     let now = Date.parse("2026-09-15T00:00:00.000Z");
@@ -2738,7 +2738,8 @@ test("a lease that expires and redelivers adds no chat entry and bumps no chat_r
 
     const updated = await store.findByKey(session.key);
     assert.equal(updated.chat.length, 1);
-    assert.equal(updated.chat_revision, 1);
+    assert.equal(updated.chat_revision, 3);
+    assert.equal(updated.chat[0].receipt.delivery_id, redelivered.delivery_id);
     assert.equal(updated.leases.length, 1);
   } finally {
     await rm(dir, { recursive: true, force: true });

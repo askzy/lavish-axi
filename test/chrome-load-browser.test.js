@@ -39,6 +39,8 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { serve } from "../src/server.js";
+import { SessionStore } from "../src/session-store.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const chromeBinary = findChromeBinary();
@@ -269,6 +271,234 @@ test(
     } finally {
       await chrome.close();
       for (const cleanup of cleanups.reverse()) await cleanup();
+      await rm(temp, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "real browser: delivery receipt updates preserve thumbnails, drafts, and caret and expire locally",
+  { skip, timeout: 120_000 },
+  async () => {
+    const temp = await mkdtemp(path.join(tmpdir(), "lavish-receipt-browser-"));
+    const chrome = await launchChrome();
+    const cleanups = [];
+    try {
+      const artifact = path.join(temp, "artifact.html");
+      await writeFile(artifact, ARTIFACT_HTML);
+      const session = await startSourceLayoutSession(temp, artifact, cleanups);
+      const { targetId } = await chrome.cdp.send("Target.createTarget", { url: "about:blank" });
+      const { sessionId } = await chrome.cdp.send("Target.attachToTarget", { targetId, flatten: true });
+      await chrome.cdp.send("Page.enable", {}, sessionId);
+      const evaluate = async (expression) => {
+        const result = await chrome.cdp.send(
+          "Runtime.evaluate",
+          { expression, returnByValue: true, awaitPromise: true },
+          sessionId,
+        );
+        if (result.exceptionDetails)
+          throw new Error(result.exceptionDetails.exception?.description || "browser evaluation failed");
+        return result.result.value;
+      };
+      const waitFor = async (expression) => {
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if (await evaluate(expression)) return;
+          await sleep(100);
+        }
+        assert.fail(`Browser condition did not settle: ${expression}`);
+      };
+      await chrome.cdp.send("Page.navigate", { url: session.url }, sessionId);
+      await waitFor("window.__lavishChromeReady === true");
+      const report = await evaluate(`(() => {
+        const entry = {role:"user",text:"Review receipt",prompt_id:"receipt-browser-note",delivery_receipt:{state:"queued"}};
+        syncChat([entry],100);
+        const bubble=document.querySelector("#chatLog .bubble.user"), row=bubble.querySelector(".delivery-receipt");
+        const image=document.createElement("img"); image.className="bubble-attachment";image.alt="reference.png";
+        bubble.appendChild(image); image.dispatchEvent(new Event("error"));
+        const expired=bubble.querySelector(".bubble-attachment-expired");
+        enqueuePrompt({prompt:"Queued draft",tag:"message"});
+        document.querySelector(".queued-edit").click();
+        const editor=document.querySelector(".queued-edit-input"); editor.value="Unsent words";
+        editor.dispatchEvent(new Event("input",{bubbles:true})); editor.focus(); editor.setSelectionRange(2,6,"backward");
+        document.getElementById("chatInput").value="Composer draft";
+        setAgentPresence("listening");
+        const queuedLabel=row.textContent;
+        syncChat([{...entry,delivery_receipt:{state:"delivered",delivered_at:"2026-10-13T12:00:00Z"}}],101);
+        window.receiptProbe={entry,bubble,row,expired,editor};
+        return {queuedLabel, deliveredLabel:row.textContent, bubbleRetained:document.querySelector("#chatLog .bubble.user")===bubble,
+          rowRetained:bubble.querySelector(".delivery-receipt")===row, expiredRetained:bubble.querySelector(".bubble-attachment-expired")===expired,
+          expiredText:expired.textContent, editorRetained:document.querySelector(".queued-edit-input")===editor,
+          draft:editor.value, caret:[editor.selectionStart,editor.selectionEnd,editor.selectionDirection], focused:document.activeElement===editor,
+          composer:document.getElementById("chatInput").value, role:row.getAttribute("role"), live:row.getAttribute("aria-live"), label:row.getAttribute("aria-label")};
+      })()`);
+      assert.deepEqual(report, {
+        queuedLabel: "Queued",
+        deliveredLabel: "Delivered",
+        bubbleRetained: true,
+        rowRetained: true,
+        expiredRetained: true,
+        expiredText: "Image expired",
+        editorRetained: true,
+        draft: "Unsent words",
+        caret: [2, 6, "backward"],
+        focused: true,
+        composer: "Composer draft",
+        role: "status",
+        live: "polite",
+        label:
+          "Delivered. The note reached the agent's output. This does not confirm it was read. Confirmed at 2026-10-13T12:00:00Z.",
+      });
+      await evaluate('syncChat([{...receiptProbe.entry,delivery_receipt:{state:"delivering",remaining_ms:150}}],102)');
+      await waitFor('receiptProbe.row.textContent === "Queued"');
+      assert.equal(await evaluate('document.querySelector("#chatLog .bubble.user") === receiptProbe.bubble'), true);
+      await evaluate('syncChat([{...receiptProbe.entry,delivery_receipt:{state:"unconfirmed"}}],103)');
+      assert.deepEqual(await evaluate("[receiptProbe.row.textContent,receiptProbe.row.title]"), [
+        "Unconfirmed",
+        "The agent posted a reply, but delivery of this note was not confirmed.",
+      ]);
+      await chrome.cdp.send("Target.closeTarget", { targetId });
+    } finally {
+      await chrome.close();
+      for (const cleanup of cleanups.reverse()) await cleanup();
+      await rm(temp, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "real browser: receipt leases, stale ACKs, reconnect, and final Send & End stay accurate",
+  { skip, timeout: 120_000 },
+  async () => {
+    const temp = await mkdtemp(path.join(tmpdir(), "lavish-receipt-lifecycle-"));
+    const chrome = await launchChrome();
+    let server;
+    try {
+      const artifact = path.join(temp, "artifact.html"),
+        stateFile = path.join(temp, "state.json");
+      await writeFile(artifact, ARTIFACT_HTML);
+      const store = new SessionStore(stateFile);
+      const { key } = await store.upsertSession(artifact, "http://localhost/session/test");
+      const state = JSON.parse(await readFile(stateFile, "utf8"));
+      state.sessions[key].chat = [{ role: "user", text: "Legacy note" }];
+      await writeFile(stateFile, JSON.stringify(state));
+      server = await serve({
+        port: 0,
+        stateFile,
+        version: "9.9.9-test",
+        idleTimeoutMs: null,
+        feedbackLeaseTtlMs: 2500,
+        hosts: ["127.0.0.1"],
+        detectTailscale: async () => null,
+      });
+      const base = "http://127.0.0.1:" + server.port;
+      const { targetId } = await chrome.cdp.send("Target.createTarget", { url: "about:blank" });
+      const { sessionId } = await chrome.cdp.send("Target.attachToTarget", { targetId, flatten: true });
+      await chrome.cdp.send("Page.enable", {}, sessionId);
+      await chrome.cdp.send(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {
+          source:
+            "window.receiptSockets=[]; window.WebSocket=class extends WebSocket { constructor(...args){super(...args);window.receiptSockets.push(this);} };",
+        },
+        sessionId,
+      );
+      const evaluate = async (expression) => {
+        const result = await chrome.cdp.send(
+          "Runtime.evaluate",
+          { expression, returnByValue: true, awaitPromise: true },
+          sessionId,
+        );
+        if (result.exceptionDetails)
+          throw new Error(result.exceptionDetails.exception?.description || "browser evaluation failed");
+        return result.result.value;
+      };
+      const waitFor = async (expression) => {
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if (await evaluate(expression)) return;
+          await sleep(100);
+        }
+        assert.fail("Browser condition did not settle: " + expression);
+      };
+      const post = async (route, body) => {
+        const response = await fetch(base + "/api/" + key + "/" + route, {
+          method: "POST",
+          headers: { "content-type": "application/json", origin: base },
+          body: JSON.stringify(body),
+        });
+        assert.equal(response.status, 200);
+        return response.json();
+      };
+      const poll = () =>
+        fetch(base + "/api/poll?file=" + encodeURIComponent(artifact) + "&timeoutMs=0").then((response) =>
+          response.json(),
+        );
+      await chrome.cdp.send("Page.navigate", { url: base + "/session/" + key }, sessionId);
+      await waitFor("window.__lavishChromeReady === true && receiptSockets[0]?.readyState === 1");
+      assert.equal(await evaluate('document.querySelector("#chatLog .bubble.user .delivery-receipt")'), null);
+      await evaluate('enqueuePrompt({prompt:"Current note",tag:"message"}); document.getElementById("send").click()');
+      await waitFor('queued.length===0 && document.querySelector(".delivery-receipt")?.textContent==="Queued"');
+      const first = await poll();
+      assert.equal(first.status, "feedback");
+      await waitFor('document.querySelector(".delivery-receipt")?.textContent==="Delivering"');
+      await evaluate(`(() => {
+      enqueuePrompt({prompt:"Unrelated queued note",tag:"message"});document.querySelector(".queued-edit").click();
+      const editor=document.querySelector(".queued-edit-input");editor.value="Draft survives receipt changes";editor.dispatchEvent(new Event("input",{bubbles:true}));editor.focus();editor.setSelectionRange(2,7,"backward");
+      window.receiptEditor=editor;window.currentBubble=document.querySelector(".delivery-receipt").parentElement;
+    })()`);
+      await waitFor('document.querySelector(".delivery-receipt")?.textContent==="Queued"');
+      const second = await poll();
+      assert.notEqual(second.delivery_id, first.delivery_id);
+      await waitFor('document.querySelector(".delivery-receipt")?.textContent==="Delivering"');
+      assert.equal((await post("ack", { delivery_id: first.delivery_id })).retired, false);
+      assert.equal(await evaluate('document.querySelector(".delivery-receipt").textContent'), "Delivering");
+      assert.equal((await post("ack", { delivery_id: second.delivery_id })).retired, true);
+      await waitFor('document.querySelector(".delivery-receipt")?.textContent==="Delivered"');
+      assert.deepEqual(
+        await evaluate(
+          '[document.querySelector(".queued-edit-input")===receiptEditor,receiptEditor.value,receiptEditor.selectionStart,receiptEditor.selectionEnd,receiptEditor.selectionDirection,document.querySelector(".delivery-receipt").parentElement===currentBubble]',
+        ),
+        [true, "Draft survives receipt changes", 2, 7, "backward", true],
+      );
+      await post("agent-reply", { text: "Reviewed" });
+      await chrome.cdp.send("Page.reload", {}, sessionId);
+      await waitFor(
+        'window.__lavishChromeReady === true && document.querySelector(".delivery-receipt")?.textContent==="Delivered" && Boolean(document.querySelector(".queued-edit-input"))',
+      );
+      assert.equal(
+        await evaluate('document.querySelector(".queued-edit-input").value'),
+        "Draft survives receipt changes",
+      );
+      assert.equal(
+        await evaluate('document.querySelector("#chatLog .bubble.user").querySelector(".delivery-receipt")'),
+        null,
+      );
+      await evaluate("receiptSockets.at(-1).close()");
+      await waitFor("receiptSockets.length>=2 && receiptSockets.at(-1).readyState===1");
+      assert.equal(await evaluate('document.querySelector(".delivery-receipt").textContent'), "Delivered");
+      await evaluate('document.getElementById("sendAndEnd").click()');
+      await waitFor('document.getElementById("endedOverlay").hidden===false && queued.length===0');
+      const final = await poll();
+      assert.equal(final.status, "feedback");
+      assert.equal(final.session_ended, true);
+      assert.equal(final.prompts[0].prompt, "Draft survives receipt changes");
+      await waitFor(
+        'document.querySelectorAll(".delivery-receipt").length===2 && Array.from(document.querySelectorAll(".delivery-receipt")).at(-1).textContent==="Delivering"',
+      );
+      assert.equal((await post("ack", { delivery_id: final.delivery_id })).retired, true);
+      await waitFor(
+        'Array.from(document.querySelectorAll(".delivery-receipt")).every(row=>row.textContent==="Delivered")',
+      );
+      assert.equal(await evaluate('document.querySelectorAll(".delivery-receipt").length'), 2);
+      assert.equal(await evaluate('document.getElementById("endedOverlay").hidden'), false);
+      await chrome.cdp.send("Page.reload", {}, sessionId);
+      await waitFor(
+        'window.__lavishChromeReady===true && document.querySelectorAll(".delivery-receipt").length===2 && Array.from(document.querySelectorAll(".delivery-receipt")).every(row=>row.textContent==="Delivered")',
+      );
+      assert.equal(await evaluate('document.getElementById("endedOverlay").hidden'), false);
+      await chrome.cdp.send("Target.closeTarget", { targetId });
+    } finally {
+      await chrome.close();
+      if (server) await server.close();
       await rm(temp, { recursive: true, force: true });
     }
   },

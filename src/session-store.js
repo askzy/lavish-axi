@@ -123,6 +123,7 @@ export class SessionStore {
         pending_prompts: existing.pending_prompts || 0,
         prompts: existingPrompts,
         leases: normalizeLeases(existing.leases),
+        pending_receipt_ids: normalizeReceiptIds(existing.pending_receipt_ids),
         // The warning inbox is durable review state, not deliverable feedback: reopening a session
         // must never silently drop unresolved warnings the user has not triaged yet.
         layout_warnings: normalizeStoredWarnings(existing.layout_warnings),
@@ -268,6 +269,11 @@ export class SessionStore {
       // messages: the notes a reviewer sends are the half of the conversation the panel used to
       // lose on send.
       const userMessages = acceptedPrompts.map((prompt) => chatEntryForPrompt(prompt, at)).filter(Boolean);
+      for (const entry of userMessages) entry.receipt = { id: crypto.randomUUID(), state: "queued" };
+      session.pending_receipt_ids = [
+        ...normalizeReceiptIds(session.pending_receipt_ids),
+        ...userMessages.map((entry) => entry.receipt.id),
+      ];
       session.prompts = [...(session.prompts || []), ...acceptedPrompts.map(agentFacingPrompt)];
       session.chat = [...(session.chat || []), ...userMessages];
       applyTranscriptBound(session);
@@ -597,6 +603,10 @@ export class SessionStore {
       const domSnapshot = session.dom_snapshot || expired.at(-1)?.dom_snapshot || "";
       const lease = {
         delivery_id: crypto.randomUUID(),
+        receipt_ids: normalizeReceiptIds([
+          ...expired.flatMap((lease) => lease.receipt_ids),
+          ...normalizeReceiptIds(session.pending_receipt_ids),
+        ]),
         leased_at: new Date(now).toISOString(),
         prompts,
         dom_snapshot: domSnapshot,
@@ -631,6 +641,13 @@ export class SessionStore {
       const historyRoom = Math.max(0, MAX_DELIVERED_ATTACHMENTS - current.length);
       session.delivered_attachments = [...carried.slice(-historyRoom), ...current];
       session.leases = [...live, lease];
+      updateReceipts(session, lease.receipt_ids, (receipt) => ({
+        id: receipt.id,
+        state: "delivering",
+        delivery_id: lease.delivery_id,
+        expires_at: new Date(now + this.feedbackLeaseTtlMs).toISOString(),
+      }));
+      session.pending_receipt_ids = [];
       session.prompts = [];
       session.artifact_failures = [];
       session.pending_prompts = 0;
@@ -654,9 +671,21 @@ export class SessionStore {
         return null;
       }
       const leases = normalizeLeases(session.leases);
+      const lease = leases.find((entry) => entry.delivery_id === deliveryId);
+      if (lease?.released) return { session, retired: false };
       const remaining = leases.filter((lease) => lease.delivery_id !== deliveryId);
       const retired = remaining.length !== leases.length;
       if (retired) {
+        updateReceipts(
+          session,
+          lease.receipt_ids,
+          (receipt) => ({
+            id: receipt.id,
+            state: "delivered",
+            delivered_at: new Date(this.now()).toISOString(),
+          }),
+          deliveryId,
+        );
         session.leases = remaining;
         session.updated_at = new Date().toISOString();
         await this.writeState(state);
@@ -679,6 +708,13 @@ export class SessionStore {
       const lease = leases.find((entry) => entry.delivery_id === deliveryId);
       if (!lease) return { session, released: false };
       lease.leased_at = new Date(0).toISOString();
+      lease.released = true;
+      updateReceipts(
+        session,
+        lease.receipt_ids,
+        (receipt) => ({ ...receipt, expires_at: new Date(0).toISOString() }),
+        deliveryId,
+      );
       session.leases = leases;
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
@@ -731,8 +767,14 @@ export class SessionStore {
       session.chat = [...(session.chat || []), { role: "agent", text: String(text || ""), at }];
       applyTranscriptBound(session);
       session.chat_revision = normalizeRevision(session.chat_revision) + 1;
-      // A reply means the agent acted on everything delivered so far, so every lease is retired
-      // even when the poll that took it never acked.
+      for (const lease of normalizeLeases(session.leases)) {
+        updateReceipts(
+          session,
+          lease.receipt_ids,
+          (receipt) => ({ id: receipt.id, state: "unconfirmed" }),
+          lease.delivery_id,
+        );
+      }
       session.leases = [];
       session.updated_at = at;
       await this.writeState(state);
@@ -841,6 +883,23 @@ function serializedStateBytes(state) {
   return Buffer.byteLength(serializeState(state));
 }
 
+function normalizeReceiptIds(value) {
+  return [...new Set((Array.isArray(value) ? value : []).filter((id) => typeof id === "string" && id))];
+}
+
+function updateReceipts(session, ids, update, deliveryId = undefined) {
+  const wanted = new Set(ids);
+  let changed = false;
+  for (const entry of session.chat || []) {
+    const receipt = entry.receipt;
+    if (!receipt || !wanted.has(receipt.id)) continue;
+    if (deliveryId !== undefined && receipt.delivery_id !== deliveryId) continue;
+    entry.receipt = update(receipt);
+    changed = true;
+  }
+  if (changed) session.chat_revision = normalizeRevision(session.chat_revision) + 1;
+}
+
 function normalizeLeases(value) {
   if (!Array.isArray(value)) return [];
   return value
@@ -848,6 +907,8 @@ function normalizeLeases(value) {
     .map((lease) => ({
       delivery_id: lease.delivery_id,
       leased_at: String(lease.leased_at || ""),
+      receipt_ids: normalizeReceiptIds(lease.receipt_ids),
+      ...(lease.released === true ? { released: true } : {}),
       prompts: Array.isArray(lease.prompts) ? lease.prompts : [],
       dom_snapshot: typeof lease.dom_snapshot === "string" ? lease.dom_snapshot : "",
       artifact_failures: Array.isArray(lease.artifact_failures) ? lease.artifact_failures : [],

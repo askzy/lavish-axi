@@ -345,6 +345,7 @@ async function createChromeHarness({
   };
 
   let clockNow = Date.now();
+  let monotonicNow = 0;
   const context = {
     AbortController,
     clearTimeout: fakeClearTimeout,
@@ -359,6 +360,7 @@ async function createChromeHarness({
       },
     },
     navigator: {},
+    performance: { now: () => monotonicNow },
     setTimeout: fakeSetTimeout,
     URL: {
       createObjectURL() {
@@ -577,6 +579,10 @@ async function createChromeHarness({
     },
     runTimers,
     advanceClock(ms) {
+      clockNow += ms;
+      monotonicNow += ms;
+    },
+    shiftWallClock(ms) {
       clockNow += ms;
     },
     srcLoads,
@@ -6125,4 +6131,150 @@ test("an unsaved queued edit survives a full reload and Escape still cancels it"
   assert.doesNotMatch(reloaded.element("queuedLog").innerHTML, /queued-edit-input/);
   const afterCancel = await createChromeHarness({ storage: first.storage });
   assert.doesNotMatch(afterCancel.element("queuedLog").innerHTML, /queued-edit-input/);
+});
+
+function receiptEntry(state, fields = {}) {
+  return {
+    role: "user",
+    text: "Check this note",
+    prompt_id: "receipt-note",
+    at: "2026-10-13T00:00:00Z",
+    delivery_receipt: { state, ...fields },
+  };
+}
+function receiptSync(chrome, chat, revision = 1) {
+  chrome.eventSource().listeners.get("chat-sync")({ data: JSON.stringify({ chat, chat_revision: revision }) });
+}
+function receiptNode(bubble) {
+  const row = bubble.querySelector(".delivery-receipt");
+  assert.ok(row, "the note has a delivery receipt");
+  return row;
+}
+
+test("delivery receipt labels and accessible hints come only from server evidence", async () => {
+  for (const [state, label, fields] of [
+    ["queued", "Queued", {}],
+    ["delivering", "Delivering", { remaining_ms: 1000 }],
+    ["delivered", "Delivered", { delivered_at: "2026-10-13T12:00:00Z" }],
+    ["unconfirmed", "Unconfirmed", {}],
+  ]) {
+    const chrome = await createChromeHarness({
+      sessionData: { ...defaultSessionData, initialChat: [receiptEntry(state, fields)] },
+    });
+    const row = receiptNode(chrome.element("chatLog").children[0]);
+    assert.equal(row.textContent, label);
+    assert.equal(row.role, "status");
+    assert.equal(row["aria-live"], "polite");
+    assert.equal(row["aria-atomic"], "true");
+    assert.match(row["aria-label"], new RegExp(String(label)));
+    if (state === "unconfirmed")
+      assert.equal(row.title, "The agent posted a reply, but delivery of this note was not confirmed.");
+    if (state === "delivered") assert.match(row.title, /2026-10-13T12:00:00Z/);
+  }
+  const chrome = await createChromeHarness({
+    sessionData: {
+      ...defaultSessionData,
+      initialChat: [
+        { role: "user", text: "Legacy" },
+        { role: "agent", text: "Reply", delivery_receipt: { state: "delivered" } },
+      ],
+    },
+  });
+  assert.equal(chrome.element("chatLog").querySelectorAll(".delivery-receipt").length, 0);
+});
+
+test("presence updates only receipt hints and preserves expired images and queued edit caret", async () => {
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialChat: [receiptEntry("queued")] },
+  });
+  const bubble = chrome.element("chatLog").children[0];
+  const row = receiptNode(bubble);
+  const image = chrome.element("receipt-image");
+  image.tagName = "IMG";
+  image.className = "bubble-attachment";
+  image.alt = "reference.png";
+  bubble.appendChild(image);
+  chrome.element("chatLog").dispatch("error", { target: image });
+  const expired = bubble.children.at(-1);
+  queueHeadingNote(chrome);
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["bubble", "queued"], 0) });
+  typeIntoQueuedEdit(chrome, "Unsent edit");
+  const editor = chrome.element("queued-edit-input");
+  editor.value = "Unsent edit";
+  editor.focus();
+  editor.setSelectionRange(3, 6, "backward");
+  const markup = chrome.element("queuedLog").innerHTML;
+  chrome.element("chatInput").value = "Composer draft";
+  for (const state of ["listening", "working", "waiting"]) {
+    chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state }) });
+    assert.equal(chrome.element("chatLog").children[0], bubble);
+    assert.equal(receiptNode(bubble), row);
+    assert.equal(row.textContent, "Queued");
+    assert.equal(bubble.children.at(-1), expired);
+    assert.equal(expired.textContent, "Image expired");
+    assert.equal(editor.value, "Unsent edit");
+    assert.deepEqual([editor.selectionStart, editor.selectionEnd, editor.selectionDirection], [3, 6, "backward"]);
+    assert.equal(chrome.element("queuedLog").innerHTML, markup);
+    assert.equal(chrome.element("chatInput").value, "Composer draft");
+  }
+});
+
+test("delivering expires on a monotonic deadline without resetting on render or presence", async () => {
+  const chrome = await createChromeHarness({
+    fakeClock: true,
+    sessionData: { ...defaultSessionData, initialChat: [receiptEntry("delivering", { remaining_ms: 1000 })] },
+  });
+  const bubble = chrome.element("chatLog").children[0];
+  const row = receiptNode(bubble);
+  chrome.advanceClock(400);
+  chrome.shiftWallClock(-60_000);
+  queueHeadingNote(chrome);
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening" }) });
+  assert.equal(row.textContent, "Delivering");
+  chrome.advanceClock(600);
+  chrome.runTimers();
+  assert.equal(row.textContent, "Queued");
+  assert.equal(chrome.element("chatLog").children[0], bubble);
+});
+
+test("receipt-only sync preserves note DOM and accepts fresh lease deadlines", async () => {
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialChatRevision: 1, initialChat: [receiptEntry("queued")] },
+  });
+  const bubble = chrome.element("chatLog").children[0];
+  const row = receiptNode(bubble);
+  receiptSync(chrome, [receiptEntry("delivering", { remaining_ms: 1000 })], 2);
+  assert.equal(chrome.element("chatLog").children[0], bubble);
+  assert.equal(receiptNode(bubble), row);
+  assert.equal(row.textContent, "Delivering");
+  chrome.advanceClock(1000);
+  chrome.runTimers();
+  assert.equal(row.textContent, "Queued");
+  receiptSync(chrome, [receiptEntry("delivering", { remaining_ms: 2000 })], 3);
+  assert.equal(row.textContent, "Delivering");
+  receiptSync(chrome, [receiptEntry("delivered", { delivered_at: "2026-10-13T12:00:00Z" })], 4);
+  assert.equal(row.textContent, "Delivered");
+  receiptSync(chrome, [receiptEntry("queued")], 2);
+  assert.equal(row.textContent, "Delivered");
+  chrome.advanceClock(2000);
+  chrome.runTimers();
+  assert.equal(row.textContent, "Delivered");
+});
+
+test("legacy entries gain or lose only the receipt row during a fresh sync", async () => {
+  const entry = receiptEntry("queued");
+  delete entry.delivery_receipt;
+  const chrome = await createChromeHarness({ sessionData: { ...defaultSessionData, initialChat: [entry] } });
+  const bubble = chrome.element("chatLog").children[0];
+  receiptSync(chrome, [receiptEntry("queued")], 1);
+  assert.equal(chrome.element("chatLog").children[0], bubble);
+  assert.equal(receiptNode(bubble).textContent, "Queued");
+  receiptSync(chrome, [entry], 2);
+  assert.equal(bubble.querySelector(".delivery-receipt"), null);
+  receiptSync(chrome, [receiptEntry("delivering")], 3);
+  assert.equal(
+    receiptNode(bubble).textContent,
+    "Queued",
+    "a lease without a remaining duration cannot claim delivery is active",
+  );
 });

@@ -4848,7 +4848,7 @@ test("event WebSocket agent-presence returns to waiting when poll feedback stora
 test("long-poll response cleanup is guarded against storage failures", async () => {
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
 
-  assert.match(source, /try \{\s*const result = await store\.takeFeedback\(key\)/);
+  assert.match(source, /try \{\s*const result = await takeFeedbackWithReceipts\(key\)/);
   assert.match(source, /finally \{\s*cleanup\(\);\s*\}/);
 });
 
@@ -5883,6 +5883,7 @@ test("the prompts route returns the transcript and syncs it live at send time", 
         role: "user",
         kind: "annotation",
         text: "Rename this",
+        delivery_receipt: { state: "queued" },
         prompt_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
         anchor: { kind: "element", label: "<h2>", excerpt: "Phase 1: Inventory", selector: "h2#phase-1" },
       },
@@ -5991,7 +5992,7 @@ test("the live transcript carries rendered html for agent replies and never for 
       chat.map(({ at: _at, ...entry }) => entry),
       [
         { role: "agent", text: "Done.\n\n- one\n- two", html: "<p>Done.</p><ul><li>one</li><li>two</li></ul>" },
-        { role: "user", kind: "message", text: "<b>keep</b>" },
+        { role: "user", kind: "message", text: "<b>keep</b>", delivery_receipt: { state: "queued" } },
       ],
     );
 
@@ -6600,6 +6601,63 @@ test("releaseFeedback expires one lease now and leaves the others timed", async 
       [second.delivery_id, redelivered.delivery_id].sort(),
     );
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("receipt transitions sync live on lease and ACK and persist through reload", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-receipt-server-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<p>Receipt test</p>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  let stream;
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const opened = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((res) => res.json());
+    stream = await startEventStream(base, opened.key, "chat-sync");
+    await stream.next();
+    const post = (route, body, origin = false) =>
+      fetch(`${base}/api/${opened.key}/${route}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(origin ? { origin: base } : {}) },
+        body: JSON.stringify(body),
+      }).then((res) => res.json());
+    await post("prompts", { prompts: [{ prompt: "first" }] }, true);
+    assert.equal((await stream.next()).chat[0].delivery_receipt.state, "queued");
+    const batch = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then((res) =>
+      res.json(),
+    );
+    assert.equal(batch.status, "feedback");
+    assert.equal(JSON.stringify(batch).includes("receipt"), false);
+    const leased = await stream.next();
+    assert.equal(leased.chat[0].delivery_receipt.state, "delivering");
+    await post("prompts", { prompts: [{ prompt: "pending" }] }, true);
+    await stream.next();
+    await post("ack", { delivery_id: batch.delivery_id });
+    const acked = await stream.next();
+    assert.deepEqual(
+      acked.chat.map((entry) => entry.delivery_receipt.state),
+      ["delivered", "queued"],
+    );
+    assert.ok(acked.chat_revision > leased.chat_revision);
+    const reload = chromeSessionData(await fetch(`${base}/session/${opened.key}`).then((res) => res.text()));
+    assert.deepEqual(
+      reload.initialChat.map((entry) => entry.delivery_receipt.state),
+      ["delivered", "queued"],
+    );
+    await post("agent-reply", { text: "Reply" });
+    const reply = await stream.next();
+    assert.deepEqual(
+      reply.chat.slice(0, 2).map((entry) => entry.delivery_receipt.state),
+      ["delivered", "queued"],
+    );
+  } finally {
+    await stream?.close();
+    await server.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

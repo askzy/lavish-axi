@@ -476,7 +476,7 @@ export function chatEntryForPrompt(prompt, at) {
 
 // The transcript as the chrome renders it. Agent entries carry their rendered `html`; user
 // entries never do, and an entry stored before `kind` existed is a composer message.
-export function serializeChat(chat) {
+export function serializeChat(chat, now = Date.now()) {
   if (!Array.isArray(chat)) return [];
   const serialized = [];
   for (const item of chat) {
@@ -493,6 +493,10 @@ export function serializeChat(chat) {
       kind: typeof item.kind === "string" && item.kind ? item.kind : "message",
     };
     delete entry.html;
+    delete entry.receipt;
+    delete entry.delivery_receipt;
+    const receipt = serializeDeliveryReceipt(item.receipt, now);
+    if (receipt) entry.delivery_receipt = receipt;
     serialized.push(entry);
   }
   return serialized;
@@ -544,11 +548,20 @@ export function collectChatAckIds(evicted, existing = []) {
   return ackIds;
 }
 
-export function serializeChatSync(session) {
+export function serializeChatSync(session, now = Date.now()) {
   const revision = Number(session?.chat_revision);
   return {
-    chat: serializeChat(session?.chat || []),
+    chat: serializeChat(session?.chat || [], now),
     ack_ids: serializeChatAckIds(session?.chat_ack_ids),
     chat_revision: Number.isSafeInteger(revision) && revision >= 0 ? revision : 0,
   };
+}
+
+export function serializeDeliveryReceipt(receipt, now = Date.now()) {
+  if (!receipt || typeof receipt.id !== "string" || !receipt.id) return undefined;
+  if (receipt.state === "queued" || receipt.state === "unconfirmed") return { state: receipt.state };
+  if (receipt.state === "delivered") return { state: "delivered", delivered_at: receipt.delivered_at };
+  if (receipt.state !== "delivering") return undefined;
+  const remaining = Date.parse(receipt.expires_at) - now;
+  return remaining > 0 ? { state: "delivering", remaining_ms: remaining } : { state: "queued" };
 }
