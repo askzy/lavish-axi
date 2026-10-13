@@ -44,8 +44,16 @@ function createElement(tag) {
         .split(",")
         .some((part) => {
           const selector = part.trim();
-          if (selector.startsWith("[")) return attributes.has(selector.slice(1, selector.indexOf("]")).split("=")[0]);
-          return selector === element.tagName.toLowerCase();
+          if (selector === "[contenteditable]:not([contenteditable='false'])") {
+            return attributes.has("contenteditable") && attributes.get("contenteditable") !== "false";
+          }
+          const match = selector.match(/^([a-z]+)?(?:\[([a-z-]+)(?:=['"]?([^'"]+)['"]?)?\])?$/i);
+          if (!match) return false;
+          const [, tag, attribute, value] = match;
+          return (
+            (!tag || tag === element.tagName.toLowerCase()) &&
+            (!attribute || (attributes.has(attribute) && (value === undefined || attributes.get(attribute) === value)))
+          );
         });
     },
     closest(selectorList) {
@@ -55,6 +63,12 @@ function createElement(tag) {
         current = current.parentElement;
       }
       return null;
+    },
+    contains(other) {
+      for (let current = other; current; current = current.parentElement) {
+        if (current === element) return true;
+      }
+      return false;
     },
     appendChild(child) {
       child.parentElement = element;
@@ -176,7 +190,16 @@ function bootSdk() {
     click(target) {
       const listener = documentListeners.find((entry) => entry.type === "click");
       assert.ok(listener, "the SDK registers a document click listener");
-      listener.handler({ target, preventDefault() {}, stopPropagation() {} });
+      const event = {
+        target,
+        defaultPrevented: false,
+        preventDefault() {
+          event.defaultPrevented = true;
+        },
+        stopPropagation() {},
+      };
+      listener.handler(event);
+      return event;
     },
     card() {
       const card = documentElement.children
@@ -284,3 +307,45 @@ test("the served SDK bundle annotates elements outside tables with no table targ
   assert.equal(message.prompt.tag, "p");
   assert.equal(message.prompt.target, undefined);
 });
+
+for (const [tag, attributes] of [
+  ["button", {}],
+  ["input", { type: "checkbox" }],
+  ["summary", {}],
+  ["div", { contenteditable: "true" }],
+  ...[
+    "button",
+    "checkbox",
+    "combobox",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "radio",
+    "switch",
+    "tab",
+    "treeitem",
+  ].map((role) => ["div", { role }]),
+]) {
+  test(`the served SDK leaves ${tag} ${JSON.stringify(attributes)} and descendants interactive`, () => {
+    const sdk = bootSdk();
+    const control = appendTo(sdk.body, createElement(tag));
+    for (const [name, value] of Object.entries(attributes)) control.setAttribute(name, value);
+    const label = appendTo(control, cell("span", "Choose"));
+    assert.equal(sdk.click(control).defaultPrevented, false);
+    assert.equal(sdk.click(label).defaultPrevented, false);
+  });
+}
+
+for (const nested of [false, true]) {
+  test(`the served SDK annotates a link ${nested ? "inside" : "with"} an ARIA widget`, () => {
+    const sdk = bootSdk();
+    const widget = appendTo(sdk.body, createElement(nested ? "div" : "a"));
+    widget.setAttribute("role", "menuitem");
+    const link = nested ? appendTo(widget, createElement("a")) : widget;
+    link.setAttribute("href", "https://example.com");
+    const label = appendTo(link, cell("span", "Read more"));
+    assert.equal(sdk.click(label).defaultPrevented, true);
+    assert.match(sdk.card().innerHTML, /Annotate &lt;span&gt;/);
+  });
+}
