@@ -829,6 +829,98 @@ function chatBubbleHtml(entry) {
   );
 }
 
+const receiptBubbles = new Map();
+let deliveryReceiptTimer;
+let deliveryReceiptDeadline = Infinity;
+const DELIVERY_RECEIPT_LABELS = {
+  queued: "Queued",
+  delivering: "Delivering",
+  delivered: "Delivered",
+  unconfirmed: "Unconfirmed",
+};
+
+function setReceiptEntry(record, entry) {
+  record.entry = entry;
+  const receipt = entry.role === "user" ? entry.delivery_receipt : null;
+  const remaining = Number(receipt?.remaining_ms);
+  record.deadline =
+    receipt?.state === "delivering" && Number.isFinite(remaining) && remaining > 0
+      ? performance.now() + remaining
+      : null;
+}
+
+function receiptHint(state, receipt) {
+  if (state === "unconfirmed") {
+    return "The agent posted a reply, but delivery of this note was not confirmed.";
+  }
+  if (state === "delivered") {
+    return (
+      "The note reached the agent's output. This does not confirm it was read." +
+      (receipt.delivered_at ? " Confirmed at " + String(receipt.delivered_at) + "." : "")
+    );
+  }
+  if (state === "delivering") return "The note is being delivered to the agent.";
+  return agentPresence === "waiting" ? "No agent is listening." : "Waiting for the agent's next poll.";
+}
+
+function updateDeliveryReceipt(bubble, record, now) {
+  const receipt = record.entry.role === "user" ? record.entry.delivery_receipt : null;
+  if (!receipt || !Object.hasOwn(DELIVERY_RECEIPT_LABELS, receipt.state)) {
+    record.node?.remove();
+    record.node = null;
+    return Infinity;
+  }
+  let state = receipt.state;
+  if (state === "delivering") {
+    if (record.deadline === null || record.deadline <= now) state = "queued";
+  }
+  if (!record.node) {
+    record.node = document.createElement("div");
+    record.node.className = "delivery-receipt";
+    record.node.setAttribute("role", "status");
+    record.node.setAttribute("aria-live", "polite");
+    record.node.setAttribute("aria-atomic", "true");
+    bubble.appendChild(record.node);
+  }
+  const label = DELIVERY_RECEIPT_LABELS[state];
+  const hint = receiptHint(state, receipt);
+  if (record.node.textContent !== label) record.node.textContent = label;
+  if (record.node.title !== hint) {
+    record.node.title = hint;
+    record.node.setAttribute("aria-label", label + ". " + hint);
+  }
+  record.node.dataset.state = state;
+  return state === "delivering" ? record.deadline : Infinity;
+}
+
+function scheduleReceiptExpiry(deadline) {
+  if (!Number.isFinite(deadline) || deadline >= deliveryReceiptDeadline) return;
+  clearTimeout(deliveryReceiptTimer);
+  deliveryReceiptDeadline = deadline;
+  deliveryReceiptTimer = setTimeout(
+    refreshDeliveryReceipts,
+    Math.min(Math.max(deadline - performance.now(), 0), 2_147_483_647),
+  );
+}
+
+function refreshDeliveryReceipts() {
+  clearTimeout(deliveryReceiptTimer);
+  deliveryReceiptTimer = undefined;
+  deliveryReceiptDeadline = Infinity;
+  const now = performance.now();
+  let nextDeadline = Infinity;
+  for (const [bubble, record] of receiptBubbles) {
+    nextDeadline = Math.min(nextDeadline, updateDeliveryReceipt(bubble, record, now));
+  }
+  scheduleReceiptExpiry(nextDeadline);
+}
+
+function chatContentKey(entry) {
+  const content = { ...entry };
+  delete content.delivery_receipt;
+  return JSON.stringify(content);
+}
+
 function addChat(entry, shouldScroll = true) {
   if (!entry || typeof entry !== "object") return;
   const role = entry.role === "agent" ? "agent" : "user";
@@ -839,6 +931,10 @@ function addChat(entry, shouldScroll = true) {
   el.className = "bubble " + role;
   el.innerHTML = chatBubbleHtml({ ...entry, role, text });
   chatLog.appendChild(el);
+  const receiptRecord = { entry, node: null, deadline: null };
+  setReceiptEntry(receiptRecord, entry);
+  receiptBubbles.set(el, receiptRecord);
+  scheduleReceiptExpiry(updateDeliveryReceipt(el, receiptRecord, performance.now()));
   if (shouldScroll) scrollElementIntoView(el);
   return el;
 }
@@ -968,6 +1064,19 @@ function syncChat(chat, revision) {
     if (!chatContainsEntries(nextChat, displayedChat)) return false;
   }
   if (nextRevision !== null) chatRevision = nextRevision;
+  const existing = [...receiptBubbles.values()];
+  if (
+    existing.length === nextChat.length &&
+    existing.every((record, index) => chatContentKey(record.entry) === chatContentKey(nextChat[index]))
+  ) {
+    displayedChat = nextChat.slice();
+    existing.forEach((record, index) => setReceiptEntry(record, nextChat[index]));
+    refreshDeliveryReceipts();
+    return true;
+  }
+  receiptBubbles.clear();
+  clearTimeout(deliveryReceiptTimer);
+  deliveryReceiptDeadline = Infinity;
   displayedChat = nextChat.slice();
   for (const el of [...chatLog.querySelectorAll(".bubble.user,.bubble.agent:not(.agent-working)")]) {
     el.remove();
@@ -989,6 +1098,7 @@ function setAgentPresence(state) {
   agentPresence = state === "listening" || state === "external" || state === "working" ? state : "waiting";
   updateSendState();
   renderSheetSummary();
+  refreshDeliveryReceipts();
   if (presenceBanner) presenceBanner.hidden = ended || agentPresence !== "waiting";
 
   // A supervisor-owned process-only listener is busy on the agent's behalf. It must not make the

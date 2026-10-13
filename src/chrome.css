@@ -942,6 +942,16 @@ body.lavish {
   border-radius: 3px;
   padding: 0 3px;
 }
+.delivery-receipt {
+  margin-top: 6px;
+  text-align: right;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--fg-muted);
+}
+.delivery-receipt[data-state="delivered"] {
+  color: var(--fg-dim);
+}
 .bubble-attachments {
   display: flex;
   flex-wrap: wrap;
