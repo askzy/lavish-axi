@@ -2,9 +2,8 @@ import { realpathSync } from "node:fs";
 import path from "node:path";
 
 import {
-  POLL_HANDOFF_RULE,
+  POLL_COMPLETION_RULE,
   POLL_LISTENER_RULE,
-  POLL_PICKUP_RULE,
   POLL_SEND_AND_END_RULE,
   POLL_WAKE_PATH_RULES,
   createHomeOutput,
@@ -152,7 +151,7 @@ ${home.help[home.help.length - 1]}
 
 1. Create the HTML artifact (default location \`.lavish/<name>.html\` in the working directory).
 2. Run \`${invocation} <html-file>\` to open or resume a review session in the browser. If the output has \`network_warning\`, tell the user.
-3. Run \`${invocation} poll <html-file>\` to long-poll for the user's annotations and queued prompts.
+3. Immediately run \`${invocation} poll <html-file>\` without \`--timeout-ms\` to long-poll for the user's annotations and queued prompts.
    On the first poll, prefer \`--agent-reply "<one-line summary of what you built and what to review first>"\` so the conversation panel opens with context.
    Browser-detected layout issues are filed passively in the user's Layout issues inbox and arrive as an ordinary \`layout-warnings\` prompt only when the user selects and queues them. Never edit an issue the user has not queued. The only response that arrives without user action is \`artifact_failures\`, when the review surface itself is unusable.
    The poll stays silent until the user acts or a fatal artifact failure makes the review surface unusable - leave it running, never kill it.
@@ -161,10 +160,10 @@ ${home.help[home.help.length - 1]}
 ${POLL_WAKE_PATH_RULES.map((rule) => `   ${skillCommandText(rule)}`).join("\n")}
 4. If poll returns feedback, apply the user's prompts. A \`layout-warnings\` prompt is an explicit repair request; apply every listed fix in one pass before saving, and let Lavish re-check it after a newer artifact load.
 5. Apply human feedback, then poll again with \`--agent-reply "<message>"\` to reply in the browser and keep the loop going under the same foreground-or-verified-wake-path rule.
-   When you are handing the result back without starting another long-poll - the user said they are done, or this conversation will not poll again - run \`${invocation} reply <html-file> --agent-reply "<message>"\` instead. It posts the reply and exits 0 only once the server accepts it, so the review page stops showing Working; it claims no listener, so it is safe while another poll holds the session. Run \`${invocation} reply --help\` for the receipt contract.
-6. If a poll is reaped before the user sends anything, hand the review back rather than looping. One line is enough: you have stopped listening, anything already sent is safely queued, and \`/check-lavish\` will collect it. Do not re-enter the poll silently - see the wake-path rules in step 3 for why an unbounded loop is the wrong default.
+   When posting a result without starting another long-poll, run \`${invocation} reply <html-file> --agent-reply "<message>"\` instead. It posts the reply and exits 0 only once the server accepts it, so the review page stops showing Working; it claims no listener, so it is safe while another poll holds the session. Run \`${invocation} reply --help\` for the receipt contract.
+6. If a poll is reaped before the user sends anything, hand the review back rather than looping. Leave the session open. One line is enough: you have stopped listening, anything already sent is safely queued, and \`/check-lavish\` will collect it. Do not re-enter the poll silently - see the wake-path rules in step 3 for why an unbounded loop is the wrong default.
 7. \`/check-lavish\` (collect feedback later): poll this review's artifact directly with \`${invocation} poll <html-file> --timeout-ms 0\` - that returns immediately instead of waiting, and it works after the user has ended the session, which drops the session from the no-argument list. Apply the prompts exactly as in step 4. If nothing comes back, say so and stop; do not open a long poll just to look.
-8. Run \`${invocation} end <html-file>\` at two moments. After applying feedback whose text says the user is done (for example "looks good", "ship it", "thanks"), or when you will not start another poll in this conversation. And after a \`browser_disconnected\` poll result, unless the user asks to reopen. An open session nobody polls again is never cleaned up by the browser, so ending it is the agent's job.
+8. ${POLL_COMPLETION_RULE} When the user explicitly finishes the review, run \`${invocation} end <html-file>\`.
 9. ${POLL_SEND_AND_END_RULE} Deliver any remaining updates directly in this conversation.
 
 ## Visual guidance
@@ -239,17 +238,14 @@ that next poll.
 3. Read the result. \`session_ended: true\` means the user is done - apply what came back, deliver
    any further updates in this conversation, and do not reopen. An empty result means the queue is
    empty _right now_, not that the user sent nothing; rule out a leased batch (below) before
-   reporting "no feedback". Do not open a long poll just to look. Once you have ruled that out and
-   this conversation will not poll again, run \`${invocation} end <html-file>\` so the session does
-   not stay open for nobody.
+   reporting "no feedback". Do not open a long poll just to look, and leave the session open when the queue is empty.
 4. Apply the returned prompts exactly as the \`/lavish\` workflow describes. A \`layout-warnings\`
    prompt is an explicit repair request; apply every listed fix in one pass.
 5. If the session is still open and you want to carry on in the browser, reply with
    \`${invocation} poll <html-file> --agent-reply "<message>"\` and follow the \`/lavish\` wake-path
-   rules from there. If the user is done, or you will not poll again in this conversation, post
-   the result with \`${invocation} reply <html-file> --agent-reply "<message>"\` - it exits once the
-   server accepts the reply, so the review page stops showing Working - then run
-   \`${invocation} end <html-file>\`. A reply claims no listener, so it is never refused while
+   rules from there. To post the result without waiting for more feedback, use \`${invocation} reply <html-file> --agent-reply "<message>"\` - it exits once the
+   server accepts the reply, so the review page stops showing Working. ${POLL_COMPLETION_RULE}
+   If the user explicitly finishes the review, run \`${invocation} end <html-file>\`. A reply claims no listener, so it is never refused while
    another poll holds the session; on an ended session it exits with \`SESSION_ENDED\` and the
    update belongs in this conversation instead.
 
@@ -266,8 +262,7 @@ lease.
 
 ## Rules
 
-- ${skillCommandText(POLL_PICKUP_RULE)}
-- ${skillCommandText(POLL_HANDOFF_RULE)}
+${POLL_WAKE_PATH_RULES.map((rule) => `- ${skillCommandText(rule)}`).join("\n")}
 - ${skillCommandText(POLL_LISTENER_RULE)}
 - A subagent must NEVER own a Lavish poll. The poll delivers to whoever started it, so when the subagent exits the prompts land in an output file nobody reads and no completion notification reaches the session that can act on them. When delegating artifact edits, forbid \`${invocation}\` in the brief; the parent polls after the subagent returns.
 - ${POLL_SEND_AND_END_RULE}

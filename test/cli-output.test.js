@@ -1241,7 +1241,11 @@ test("poll wait messages tell watching agents the silence is normal", () => {
   assert.match(banner, /Long-polling for user feedback/);
   assert.match(banner, /stays silent/);
   assert.match(banner, /leave it running/i);
-  assert.match(banner, /queued feedback is never lost/);
+  assert.match(banner, /queued feedback is never lost/i);
+  assert.match(banner, /leave the session open/i);
+  assert.match(banner, /check-lavish/);
+  assert.match(banner, /Do not silently re-run the poll/);
+  assert.doesNotMatch(banner, /re-run `lavish-axi poll/);
 
   const tick = pollWaitTickText(3 * 60_000);
   assert.match(tick, /\[lavish-axi\]/);
@@ -1310,7 +1314,7 @@ test("shouldNarratePollWaitTicks heartbeats only in an interactive terminal", ()
   assert.equal(shouldNarratePollWaitTicks({ isTTY: false }), false);
 });
 
-test("spawned poll announces the wait on stderr and leaves re-run guidance when killed", async () => {
+test("spawned poll announces the wait on stderr and leaves handoff guidance when killed", async () => {
   const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-poll-wait-test-`);
   const artifact = `${stateDir}/artifact.html`;
   await writeFile(artifact, "<html><body>hello</body></html>", "utf8");
@@ -1424,6 +1428,26 @@ test("end closes a session whose artifact file was deleted, and refuses an unkno
     await server.close();
     await rm(stateDir, { force: true, recursive: true });
   }
+});
+
+test("an empty zero-timeout drain leaves the review open without starting a listener", () => {
+  const output = createPollOutput({ file: "/tmp/report.html", response: { status: "waiting" }, isDrain: true });
+  assert.match(output.next_step, /No queued feedback is available right now/);
+  assert.match(output.next_step, /Leave the session open/);
+  assert.match(output.next_step, /Do not start a long poll/);
+  assert.doesNotMatch(output.next_step, /wait indefinitely|first indefinite poll|lavish-axi end/);
+});
+
+test("a leased zero-timeout drain keeps the retry instruction without starting a listener", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: { status: "waiting", retry_after_ms: 1000 },
+    isDrain: true,
+  });
+  assert.equal(output.retry_after_ms, 1000);
+  assert.match(output.next_step, /drain again then/);
+  assert.match(output.next_step, /Leave the session open/);
+  assert.doesNotMatch(output.next_step, /wait indefinitely|first indefinite poll|lavish-axi end/);
 });
 
 test("waiting next step reassures agents that re-running poll loses nothing", () => {
