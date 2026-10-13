@@ -674,6 +674,12 @@ export async function serve({
     return session;
   }
 
+  async function takeFeedbackWithReceipts(key) {
+    const result = await store.takeFeedback(key);
+    if (result.status === "feedback") events.emit("chat-sync", key, await store.findByKey(key));
+    return result;
+  }
+
   function finishFeedbackDelivery(key, result) {
     if (result.status !== "feedback") return;
     markFeedbackDelivered(key, activePolls, deliveredFeedback, events);
@@ -692,7 +698,10 @@ export async function serve({
     if (result.status !== "feedback") return;
     try {
       const released = await store.releaseFeedback(key, result.delivery_id);
-      if (released?.released) events.emit("feedback", key);
+      if (released?.released) {
+        events.emit("chat-sync", key, released.session);
+        events.emit("feedback", key);
+      }
     } catch (error) {
       logEvent?.(`lease release failed key=${key} delivery=${result.delivery_id}: ${error?.message || error}`);
     }
@@ -780,7 +789,7 @@ export async function serve({
           res.status(404).json({ error: "session not found" });
           return;
         }
-        const drained = await store.takeFeedback(key);
+        const drained = await takeFeedbackWithReceipts(key);
         if (requestClosed || res.writableEnded) {
           await releaseUndeliveredFeedback(key, drained);
           detachRequestClose();
@@ -828,7 +837,7 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      const immediate = await store.takeFeedback(key);
+      const immediate = await takeFeedbackWithReceipts(key);
       if (immediate.status !== "waiting") {
         if (holder.replaced) {
           await releaseUndeliveredFeedback(key, immediate);
@@ -931,7 +940,7 @@ export async function serve({
         let finalSessionEnded = false;
         let keepWaiting = false;
         try {
-          const result = await store.takeFeedback(key);
+          const result = await takeFeedbackWithReceipts(key);
           if (holder.replaced) {
             await releaseUndeliveredFeedback(key, result);
             if (!requestClosed && !res.writableEnded) {
@@ -1045,6 +1054,7 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
+      if (result.retired) events.emit("chat-sync", req.params.key, result.session);
       res.json({ status: "acked", retired: result.retired });
     } catch (error) {
       next(error);
