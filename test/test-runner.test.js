@@ -28,11 +28,15 @@ function runFixture(dir, args = []) {
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [path.join(dir, "scripts", "run-tests.js"), ...args], {
-      cwd: dir,
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const child = spawn(
+      process.execPath,
+      [path.join(dir, "scripts", "run-tests.js"), "--test-reporter=spec", ...args],
+      {
+        cwd: dir,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     let output = "";
     child.stdout.on("data", (chunk) => (output += chunk));
     child.stderr.on("data", (chunk) => (output += chunk));
