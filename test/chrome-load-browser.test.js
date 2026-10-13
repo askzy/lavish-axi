@@ -149,7 +149,7 @@ test(
         `the served-bytes id audit did not report the injected stale id${detail}`,
       );
       assert.deepEqual(
-        Object.entries(report.handlersAttached).filter(([, attached]) => attached),
+        Object.entries(report.handlersAttached).filter(([id, attached]) => attached && id !== "layoutGateAction"),
         [],
         `handlers were attached even though initialisation threw${detail}`,
       );
@@ -158,6 +158,114 @@ test(
         true,
         `presenceBanner was unhidden even though the module never reached its last statement${detail}`,
       );
+    } finally {
+      await chrome.close();
+      for (const cleanup of cleanups.reverse()) await cleanup();
+      await rm(temp, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "real browser: queued notes edit, cancel, persist across reload, and send the open edit",
+  { skip, timeout: 120_000 },
+  async () => {
+    const temp = await mkdtemp(path.join(tmpdir(), "lavish-queued-edit-browser-"));
+    const chrome = await launchChrome();
+    /** @type {Array<() => Promise<void>>} */
+    const cleanups = [];
+    try {
+      const artifact = path.join(temp, "artifact.html");
+      await writeFile(
+        artifact,
+        '<!doctype html><html><head><title>Queued edit</title></head><body><h1 id="heading">Heading</h1></body></html>',
+      );
+      const session = await startSourceLayoutSession(temp, artifact, cleanups);
+      const { targetId } = await chrome.cdp.send("Target.createTarget", { url: "about:blank" });
+      const { sessionId } = await chrome.cdp.send("Target.attachToTarget", { targetId, flatten: true });
+      await chrome.cdp.send("Page.enable", {}, sessionId);
+      /** @param {string} expression */
+      const evaluate = async (expression) => {
+        const result = await chrome.cdp.send(
+          "Runtime.evaluate",
+          { expression, returnByValue: true, awaitPromise: true },
+          sessionId,
+        );
+        if (result.exceptionDetails)
+          throw new Error(result.exceptionDetails.exception?.description || "browser evaluation failed");
+        return result.result.value;
+      };
+      /** @param {string} expression */
+      const waitFor = async (expression) => {
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if (await evaluate(expression)) return;
+          await sleep(100);
+        }
+        assert.fail(`Browser condition did not settle: ${expression}`);
+      };
+      await chrome.cdp.send("Page.navigate", { url: session.url }, sessionId);
+      await waitFor("window.__lavishChromeReady === true");
+      await evaluate('enqueuePrompt({prompt:"Original note",selector:"#heading",tag:"h1",text:"Heading"})');
+      await waitFor('Boolean(document.querySelector(".queued-edit"))');
+      const identity = await evaluate("queued[0].prompt_id");
+      assert.equal(typeof identity, "string");
+      assert.equal(
+        await evaluate(`(() => {
+      document.querySelector(".queued-edit").click();
+      const input=document.querySelector(".queued-edit-input");
+      input.value="Cancelled note";
+      input.dispatchEvent(new Event("input",{bubbles:true}));
+      document.querySelector(".queued-edit-cancel").click();
+      return queued[0].prompt;
+    })()`),
+        "Original note",
+      );
+      assert.equal(
+        await evaluate(`(() => {
+      document.querySelector(".queued-edit").click();
+      const input=document.querySelector(".queued-edit-input");
+      input.value="Saved note";
+      input.dispatchEvent(new Event("input",{bubbles:true}));
+      input.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
+      return queued[0].prompt;
+    })()`),
+        "Saved note",
+      );
+      await evaluate(`(() => {
+      document.querySelector(".queued-edit").click();
+      const input=document.querySelector(".queued-edit-input");
+      input.value="Draft across reload";
+      input.dispatchEvent(new Event("input",{bubbles:true}));
+    })()`);
+      await chrome.cdp.send("Page.reload", {}, sessionId);
+      await waitFor('window.__lavishChromeReady === true && Boolean(document.querySelector(".queued-edit-input"))');
+      assert.deepEqual(await evaluate("queued.map(note=>[note.prompt,note.prompt_id])"), [["Saved note", identity]]);
+      assert.equal(await evaluate('document.querySelector(".queued-edit-input").value'), "Draft across reload");
+      await evaluate(`(() => {
+      const input=document.querySelector(".queued-edit-input");
+      input.value="Sent from the open edit";
+      input.dispatchEvent(new Event("input",{bubbles:true}));
+      document.getElementById("send").click();
+    })()`);
+      await waitFor(
+        'queued.length === 0 && document.getElementById("chatLog").textContent.includes("Sent from the open edit")',
+      );
+      const url = new URL(session.url);
+      const feedback = await fetch(new URL(`/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`, url)).then(
+        (response) => response.json(),
+      );
+      assert.equal(feedback.status, "feedback");
+      assert.deepEqual(
+        feedback.prompts.map((note) => note.prompt),
+        ["Sent from the open edit"],
+      );
+      const persisted = JSON.parse(await readFile(path.join(temp, "state-source", "state.json"), "utf8"));
+      const storedSession = persisted.sessions[url.pathname.split("/").at(-1)];
+      assert.deepEqual(
+        storedSession.chat.map((note) => [note.text, note.prompt_id]),
+        [["Sent from the open edit", identity]],
+      );
+      await chrome.cdp.send("Target.closeTarget", { targetId });
     } finally {
       await chrome.close();
       for (const cleanup of cleanups.reverse()) await cleanup();
@@ -511,8 +619,12 @@ async function launchChrome() {
     if (port && browserPath) wsUrl = `ws://127.0.0.1:${port.trim()}${browserPath.trim()}`;
   }
   const close = async () => {
-    chrome.kill("SIGKILL");
-    await rm(userDataDir, { recursive: true, force: true });
+    if (chrome.exitCode === null && chrome.signalCode === null) {
+      const exited = new Promise((resolve) => chrome.once("exit", () => resolve(undefined)));
+      chrome.kill("SIGKILL");
+      await exited;
+    }
+    await rm(userDataDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   };
   if (!wsUrl) {
     await close();

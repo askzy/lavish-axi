@@ -3578,11 +3578,13 @@ test("long-poll sends heartbeat bytes before feedback arrives", async () => {
   });
   try {
     const base = `http://127.0.0.1:${server.port}`;
-    await fetch(`${base}/api/sessions`, {
+    const open = await fetch(`${base}/api/sessions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ file: artifact }),
     });
+
+    const { key } = await open.json();
 
     const controller = new AbortController();
     const res = await Promise.race([
@@ -3592,6 +3594,8 @@ test("long-poll sends heartbeat bytes before feedback arrives", async () => {
     const reader = res.body.getReader();
     try {
       const decoder = new TextDecoder();
+      // A delayed reader lets multiple heartbeat writes arrive in one transport chunk.
+      await new Promise((resolve) => setTimeout(resolve, 50));
       const first = await Promise.race([
         reader.read(),
         new Promise((_, reject) => setTimeout(() => reject(new Error("poll did not send initial heartbeat")), 500)),
@@ -3601,8 +3605,34 @@ test("long-poll sends heartbeat bytes before feedback arrives", async () => {
         new Promise((_, reject) => setTimeout(() => reject(new Error("poll did not repeat heartbeat")), 500)),
       ]);
 
-      assert.equal(decoder.decode(first.value), " ");
-      assert.equal(decoder.decode(second.value), " ");
+      assert.equal(first.done, false);
+      assert.equal(second.done, false);
+      assert.match(decoder.decode(first.value), /^ +$/);
+      assert.match(decoder.decode(second.value), /^ +$/);
+
+      const submitted = await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify({ prompts: [{ prompt: "Heartbeat received", tag: "message" }] }),
+      });
+      assert.equal(submitted.status, 200);
+
+      let body = decoder.decode(first.value) + decoder.decode(second.value);
+      const completion = (async () => {
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          body += decoder.decode(chunk.value, { stream: true });
+        }
+        return JSON.parse(body + decoder.decode());
+      })();
+      const feedback = await Promise.race([
+        completion,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("poll did not deliver feedback")), 500)),
+      ]);
+      assert.equal(feedback.status, "feedback");
+      assert.equal(feedback.prompts.length, 1);
+      assert.equal(feedback.prompts[0].prompt, "Heartbeat received");
     } finally {
       controller.abort();
       await reader.cancel().catch(() => {});

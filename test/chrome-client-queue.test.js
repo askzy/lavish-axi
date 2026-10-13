@@ -185,6 +185,16 @@ async function createChromeHarness({
             return close;
           });
         }
+        if (id === "queuedLog" && selector === ".queued-edit-input") {
+          // One textarea stands in for the editor across renders, mounted only while the log
+          // renders it, so a test can place the caret and watch whether a render moves it.
+          const editor = element("queued-edit-input");
+          const match = this.innerHTML.match(/class="queued-edit-input"[^>]*>([^<]*)</);
+          editor.parentElement = match ? this : null;
+          if (!match) return [];
+          editor.value = match[1];
+          return [editor];
+        }
         const matches = [];
         const walk = (node) => {
           for (const child of node.children || []) {
@@ -261,6 +271,11 @@ async function createChromeHarness({
         focusLog.push(this.id);
       },
       select() {},
+      setSelectionRange(start, end, direction = "none") {
+        this.selectionStart = start;
+        this.selectionEnd = end;
+        this.selectionDirection = direction;
+      },
       scrollIntoView(options) {
         this.scrolledIntoView = options;
       },
@@ -4734,7 +4749,7 @@ test("a reconnect cannot settle an identical note this tab never submitted", asy
 // server's transcript carries it. Before this, queued notes were pills in a separate region and
 // sent notes vanished from the panel entirely, so the conversation read as one-sided.
 
-test("a queued note is a dashed bubble at the end of the conversation with its anchor and a remove control", async () => {
+test("a queued note is a dashed bubble at the end of the conversation with its anchor and edit and remove controls", async () => {
   const chrome = await createChromeHarness();
   chrome.sendFrameMessage({
     type: "lavish:queuePrompt",
@@ -4742,7 +4757,11 @@ test("a queued note is a dashed bubble at the end of the conversation with its a
   });
 
   const html = chrome.element("queuedLog").innerHTML;
-  assert.match(html, /^<div class="bubble user queued"><small>Queued <button class="queued-remove"[^>]*data-index="0"/);
+  assert.match(
+    html,
+    /^<div class="bubble user queued" data-index="0"><small>Queued <button class="queued-edit"[^>]*data-index="0"/,
+  );
+  assert.match(html, /<button class="queued-remove"[^>]*data-index="0"/);
   assert.match(
     html,
     /<span class="anchor-kind">&lt;h2&gt;<\/span><span class="anchor-excerpt">“Phase 1: Inventory”<\/span>/,
@@ -5773,4 +5792,337 @@ test("a newer bounded sync replaces the transcript without overlap and rejects s
     data: JSON.stringify({ chat: [], ack_ids: [], chat_revision: 3 }),
   });
   assert.equal(chrome.element("chatLog").children.length, 0);
+});
+
+function retiredDraftNotes(chrome) {
+  return chrome.element("chatLog").children.filter((child) =>
+    String(child.className || "")
+      .split(/\s+/)
+      .includes("note"),
+  );
+}
+
+function queuedLogNode(classes, index, props = {}) {
+  return {
+    ...props,
+    closest(selector) {
+      const wanted = String(selector).split(".").filter(Boolean);
+      return wanted.every((name) => classes.includes(name)) ? { dataset: { index: String(index) } } : null;
+    },
+  };
+}
+
+function queuedLogKey(chrome, key, index = 0) {
+  const event = {
+    key,
+    shiftKey: false,
+    isComposing: false,
+    target: queuedLogNode(["queued-edit-input"], index),
+    defaultPrevented: false,
+    propagationStopped: false,
+    preventDefault() {
+      this.defaultPrevented = true;
+    },
+    stopPropagation() {
+      this.propagationStopped = true;
+    },
+  };
+  chrome.element("queuedLog").dispatch("keydown", event);
+  // The log's listener runs first and the key bubbles on to the document unless it stops there.
+  if (!event.propagationStopped) chrome.dispatchDocumentKeydown({ key, target: event.target });
+  return event;
+}
+
+function typeIntoQueuedEdit(chrome, value, index = 0) {
+  chrome.element("queuedLog").dispatch("input", { target: queuedLogNode(["queued-edit-input"], index, { value }) });
+}
+
+function queueHeadingNote(chrome, prompt = "Make this heading bigger", selector = "main > h2") {
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: { prompt, selector, tag: "h2", text: "Pricing" } });
+}
+
+test("clicking a queued note opens it for editing and reveals its element", async () => {
+  const chrome = await createChromeHarness();
+  queueHeadingNote(chrome);
+
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["bubble", "queued"], 0) });
+
+  assert.match(chrome.element("queuedLog").innerHTML, /class="queued-edit-input"[^>]*>Make this heading bigger</);
+  assert.deepEqual(
+    JSON.parse(
+      JSON.stringify(chrome.postedToFrame.filter((message) => message.type === "lavish:revealElement").at(-1)),
+    ),
+    { type: "lavish:revealElement", selector: "main > h2" },
+  );
+});
+
+test("saving an edited queued note rewrites it in place and keeps its identity", async () => {
+  const chrome = await createChromeHarness();
+  queueHeadingNote(chrome);
+  queueHeadingNote(chrome, "Tighten this copy", "main > p");
+  const [before] = chrome.queued();
+
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["queued-edit"], 0) });
+  typeIntoQueuedEdit(chrome, "Make this heading smaller");
+  const event = queuedLogKey(chrome, "Enter");
+
+  assert.equal(event.defaultPrevented, true);
+  const after = chrome.queued();
+  assert.deepEqual(
+    after.map((prompt) => prompt.prompt),
+    ["Make this heading smaller", "Tighten this copy"],
+  );
+  assert.equal(after[0].prompt_id, before.prompt_id);
+  assert.equal(after[0].selector, "main > h2");
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /queued-edit-input/);
+});
+
+test("cancelling an edit leaves the queued note untouched", async () => {
+  const chrome = await createChromeHarness();
+  queueHeadingNote(chrome);
+
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["bubble", "queued"], 0) });
+  typeIntoQueuedEdit(chrome, "Something else");
+  queuedLogKey(chrome, "Escape");
+
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["Make this heading bigger"],
+  );
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /queued-edit-input/);
+});
+
+test("saving a queued note with its words cleared removes it", async () => {
+  const chrome = await createChromeHarness();
+  queueHeadingNote(chrome);
+
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["bubble", "queued"], 0) });
+  typeIntoQueuedEdit(chrome, "   ");
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["queued-edit-save"], 0) });
+
+  assert.deepEqual(chrome.queued(), []);
+});
+
+test("the artifact learns which elements carry a queued note, never the note itself", async () => {
+  const chrome = await createChromeHarness();
+  queueHeadingNote(chrome);
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: {
+      prompt: "Punchier",
+      selector: "main > p",
+      tag: "text",
+      text: "marketing site",
+      target: { type: "text-range", text: "marketing site", selector: "main > p" },
+    },
+  });
+
+  const anchors = chrome.postedToFrame.filter((message) => message.type === "lavish:queuedAnchors").at(-1);
+  assert.deepEqual(JSON.parse(JSON.stringify(anchors)), { type: "lavish:queuedAnchors", selectors: ["main > h2"] });
+});
+
+test("clicking an annotated element in the artifact opens its queued note", async () => {
+  const chrome = await createChromeHarness();
+  queueHeadingNote(chrome, "First thought");
+  queueHeadingNote(chrome, "Tighten this copy", "main > p");
+  queueHeadingNote(chrome, "Second thought");
+
+  chrome.sendFrameMessage({ type: "lavish:editQueuedAnchor", selector: "main > h2" });
+
+  // The most recent note on the element is the one the reviewer is most likely revising.
+  assert.match(chrome.element("queuedLog").innerHTML, /class="queued-edit-input"[^>]*>Second thought</);
+  assert.equal(chrome.element("queuedLog").innerHTML.match(/queued-edit-input/g)?.length, 1);
+});
+
+test("Send delivers an open edit instead of the stale words", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      return { ok: true };
+    },
+  });
+  queueHeadingNote(chrome);
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["bubble", "queued"], 0) });
+  typeIntoQueuedEdit(chrome, "Make this heading smaller");
+
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 body");
+  await flushPromises();
+
+  assert.deepEqual(
+    posts[0].body.prompts.map((prompt) => prompt.prompt),
+    ["Make this heading smaller"],
+  );
+});
+
+test("a note that is already sending cannot be opened for editing", async () => {
+  const chrome = await createChromeHarness({ fetchImpl: () => new Promise(() => {}) });
+  queueHeadingNote(chrome);
+  chrome.element("send").click();
+
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["bubble", "queued"], 0) });
+  chrome.sendFrameMessage({ type: "lavish:editQueuedAnchor", selector: "main > h2" });
+
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /queued-edit-input/);
+  // The element click falls back to the fresh card it would have opened without a queued note.
+  assert.deepEqual(JSON.parse(JSON.stringify(chrome.postedToFrame.at(-1))), {
+    type: "lavish:annotateElement",
+    selector: "main > h2",
+  });
+});
+
+test("Escape in the queued-note editor cancels the edit and leaves the phone sheet open", async () => {
+  const chrome = await createChromeHarness({ mobile: true });
+  chrome.element("panelHead").dispatch("click", {});
+  queueHeadingNote(chrome);
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["bubble", "queued"], 0) });
+
+  queuedLogKey(chrome, "Escape");
+
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /queued-edit-input/);
+  assert.equal(sheetState(chrome).open, true);
+});
+
+test("a diagram node's note is found from any part of the node", async () => {
+  const chrome = await createChromeHarness();
+  const node = { type: "mermaid-node", diagramId: "mermaid-1", nodeId: "flowchart-A-0", label: "Start" };
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: {
+      prompt: "Rename this step",
+      selector: "g#flowchart-A-0 > span",
+      tag: "mermaid-node",
+      text: "Start",
+      target: { ...node, selector: "g#flowchart-A-0" },
+    },
+  });
+
+  const anchors = chrome.postedToFrame.filter((message) => message.type === "lavish:queuedAnchors").at(-1);
+  assert.deepEqual(JSON.parse(JSON.stringify(anchors.selectors)), ["g#flowchart-A-0 > span", "g#flowchart-A-0"]);
+
+  chrome.sendFrameMessage({ type: "lavish:editQueuedAnchor", selector: "g#flowchart-A-0" });
+
+  assert.match(chrome.element("queuedLog").innerHTML, /class="queued-edit-input"[^>]*>Rename this step</);
+});
+
+test("a table cell's note tells the artifact only the exact element it was queued on", async () => {
+  const chrome = await createChromeHarness();
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: {
+      prompt: "Explain this app",
+      selector: "td:nth-of-type(3) > strong",
+      tag: "strong",
+      text: "Drive",
+      target: {
+        type: "table-cell",
+        selector: "td:nth-of-type(3)",
+        rowLabel: "Media",
+        columnLabel: "Evidence",
+      },
+    },
+  });
+
+  const anchors = chrome.postedToFrame.filter((message) => message.type === "lavish:queuedAnchors").at(-1);
+  assert.deepEqual(JSON.parse(JSON.stringify(anchors.selectors)), ["td:nth-of-type(3) > strong"]);
+});
+
+test("a re-render while editing a queued note keeps the reviewer's caret and scroll", async () => {
+  const chrome = await createChromeHarness();
+  queueHeadingNote(chrome);
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["bubble", "queued"], 0) });
+  const editor = chrome.element("queued-edit-input");
+  // Opening an edit starts at the end of its words.
+  assert.deepEqual([editor.selectionStart, editor.selectionEnd], [24, 24]);
+
+  typeIntoQueuedEdit(chrome, "Make this heading smaller");
+  editor.setSelectionRange(5, 9, "backward");
+  editor.scrollTop = 12;
+  queueHeadingNote(chrome, "Tighten this copy", "main > p");
+
+  assert.equal(chrome.focusLog.at(-1), "queued-edit-input");
+  assert.deepEqual([editor.selectionStart, editor.selectionEnd, editor.selectionDirection], [5, 9, "backward"]);
+  assert.equal(editor.scrollTop, 12);
+});
+
+test("a keyed replacement closes the open edit and hands its typed words back as unsent", async () => {
+  const chrome = await createChromeHarness();
+  const choice = (prompt, selector, text) => ({
+    type: "lavish:queuePrompt",
+    prompt: { prompt, selector, tag: "choice", text, _lavishQueueKey: "plan" },
+  });
+  chrome.sendFrameMessage(choice("Use plan A", "input#plan-a", "Plan A"));
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["bubble", "queued"], 0) });
+  typeIntoQueuedEdit(chrome, "Use plan A, but cheaper");
+
+  chrome.sendFrameMessage(choice("Use plan B", "input#plan-b", "Plan B"));
+
+  assert.deepEqual(
+    chrome.queued().map((prompt) => [prompt.prompt, prompt.selector]),
+    [["Use plan B", "input#plan-b"]],
+  );
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /queued-edit-input/);
+  const notes = retiredDraftNotes(chrome);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0].innerHTML, /Unsent annotation/);
+  assert.match(notes[0].innerHTML, /Use plan A, but cheaper/);
+});
+
+test("a keyed replacement of an untouched open edit leaves no unsent note", async () => {
+  const chrome = await createChromeHarness();
+  const choice = (prompt, selector, text) => ({
+    type: "lavish:queuePrompt",
+    prompt: { prompt, selector, tag: "choice", text, _lavishQueueKey: "plan" },
+  });
+  chrome.sendFrameMessage(choice("Use plan A", "input#plan-a", "Plan A"));
+  chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["bubble", "queued"], 0) });
+
+  chrome.sendFrameMessage(choice("Use plan B", "input#plan-b", "Plan B"));
+
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["Use plan B"],
+  );
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /queued-edit-input/);
+  assert.equal(retiredDraftNotes(chrome).length, 0);
+});
+
+for (const completion of ["snapshot", "timeout"]) {
+  test(`a ${completion} send preserves a newer note's open edit`, async () => {
+    const posts = [];
+    const chrome = await createChromeHarness({
+      fetchImpl: async (url, init = {}) => {
+        posts.push(JSON.parse(init.body));
+        return { ok: true };
+      },
+    });
+    queueHeadingNote(chrome, "First note");
+    chrome.element("send").click();
+    queueHeadingNote(chrome, "Second note", "main > p");
+    chrome.element("queuedLog").dispatch("click", { target: queuedLogNode(["queued-edit"], 1) });
+    typeIntoQueuedEdit(chrome, "Edited second note", 1);
+    if (completion === "snapshot") chrome.sendSnapshot("uid=1 body");
+    else chrome.runTimers(5000);
+    await flushPromises();
+    assert.deepEqual(
+      posts[0].prompts.map((prompt) => prompt.prompt),
+      ["First note", "Edited second note"],
+    );
+  });
+}
+
+test("an unsaved queued edit survives a full reload and Escape still cancels it", async () => {
+  const first = await createChromeHarness();
+  queueHeadingNote(first, "Original note");
+  first.element("queuedLog").dispatch("click", { target: queuedLogNode(["queued-edit"], 0) });
+  typeIntoQueuedEdit(first, "Unsaved words");
+  const reloaded = await createChromeHarness({ storage: first.storage });
+  assert.match(reloaded.element("queuedLog").innerHTML, /queued-edit-input[^>]*>Unsaved words</);
+  assert.equal(reloaded.queued()[0].prompt, "Original note");
+  queuedLogKey(reloaded, "Escape");
+  assert.equal(reloaded.queued()[0].prompt, "Original note");
+  assert.doesNotMatch(reloaded.element("queuedLog").innerHTML, /queued-edit-input/);
+  const afterCancel = await createChromeHarness({ storage: first.storage });
+  assert.doesNotMatch(afterCancel.element("queuedLog").innerHTML, /queued-edit-input/);
 });
