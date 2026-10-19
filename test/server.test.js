@@ -984,20 +984,20 @@ test("chrome can sync persisted chat after the event stream reconnects", async (
   assert.match(js, /function syncChat/);
 });
 
-test("chrome shows agent working state when a previous poll has released", async () => {
+test("chrome shows unanswered delivery without claiming active work", async () => {
   const js = await chromeClientSource();
 
   assert.match(js, /agent-presence/);
-  assert.match(js, /Working\.\.\./);
-  assert.match(js, /spinner/);
+  assert.match(js, /Waiting for agent reply/);
+  assert.doesNotMatch(js, /Working\.\.\./);
 });
 
-test("chrome disables sending only while working or ended", async () => {
+test("chrome disables sending only after the session ends", async () => {
   const js = await chromeClientSource();
 
   assert.match(js, /let agentPresence = "waiting"/);
   assert.match(js, /function updateSendState\(\)/);
-  assert.match(js, /sendButton\.disabled = ended \|\| agentPresence === "working"/);
+  assert.match(js, /sendButton\.disabled = ended;/);
   assert.match(js, /sendAndEndButton\.disabled = sendButton\.disabled/);
   assert.doesNotMatch(js, /hasContent/);
 });
@@ -1057,7 +1057,10 @@ test("chrome shows a waiting banner when no agent has attached", async () => {
 
   assert.match(html, /id="presenceBanner"/);
   assert.match(html, /Your agent is not listening/);
-  assert.match(js, /presenceBanner\.hidden = ended \|\| agentPresence !== "waiting"/);
+  assert.match(
+    js,
+    /presenceBanner\.hidden = ended \|\| agentPresence === "listening" \|\| agentPresence === "external"/,
+  );
   assert.match(css, /\.presence-banner\{/);
 });
 
@@ -4666,7 +4669,8 @@ test("send-and-end prompt submissions wake active polls with ended attribution",
       assert.equal(feedback.session_ended, true);
       assert.equal(feedback.ended_by, "user");
       assert.equal(feedback.prompts.length, 1);
-      assert.equal(await presence.next(), "working");
+      assert.equal(await presence.next(), "listening");
+      assert.equal(await presence.next(), "awaiting-reply");
       assert.equal(await presence.next(), "waiting");
 
       const ended = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
@@ -4682,7 +4686,7 @@ test("send-and-end prompt submissions wake active polls with ended attribution",
   }
 });
 
-test("event WebSocket agent-presence reflects waiting, listening, and working transitions", async () => {
+test("event WebSocket agent-presence reflects waiting, listening, and unanswered delivery transitions", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -4711,8 +4715,8 @@ test("event WebSocket agent-presence reflects waiting, listening, and working tr
     });
     await pollPromise;
 
-    const working = await presence.next();
-    assert.equal(working, "working", "should switch to working when poll releases after at least one attach");
+    assert.equal(await presence.next(), "listening");
+    assert.equal(await presence.next(), "awaiting-reply");
 
     await presence.close();
   } finally {
@@ -4861,7 +4865,7 @@ test("heartbeat long-poll errors close the stream without Express error handling
   assert.match(source, /respond\(\)\.catch\(handleRespondError\)/);
 });
 
-test("event WebSocket agent-presence switches to working when poll immediately takes queued feedback", async () => {
+test("event WebSocket agent-presence reports unanswered delivery when poll immediately takes queued feedback", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -4885,7 +4889,8 @@ test("event WebSocket agent-presence switches to working when poll immediately t
     });
     await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
 
-    assert.equal(await presence.next(), "working");
+    assert.equal(await presence.next(), "listening");
+    assert.equal(await presence.next(), "awaiting-reply");
     await presence.close();
   } finally {
     await server.close();
@@ -5082,7 +5087,8 @@ test("event WebSocket agent-presence resets to waiting after ending and reopenin
         body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
       });
       await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
-      assert.equal(await presence.next(), "working");
+      assert.equal(await presence.next(), "listening");
+      assert.equal(await presence.next(), "awaiting-reply");
 
       await fetch(`${base}/api/${key}/end`, { method: "POST" });
       // The browser end above is user-initiated, so reopening requires the explicit opt-in.
@@ -5129,12 +5135,10 @@ test("event WebSocket agent-presence returns to waiting after an agent reply", a
         headers: { "content-type": "application/json", origin: base },
         body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
       });
-      // A poll that drains the feedback and releases leaves presence "working".
       await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
-      assert.equal(await presence.next(), "working");
+      assert.equal(await presence.next(), "listening");
+      assert.equal(await presence.next(), "awaiting-reply");
 
-      // The reply concludes that work. Without a clear here, presence stays "working"
-      // forever (the chrome disables Send) until some future poll happens to attach.
       await fetch(`${base}/api/${key}/agent-reply`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -5150,7 +5154,7 @@ test("event WebSocket agent-presence returns to waiting after an agent reply", a
   }
 });
 
-test("event WebSocket agent-presence stays working when resuming an open session", async () => {
+test("event WebSocket agent-presence keeps unanswered delivery when resuming an open session", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -5179,7 +5183,7 @@ test("event WebSocket agent-presence stays working when resuming an open session
 
     const presence = await startPresenceStream(base, key);
     try {
-      assert.equal(await presence.next(), "working");
+      assert.equal(await presence.next(), "awaiting-reply");
     } finally {
       await presence.close();
     }
@@ -6247,7 +6251,12 @@ test("a zero-timeout drain is never refused, claims no listener, and cannot take
       });
       const delivered = await holder;
       assert.equal(delivered.status, "feedback");
-      assert.deepEqual(await presence.next(), { state: "working", mode: "agent-busy" });
+      assert.deepEqual(await presence.next(), { state: "listening", mode: "external-listener", awaiting_reply: true });
+      assert.deepEqual(await presence.next(), {
+        state: "awaiting-reply",
+        mode: "awaiting-reply",
+        awaiting_reply: true,
+      });
     } finally {
       await presence.close();
     }
@@ -6657,6 +6666,115 @@ test("receipt transitions sync live on lease and ACK and persist through reload"
     );
   } finally {
     await stream?.close();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+for (const acknowledge of [false, true]) {
+  test(`unanswered ${acknowledge ? "acknowledged" : "abandoned"} delivery does not claim work or lose later notes`, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "lavish-presence-"));
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<!doctype html><body>Review</body>");
+    const server = await serve({
+      port: 0,
+      stateFile: path.join(dir, "state.json"),
+      feedbackLeaseTtlMs: 40,
+      pruneMaxAgeMs: null,
+    });
+    try {
+      const base = `http://127.0.0.1:${server.port}`;
+      const open = await fetch(`${base}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: artifact }),
+      });
+      const { key } = await open.json();
+      const post = (route, body) =>
+        fetch(`${base}/api/${key}/${route}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", origin: base },
+          body: JSON.stringify(body),
+        });
+      await post("prompts", { prompts: [{ prompt: "First note", tag: "message" }] });
+      const delivery = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`).then((r) => r.json());
+      assert.equal(delivery.status, "feedback");
+      if (acknowledge) await post("ack", { delivery_id: delivery.delivery_id });
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      assert.deepEqual((await fetch(`${base}/health`).then((r) => r.json())).listeners, []);
+      const presence = await startEventStream(base, key, "agent-presence");
+      try {
+        assert.deepEqual(await presence.next(), {
+          state: "awaiting-reply",
+          mode: "awaiting-reply",
+          awaiting_reply: true,
+        });
+        await post("prompts", { prompts: [{ prompt: "Second note", tag: "message" }] });
+        const stored = JSON.parse(await readFile(path.join(dir, "state.json"), "utf8")).sessions[key];
+        assert.equal(stored.prompts.length, 1);
+        const next = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then((r) =>
+          r.json(),
+        );
+        assert.deepEqual(
+          next.prompts.map((p) => p.prompt),
+          acknowledge ? ["Second note"] : ["First note", "Second note"],
+        );
+        await post("agent-reply", { text: "Done" });
+        assert.deepEqual(await presence.next(), { state: "waiting" });
+      } finally {
+        await presence.close();
+      }
+    } finally {
+      await server.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a fresh listener and an agent reply preserve independent unanswered delivery state", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-presence-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><body>Review</body>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), pruneMaxAgeMs: null });
+  const controller = new AbortController();
+  let listening;
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const post = (route, body) =>
+      fetch(`${base}/api/${key}/${route}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify(body),
+      });
+    await post("prompts", { prompts: [{ prompt: "First note", tag: "message" }] });
+    const batch = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then((r) =>
+      r.json(),
+    );
+    await post("ack", { delivery_id: batch.delivery_id });
+    const presence = await startEventStream(base, key, "agent-presence");
+    try {
+      assert.equal((await presence.next()).state, "awaiting-reply");
+      listening = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`, { signal: controller.signal })
+        .then((r) => r.json())
+        .catch(() => null);
+      assert.deepEqual(await presence.next(), { state: "listening", mode: "agent-listener", awaiting_reply: true });
+      await post("agent-reply", { text: "Done" });
+      assert.deepEqual(await presence.next(), { state: "listening", mode: "agent-listener" });
+      controller.abort();
+      await listening;
+      assert.deepEqual(await presence.next(), { state: "waiting" });
+    } finally {
+      await presence.close();
+    }
+  } finally {
+    controller.abort();
+    await listening;
     await server.close();
     await rm(dir, { recursive: true, force: true });
   }

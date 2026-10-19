@@ -42,7 +42,7 @@ that next poll.
 5. If the session is still open and you want to carry on in the browser, reply with
    `npx -y lavish-axi poll <html-file> --agent-reply "<message>"` and follow the `/lavish` wake-path
    rules from there. To post the result without waiting for more feedback, use `npx -y lavish-axi reply <html-file> --agent-reply "<message>"` - it exits once the
-   server accepts the reply, so the review page stops showing Working. End the session only when the user explicitly says the review is finished or asks to end it. A finished agent turn, an empty drain, a timeout, a reap, or a browser disconnect does not mean the user is done: leave the session open. A polite thanks alone is not a completion request.
+   server accepts the reply, so the review page clears its waiting message. End the session only when the user explicitly says the review is finished or asks to end it. A finished agent turn, an empty drain, a timeout, a reap, or a browser disconnect does not mean the user is done: leave the session open. A polite thanks alone is not a completion request.
    If the user explicitly finishes the review, run `npx -y lavish-axi end <html-file>`. A reply claims no listener, so it is never refused while
    another poll holds the session; on an ended session it exits with `SESSION_ENDED` and the
    update belongs in this conversation instead.
@@ -52,9 +52,9 @@ that next poll.
 Delivered feedback stays leased to the poll that took it for about a minute. A poll that collected
 the feedback and then exited before acknowledging it - typically a poll a subagent started and left
 behind - leaves that lease to expire, and the next drain delivers the batch again. Signals: the
-browser is stuck on "Working" or a spinner, or the drain came back `waiting` with a
+browser still shows an unanswered note, or the drain came back `waiting` with a
 `retry_after_ms`. Wait that long, then drain again with `--timeout-ms 0`; the prompts come back.
-Apply them normally, then reply into the browser so it stops spinning - `npx -y lavish-axi reply
+Apply them normally, then reply into the browser to clear the waiting message - `npx -y lavish-axi reply
 <html-file> --agent-reply "<message>"` does that without opening a long poll, and it retires the
 lease.
 
