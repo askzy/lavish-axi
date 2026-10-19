@@ -666,10 +666,6 @@ export async function serve({
     const entry = serializeChat([last?.role === "agent" ? last : { role: "agent", text, at: session.updated_at }])[0];
     events.emit("agent-reply", key, entry);
     events.emit("chat-sync", key, session);
-    // The reply concludes the delivered-feedback "working" state. Without this, a poll that
-    // drains feedback and then releases leaves presence stuck on "working" - the chrome keeps
-    // Send disabled - until some future poll happens to attach, even though the agent already
-    // answered. See "event WebSocket agent-presence returns to waiting after an agent reply".
     clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
     return session;
   }
@@ -816,8 +812,6 @@ export async function serve({
         } else {
           activePolls.set(key, nextHolder);
         }
-        // Attaching a fresh round retires the prior delivery marker; releasing a poll never does.
-        deliveredFeedback.delete(key);
         if (agentReply !== null) {
           const session = await publishAgentReply(key, agentReply);
           if (!session) {
@@ -2746,10 +2740,12 @@ export function hasLiveReloadRootOptIn(html) {
 // release the successor that replaced it.
 function releasePollListener(holder, activePolls, deliveredFeedback, events) {
   if (activePolls.get(holder.key) !== holder) return;
-  const previousPresence = computePresence(holder.key, activePolls, deliveredFeedback);
+  const previousPresence = presenceSignature(holder.key, activePolls, deliveredFeedback);
   activePolls.delete(holder.key);
-  const nextPresence = computePresence(holder.key, activePolls, deliveredFeedback);
-  if (nextPresence !== previousPresence) events.emit("agent-presence", holder.key, nextPresence);
+  const nextPresence = presenceSignature(holder.key, activePolls, deliveredFeedback);
+  if (nextPresence !== previousPresence) {
+    events.emit("agent-presence", holder.key, computePresence(holder.key, activePolls, deliveredFeedback));
+  }
 }
 
 function listenerLabel(holder) {
@@ -2769,38 +2765,35 @@ function listenerConflict(holder, code) {
 }
 
 function markFeedbackDelivered(key, activePolls, deliveredFeedback, events) {
-  const previousPresence = computePresence(key, activePolls, deliveredFeedback);
+  const previousPresence = presenceSignature(key, activePolls, deliveredFeedback);
   deliveredFeedback.add(key);
-  const nextPresence = computePresence(key, activePolls, deliveredFeedback);
+  const nextPresence = presenceSignature(key, activePolls, deliveredFeedback);
   if (nextPresence !== previousPresence) {
-    events.emit("agent-presence", key, nextPresence);
+    events.emit("agent-presence", key, computePresence(key, activePolls, deliveredFeedback));
   }
 }
 
 function clearFeedbackDelivery(key, activePolls, deliveredFeedback, events) {
-  const previousPresence = computePresence(key, activePolls, deliveredFeedback);
+  const previousPresence = presenceSignature(key, activePolls, deliveredFeedback);
   deliveredFeedback.delete(key);
-  const nextPresence = computePresence(key, activePolls, deliveredFeedback);
+  const nextPresence = presenceSignature(key, activePolls, deliveredFeedback);
   if (nextPresence !== previousPresence) {
-    events.emit("agent-presence", key, nextPresence);
+    events.emit("agent-presence", key, computePresence(key, activePolls, deliveredFeedback));
   }
 }
 
-// Working outranks listening: a poll that attaches while a delivered batch is still unanswered
-// is the same agent coming back for more, not a sign the work is done.
 export function computePresence(key, activePolls, deliveredFeedback) {
-  if (deliveredFeedback.has(key)) return "working";
-  return activePolls.has(key) ? "listening" : "waiting";
+  if (activePolls.has(key)) return "listening";
+  return deliveredFeedback.has(key) ? "awaiting-reply" : "waiting";
 }
 
 function presenceSignature(key, activePolls, deliveredFeedback) {
-  return `${computePresence(key, activePolls, deliveredFeedback)}:${presenceMode(key, activePolls, deliveredFeedback)}`;
+  return `${computePresence(key, activePolls, deliveredFeedback)}:${presenceMode(key, activePolls, deliveredFeedback)}:${deliveredFeedback.has(key)}`;
 }
 
 export function presenceMode(key, activePolls, deliveredFeedback) {
-  if (deliveredFeedback.has(key)) return "agent-busy";
   const holder = activePolls.get(key);
-  if (!holder) return "waiting-on-captain";
+  if (!holder) return deliveredFeedback.has(key) ? "awaiting-reply" : "waiting-on-captain";
   // --owner is used by a supervisor process listening on behalf of a worker. A bare poll is the
   // agent's own waiting round; an identified holder must not make the composer invite user
   // input while the owning worker is busy elsewhere.
@@ -2809,7 +2802,11 @@ export function presenceMode(key, activePolls, deliveredFeedback) {
 
 function presenceEventData(key, state, activePolls, deliveredFeedback) {
   const mode = presenceMode(key, activePolls, deliveredFeedback);
-  return mode === "waiting-on-captain" ? { state } : { state, mode };
+  return {
+    state,
+    ...(mode === "waiting-on-captain" ? {} : { mode }),
+    ...(deliveredFeedback.has(key) ? { awaiting_reply: true } : {}),
+  };
 }
 
 function chromeIcon(paths, size = 16, strokeWidth = 1.7) {

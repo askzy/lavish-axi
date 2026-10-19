@@ -206,7 +206,7 @@ test("reply help and top-level help say when to prefer reply over poll --agent-r
   }
 });
 
-test("reply exits 0 only after the server accepts, delivers the reply, and clears Working", async () => {
+test("reply exits 0 only after the server accepts, delivers the reply, and clears the waiting message", async () => {
   await withArtifact(async ({ artifact, absolute, env, base, key }) => {
     await queuePrompt(base, key, "change the title");
     const delivered = await runCli(["poll", artifact, "--timeout-ms", "1000"], { env });
@@ -215,11 +215,12 @@ test("reply exits 0 only after the server accepts, delivers the reply, and clear
 
     const live = await openLiveEvents(base, key);
     try {
-      const working = await live.nextMatching(
-        (message) => message.type === "agent-presence" && message.data.state === "working",
-        "working presence",
+      const awaiting = await live.nextMatching(
+        (message) => message.type === "agent-presence" && message.data.state === "awaiting-reply",
+        "unanswered delivery presence",
       );
-      assert.equal(working.data.mode, "agent-busy");
+      assert.equal(awaiting.data.mode, "awaiting-reply");
+      assert.equal(awaiting.data.awaiting_reply, true);
 
       const replyPromise = runCli(["reply", artifact, "--agent-reply", "Decision recorded."], { env });
       const accepted = await live.nextMatching(
@@ -236,7 +237,7 @@ test("reply exits 0 only after the server accepts, delivers the reply, and clear
       const reply = await replyPromise;
       assert.equal(reply.status, 0, reply.stderr || reply.stdout);
       assert.match(reply.stdout, /status: sent/);
-      assert.match(reply.stdout, /no longer showing Working/);
+      assert.match(reply.stdout, /has cleared its waiting message/);
       assert.doesNotMatch(reply.stdout, /status: waiting/);
       assert.ok(reply.stdout.includes(`file: ${path.sep === "\\" ? JSON.stringify(absolute) : absolute}`));
     } finally {

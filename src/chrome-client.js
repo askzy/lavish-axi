@@ -168,6 +168,7 @@ const queued = loadQueuedPrompts();
 let annotation = true;
 let ended = false;
 let agentPresence = "waiting";
+let feedbackAwaitingReply = false;
 let pendingSnapshot = "";
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
@@ -655,7 +656,7 @@ function render() {
 }
 
 function updateSendState() {
-  sendButton.disabled = ended || agentPresence === "working";
+  sendButton.disabled = ended;
   sendAndEndButton.disabled = sendButton.disabled;
   if (warningsQueueButton) updateWarningSelectionState();
 }
@@ -860,7 +861,10 @@ function receiptHint(state, receipt) {
     );
   }
   if (state === "delivering") return "The note is being delivered to the agent.";
-  return agentPresence === "waiting" ? "No agent is listening." : "Waiting for the agent's next poll.";
+  if (agentPresence === "unknown") return "Agent status is unknown.";
+  return agentPresence === "waiting" || agentPresence === "awaiting-reply"
+    ? "No agent is listening."
+    : "Waiting for the agent's next poll.";
 }
 
 function updateDeliveryReceipt(bubble, record, now) {
@@ -1094,16 +1098,21 @@ function syncChat(chat, revision) {
   return true;
 }
 
-function setAgentPresence(state) {
-  agentPresence = state === "listening" || state === "external" || state === "working" ? state : "waiting";
+function setAgentPresence(state, awaitingReply = false) {
+  feedbackAwaitingReply = awaitingReply || state === "awaiting-reply";
+  agentPresence = ["listening", "external", "awaiting-reply", "unknown"].includes(state) ? state : "waiting";
   updateSendState();
   renderSheetSummary();
   refreshDeliveryReceipts();
-  if (presenceBanner) presenceBanner.hidden = ended || agentPresence !== "waiting";
+  if (presenceBanner) {
+    presenceBanner.hidden = ended || agentPresence === "listening" || agentPresence === "external";
+    presenceBanner.textContent =
+      agentPresence === "unknown"
+        ? "Connection lost. Agent status is unknown. Your feedback will stay queued."
+        : "Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.";
+  }
 
-  // A supervisor-owned process-only listener is busy on the agent's behalf. It must not make the
-  // composer look like an idle turn for the user while the owning agent is offline.
-  if (agentPresence !== "working" && agentPresence !== "external") {
+  if (!feedbackAwaitingReply) {
     if (workingBubble) workingBubble.remove();
     workingBubble = null;
     return;
@@ -1112,7 +1121,7 @@ function setAgentPresence(state) {
   if (!workingBubble) {
     workingBubble = document.createElement("div");
     workingBubble.className = "bubble agent agent-working";
-    workingBubble.innerHTML = '<span class="spinner"></span><span>Working...</span>';
+    workingBubble.textContent = "Waiting for agent reply";
     chatLog.appendChild(workingBubble);
   }
   scrollElementIntoView(workingBubble);
@@ -1318,7 +1327,9 @@ function sheetSummary() {
     return { text: queued.length === 1 ? "1 queued" : queued.length + " queued", accent: true, unread: false };
   }
   if (unreadAgentReply) return { text: unreadAgentReply, accent: false, unread: true };
-  if (agentPresence === "working") return { text: "Agent is working…", accent: false, unread: false };
+  if (agentPresence === "unknown") return { text: "Agent status unknown", accent: false, unread: false };
+  if (agentPresence === "awaiting-reply") return { text: "Agent not listening", accent: false, unread: false };
+  if (feedbackAwaitingReply) return { text: "Waiting for agent reply", accent: false, unread: false };
   if (agentPresence === "external") return { text: "External listener active", accent: false, unread: false };
   if (agentPresence === "listening") return { text: "Agent listening", accent: false, unread: false };
   return { text: "Agent not listening", accent: false, unread: false };
@@ -1857,7 +1868,7 @@ function createChatAttachmentsController() {
 const chatAttachmentController = createChatAttachmentsController();
 
 function sendQueued(endAfter) {
-  if (ended || agentPresence === "working") return;
+  if (ended) return;
   closeMenus();
   // Send delivers what the panel shows, so an open edit is kept rather than sent stale.
   if (commitQueuedEdit()) render();
@@ -2028,7 +2039,6 @@ async function submitQueuedOnce() {
     markSessionEnded();
     return;
   }
-  if (agentPresence === "listening") setAgentPresence("working");
 }
 
 function normalizeLayoutFindings(value) {
@@ -2466,7 +2476,7 @@ function updateWarningSelectionState() {
   warningsSelectAll.checked = selectable.length > 0 && selectedCount === selectable.length;
   warningsSelectAll.indeterminate = selectedCount > 0 && selectedCount < selectable.length;
   warningsSelected.textContent = selectedCount === 0 ? "None selected" : selectedCount + " selected";
-  warningsQueueButton.disabled = selectedCount === 0 || ended || agentPresence === "working";
+  warningsQueueButton.disabled = selectedCount === 0 || ended;
 }
 
 function toggleSelectAllWarnings() {
@@ -2523,7 +2533,7 @@ async function dismissWarning(id) {
 // One queued batch = one ordinary queued prompt. The CLI cannot tell it apart from any other
 // feedback, which is exactly the point: no parallel agent protocol.
 async function queueSelectedWarningFixes() {
-  if (ended || agentPresence === "working") return;
+  if (ended) return;
   const ids = [...selectedWarningIds];
   if (ids.length === 0) return;
   warningsQueueButton.disabled = true;
@@ -3880,6 +3890,7 @@ function connectLiveEvents() {
     }
   });
   socket.addEventListener("close", () => {
+    setAgentPresence("unknown", feedbackAwaitingReply);
     liveEventFailures += 1;
     noteLiveEventsUnreachable();
     setTimeout(connectLiveEvents, eventReconnectDelayMs);
@@ -3920,7 +3931,9 @@ events.set("chat-sync", (data) => {
   rememberChatAckIds(data.ack_ids);
   syncChat(data.chat || [], data.chat_revision);
 });
-events.set("agent-presence", (data) => setAgentPresence(data.mode === "external-listener" ? "external" : data.state));
+events.set("agent-presence", (data) =>
+  setAgentPresence(data.mode === "external-listener" ? "external" : data.state, data.awaiting_reply === true),
+);
 events.set("layout-warnings", (data) => setLayoutWarnings(data.warnings || []));
 events.set("ended", () => markSessionEnded());
 connectLiveEvents();

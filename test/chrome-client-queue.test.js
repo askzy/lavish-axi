@@ -2951,8 +2951,8 @@ test("the dock summarizes what the user should know while the sheet is down", as
   chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening" }) });
   assert.equal(sheetState(chrome).summary, "Agent listening");
 
-  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "working" }) });
-  assert.equal(sheetState(chrome).summary, "Agent is working…");
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "awaiting-reply" }) });
+  assert.equal(sheetState(chrome).summary, "Agent not listening");
 
   // A reply that lands behind the artifact is previewed on the dock until the sheet comes up.
   chrome.eventSource().listeners.get("agent-reply")({ data: JSON.stringify({ text: "Renamed the payment step." }) });
@@ -2986,13 +2986,13 @@ test("the dock summarizes what the user should know while the sheet is down", as
   await flushPromises();
   await flushPromises();
   assert.equal(chrome.queued().length, 0);
-  assert.equal(sheetState(chrome).summary, "Agent is working…");
+  assert.equal(sheetState(chrome).summary, "Agent not listening");
   assert.doesNotMatch(sheetState(chrome).summaryClass, /is-unread/);
 
   // A reply that arrives while the sheet is up was seen, so lowering it previews nothing.
   chrome.eventSource().listeners.get("agent-reply")({ data: JSON.stringify({ text: "Done." }) });
   chrome.element("panelHead").dispatch("click", {});
-  assert.equal(sheetState(chrome).summary, "Agent is working…");
+  assert.equal(sheetState(chrome).summary, "Agent not listening");
 });
 
 test("the dock reports an ended session and keeps the panel inert", async () => {
@@ -6205,7 +6205,7 @@ test("presence updates only receipt hints and preserves expired images and queue
   editor.setSelectionRange(3, 6, "backward");
   const markup = chrome.element("queuedLog").innerHTML;
   chrome.element("chatInput").value = "Composer draft";
-  for (const state of ["listening", "working", "waiting"]) {
+  for (const state of ["listening", "awaiting-reply", "waiting"]) {
     chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state }) });
     assert.equal(chrome.element("chatLog").children[0], bubble);
     assert.equal(receiptNode(bubble), row);
@@ -6277,4 +6277,54 @@ test("legacy entries gain or lose only the receipt row during a fresh sync", asy
     "Queued",
     "a lease without a remaining duration cannot claim delivery is active",
   );
+});
+
+test("a disconnected presence stream reports unknown status and queue acceptance never claims work", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: "queued" }) }),
+  });
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening" }) });
+  chrome.webSocket().protocolListeners.get("close")();
+  assert.equal(chrome.element("presenceBanner").hidden, false);
+  assert.match(chrome.element("presenceBanner").textContent, /status is unknown/i);
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: { prompt: "Please act", tag: "message" } });
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.element("send").disabled, false);
+  assert.equal(chrome.element("presenceBanner").hidden, false);
+  assert.doesNotMatch(chrome.element("chatLog").lastAppendedChild?.innerHTML || "", /Working|spinner/);
+  chrome.runTimers(500);
+  chrome.webSocketAt(1).listeners.get("agent-presence")({ data: JSON.stringify({ state: "waiting" }) });
+  assert.match(chrome.element("presenceBanner").textContent, /not listening/i);
+  chrome.webSocketAt(1).listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening" }) });
+  assert.equal(chrome.element("presenceBanner").hidden, true);
+});
+
+test("delivered feedback waits for a reply without claiming work or blocking another note", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: "queued" }) }),
+  });
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "awaiting-reply" }) });
+  assert.equal(chrome.element("presenceBanner").hidden, false);
+  assert.match(chrome.element("chatLog").lastAppendedChild.textContent, /Waiting for agent reply/);
+  assert.doesNotMatch(chrome.element("chatLog").lastAppendedChild.innerHTML, /spinner/);
+  assert.equal(chrome.element("send").disabled, false);
+  chrome.sendFrameMessage({ type: "lavish:queuePrompt", prompt: { prompt: "One more note", tag: "message" } });
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 body" });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.queued().length, 0);
+});
+
+test("the phone dock shows lost presence even while a delivered note awaits a reply", async () => {
+  const chrome = await createChromeHarness({ mobile: true });
+  chrome.eventSource().listeners.get("agent-presence")({
+    data: JSON.stringify({ state: "listening", awaiting_reply: true }),
+  });
+  assert.equal(sheetState(chrome).summary, "Waiting for agent reply");
+  chrome.webSocket().protocolListeners.get("close")();
+  assert.equal(sheetState(chrome).summary, "Agent status unknown");
 });
