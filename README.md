@@ -94,6 +94,8 @@ Unlike the skill, the hook also shows your live open sessions, so a fresh agent 
 
 Upstream ships `lavish-axi setup hooks` to write that hook into **Claude Code**, **Codex**, **OpenCode**, and **GitHub Copilot CLI** for you. It is disabled in this fork and rejects with a validation error rather than editing your agent settings, so wire the hook up by hand.
 
+For the optional personal Stop guard and its tested scope, see [Review Stop guard](https://github.com/askzy/lavish-axi/blob/main/docs/review-guard.md).
+
 ### From source
 
 This is the install path for the fork. It needs Node 22+; `corepack` ships with Node and provides the pinned pnpm.

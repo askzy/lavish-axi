@@ -30,6 +30,7 @@
   },
   "dependencies": {
     "@tailwindcss/browser": "4.2.4",
+    "@toon-format/toon": "2.1.0",
     "axi-sdk-js": "^0.1.8",
     "chokidar": "^4.0.3",
     "daisyui": "^5.5.19",
