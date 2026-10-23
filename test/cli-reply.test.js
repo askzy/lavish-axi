@@ -130,7 +130,7 @@ async function withArtifact(fn, { open = true, feedbackLeaseTtlMs = undefined } 
   const base = `http://127.0.0.1:${server.port}`;
   try {
     if (open) {
-      const opened = await runCli([artifact, "--no-open"], { env });
+      const opened = await runCli([artifact, "--no-open", "--view-only"], { env });
       assert.equal(opened.status, 0, opened.stderr || opened.stdout);
     }
     await fn({

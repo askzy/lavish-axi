@@ -131,7 +131,7 @@ test("a stale control-channel server is replaced only once per CLI invocation", 
           },
           async () => {
             try {
-              await run(["open", artifact, "--no-open"]);
+              await run(["open", artifact, "--no-open", "--view-only"]);
             } catch {
               // The fake control channel has no session route; axi-sdk may print that 404
               // without throwing. The assertion below is the replacement-count contract.
@@ -186,7 +186,7 @@ test(
       await new Promise((resolve) => fake.listen({ host: "127.0.0.1", port: 0 }, () => resolve(undefined)));
       const port = /** @type {{ port: number }} */ (fake.address()).port;
       try {
-        const child = spawn(process.execPath, [distCli, "open", artifact, "--no-open"], {
+        const child = spawn(process.execPath, [distCli, "open", artifact, "--no-open", "--view-only"], {
           cwd: root,
           env: {
             ...process.env,

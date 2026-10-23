@@ -694,7 +694,7 @@ function handlerTargetIds(source) {
 async function startSourceLayoutSession(temp, artifact, cleanups) {
   const port = await freePort();
   const env = lavishEnv(port, path.join(temp, "state-source"));
-  const output = run(process.execPath, ["bin/lavish-axi.js", artifact, "--no-open"], env);
+  const output = run(process.execPath, ["bin/lavish-axi.js", artifact, "--no-open", "--view-only"], env);
   cleanups.push(async () => {
     run(process.execPath, ["bin/lavish-axi.js", "stop", "--port", String(port)], env, 15_000);
   });
@@ -722,7 +722,7 @@ async function startBundleLayoutSession(temp, artifact, cleanups) {
   const entry = path.join(bundleRoot, "dist", "cli.mjs");
   const port = await freePort();
   const env = lavishEnv(port, path.join(temp, "state-bundle"));
-  const output = run(process.execPath, [entry, artifact, "--no-open"], env);
+  const output = run(process.execPath, [entry, artifact, "--no-open", "--view-only"], env);
   cleanups.push(async () => {
     run(process.execPath, [entry, "stop", "--port", String(port)], env, 15_000);
   });

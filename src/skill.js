@@ -150,13 +150,13 @@ ${home.help[home.help.length - 1]}
 ## Workflow
 
 1. Create the HTML artifact (default location \`.lavish/<name>.html\` in the working directory).
-2. Run \`${invocation} <html-file>\` to open or resume a review session in the browser. If the output has \`network_warning\`, tell the user.
-3. Immediately run \`${invocation} poll <html-file>\` without \`--timeout-ms\` to long-poll for the user's annotations and queued prompts.
-   On the first poll, prefer \`--agent-reply "<one-line summary of what you built and what to review first>"\` so the conversation panel opens with context.
+2. The parent session runs \`${invocation} <html-file>\` to claim its exclusive listener, open the review, and wait in the same tracked command. Subagents only build or edit the HTML and return its path. If the output has \`network_warning\`, tell the user.
+3. Keep this command tracked until feedback arrives or the review ends. Do not start a separate first poll. Use \`--view-only\` only for an explicitly requested read-only page. \`--no-open\` still listens.
+   On the first review command, prefer \`--agent-reply "<one-line summary of what you built and what to review first>"\` so the conversation panel opens with context.
    Browser-detected layout issues are filed passively in the user's Layout issues inbox and arrive as an ordinary \`layout-warnings\` prompt only when the user selects and queues them. Never edit an issue the user has not queued. The only response that arrives without user action is \`artifact_failures\`, when the review surface itself is unusable.
    The poll stays silent until the user acts or a fatal artifact failure makes the review surface unusable - leave it running, never kill it.
    Cosmetic, intentional, transient, tiny, and uncertain observations remain silent.
-   The agent that starts the poll must outlive it, so a SUBAGENT must never own one: its notification dies with it and the feedback drains into an output file nobody reads (see \`/check-lavish\` for the signals and the recovery). Delegating the artifact edits is fine - forbid \`${invocation}\` in the brief and poll from the parent session after the subagent returns.
+   The agent that starts the poll must outlive it, so a SUBAGENT must never own one: its notification dies with it and the feedback drains into an output file nobody reads (see \`/check-lavish\` for the signals and the recovery). Delegating the artifact edits is fine - forbid review commands in the brief and open and listen from the parent session after the subagent returns.
 ${POLL_WAKE_PATH_RULES.map((rule) => `   ${skillCommandText(rule)}`).join("\n")}
 4. If poll returns feedback, apply the user's prompts. A \`layout-warnings\` prompt is an explicit repair request; apply every listed fix in one pass before saving, and let Lavish re-check it after a newer artifact load.
 5. Apply human feedback, then poll again with \`--agent-reply "<message>"\` to reply in the browser and keep the loop going under the same foreground-or-verified-wake-path rule.

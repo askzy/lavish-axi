@@ -8,6 +8,8 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readReviewAttempt, updateReviewAttempt, validReviewAttempt } from "./review-attempts.js";
+
 import chokidar from "chokidar";
 import express from "express";
 
@@ -350,6 +352,7 @@ export async function serve({
   const activePolls = new Map();
   const deliveredFeedback = new Set();
   const pollOwnershipLock = new AsyncMutex();
+  const reviewReadiness = new Map();
   // Live-event client -> session key, so a session can tell whether any browser chrome still holds
   // it and a version-driven shutdown can reload the one chrome whose artifact is being reopened.
   // Current chromes use a WebSocket; the legacy SSE route only tells an old chrome to reload.
@@ -624,10 +627,47 @@ export async function serve({
     return true;
   }
 
+  function prepareReviewAttempt(id, file, harness) {
+    if (!validReviewAttempt(id) || readReviewAttempt(stateFile, id)) return false;
+    updateReviewAttempt(stateFile, id, {
+      v: 1,
+      id,
+      file,
+      createdAt: Date.now(),
+      listenerStartedAt: null,
+      finishedAt: null,
+      outcome: null,
+      ...(["claude", "codex"].includes(harness?.name) &&
+      typeof harness.sessionId === "string" &&
+      harness.sessionId.length <= 256
+        ? { harness: { name: harness.name, sessionId: harness.sessionId } }
+        : {}),
+    });
+    return true;
+  }
+
+  app.post("/api/review-attempts", async (req, res, next) => {
+    try {
+      const file = await canonicalSessionFile(String(req.body?.file || ""));
+      if (!prepareReviewAttempt(req.body?.reviewAttempt, file, req.body?.harness)) {
+        res.status(400).json({ error: "Invalid or reused review attempt" });
+        return;
+      }
+      res.json({ status: "prepared" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/sessions", async (req, res, next) => {
     try {
       const file = await resolveAllowedArtifactFile(req.body?.file);
       const key = sessionKey(file);
+      const attemptId = req.body?.reviewAttempt;
+      if (attemptId !== undefined && !prepareReviewAttempt(attemptId, file, req.body.harness)) {
+        res.status(400).json({ error: "Invalid or reused review attempt" });
+        return;
+      }
       const reopen = Boolean(req.body.reopen);
       const existing = await store.findByKey(key);
       const sessionUrl = `http://${hostForUrl(resolvedLinkHost)}:${publicPort}/session/${key}`;
@@ -638,6 +678,7 @@ export async function serve({
       // (`lavish-axi end`) keep reviving on the next open, same as before this change.
       if (existing?.status === "ended" && existing.ended_by === "user" && !reopen) {
         logEvent?.(`session open blocked (user-ended) key=${key} file=${file}`);
+        if (attemptId) updateReviewAttempt(stateFile, attemptId, { finishedAt: Date.now(), outcome: "ended" });
         res.json({ key, file, url: sessionUrl, status: "user-ended", ...networkWarningField() });
         return;
       }
@@ -703,7 +744,26 @@ export async function serve({
     }
   }
 
+  app.post("/api/poll/:attempt/ready", (req, res) => {
+    const ready = reviewReadiness.get(req.params.attempt);
+    if (!ready) {
+      res.status(409).json({ error: "Review listener is no longer awaiting readiness" });
+      return;
+    }
+    ready(true);
+    res.json({ status: "ready" });
+  });
+
   const handlePoll = async (req, res, next) => {
+    const attemptId = typeof req.query.reviewAttempt === "string" ? req.query.reviewAttempt : null;
+    let validAttempt = false;
+    const finishAttempt = (outcome) => {
+      if (!validAttempt) return;
+      const record = readReviewAttempt(stateFile, attemptId);
+      if (record && !record.finishedAt) updateReviewAttempt(stateFile, attemptId, { finishedAt: Date.now(), outcome });
+    };
+    res.on("finish", () => finishAttempt("error"));
+    res.on("close", () => finishAttempt("socket_closed"));
     const takeover = req.query.takeover === "1";
     const agentReply =
       req.method === "POST" && req.body?.agent_reply !== undefined ? String(req.body.agent_reply) : null;
@@ -749,6 +809,21 @@ export async function serve({
       // deleted artifact must not make the queue unreachable.
       const file = await canonicalSessionFile(String(req.query.file || ""));
       const key = sessionKey(file);
+      if (attemptId) {
+        const record = validReviewAttempt(attemptId) && readReviewAttempt(stateFile, attemptId);
+        if (
+          !record ||
+          record.file !== file ||
+          record.listenerStartedAt ||
+          record.finishedAt ||
+          req.query.timeoutMs !== undefined
+        ) {
+          detachRequestClose();
+          res.status(400).json({ error: "Invalid review attempt" });
+          return;
+        }
+      }
+      validAttempt = Boolean(attemptId);
       const timeoutMs =
         req.query.timeoutMs === undefined ? null : Math.max(0, Math.min(Number(req.query.timeoutMs || 0), 2147483647));
       const ownerValue = typeof req.query.owner === "string" ? req.query.owner.trim() : "";
@@ -822,6 +897,7 @@ export async function serve({
         return { holder: nextHolder, previousPresence: priorPresence };
       });
       if (conflict) {
+        finishAttempt("conflict");
         detachRequestClose();
         res.status(409).json(conflict);
         return;
@@ -831,12 +907,50 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
+      if (attemptId) {
+        updateReviewAttempt(stateFile, attemptId, { listenerStartedAt: Date.now() });
+        const ready = await new Promise((resolve) => {
+          let settled = false;
+          const complete = (accepted) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(deadline);
+            reviewReadiness.delete(attemptId);
+            cleanupPoll = null;
+            resolve(accepted);
+          };
+          const deadline = setTimeout(() => complete(false), 10_000);
+          deadline.unref?.();
+          reviewReadiness.set(attemptId, complete);
+          cleanupPoll = () => complete(false);
+          holder.replace = () => complete(false);
+          res.status(200).type("application/json").set("x-lavish-review-attempt", attemptId);
+          res.flushHeaders();
+          if (requestClosed || holder.replaced) complete(false);
+        });
+        if (!ready || holder.replaced || requestClosed) {
+          finishAttempt(holder.replaced ? "replaced" : requestClosed ? "socket_closed" : "error");
+          releasePollListener(holder, activePolls, deliveredFeedback, events);
+          detachRequestClose();
+          if (!res.writableEnded && !requestClosed)
+            res.end(
+              JSON.stringify(
+                holder.replaced
+                  ? listenerConflict(holder, "LISTENER_REPLACED")
+                  : { status: "error", code: "REVIEW_NOT_READY" },
+              ),
+            );
+          return;
+        }
+      }
       const immediate = await takeFeedbackWithReceipts(key);
       if (immediate.status !== "waiting") {
         if (holder.replaced) {
           await releaseUndeliveredFeedback(key, immediate);
           detachRequestClose();
-          res.json(listenerConflict(holder, "LISTENER_REPLACED"));
+          finishAttempt("replaced");
+          if (attemptId) res.end(JSON.stringify(listenerConflict(holder, "LISTENER_REPLACED")));
+          else res.json(listenerConflict(holder, "LISTENER_REPLACED"));
           releasePollListener(holder, activePolls, deliveredFeedback, events);
           return;
         }
@@ -846,16 +960,20 @@ export async function serve({
           detachRequestClose();
           return;
         }
+        finishAttempt(immediate.session_ended ? "ended" : immediate.status);
         finishFeedbackDelivery(key, immediate);
         releasePollListener(holder, activePolls, deliveredFeedback, events);
         if (immediate.session_ended) clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
         detachRequestClose();
-        res.json(immediate);
+        if (attemptId) res.end(JSON.stringify(immediate));
+        else res.json(immediate);
         return;
       }
       if (holder.replaced) {
         detachRequestClose();
-        res.json(listenerConflict(holder, "LISTENER_REPLACED"));
+        finishAttempt("replaced");
+        if (attemptId) res.end(JSON.stringify(listenerConflict(holder, "LISTENER_REPLACED")));
+        else res.json(listenerConflict(holder, "LISTENER_REPLACED"));
         releasePollListener(holder, activePolls, deliveredFeedback, events);
         return;
       }
@@ -867,7 +985,7 @@ export async function serve({
       const streamHeartbeat = timeoutMs === null;
       let heartbeat = null;
       if (streamHeartbeat) {
-        res.status(200).type("application/json");
+        if (!res.headersSent) res.status(200).type("application/json");
         res.write(" ");
         heartbeat = setInterval(() => {
           if (!res.writableEnded) res.write(" ");
@@ -920,6 +1038,7 @@ export async function serve({
         if (responding || res.writableEnded) return;
         responding = true;
         try {
+          finishAttempt("replaced");
           const replacement = listenerConflict(holder, "LISTENER_REPLACED");
           if (streamHeartbeat) res.end(JSON.stringify(replacement));
           else res.json(replacement);
@@ -938,6 +1057,7 @@ export async function serve({
           if (holder.replaced) {
             await releaseUndeliveredFeedback(key, result);
             if (!requestClosed && !res.writableEnded) {
+              finishAttempt("replaced");
               const replacement = listenerConflict(holder, "LISTENER_REPLACED");
               if (streamHeartbeat) res.end(JSON.stringify(replacement));
               else res.json(replacement);
@@ -963,6 +1083,7 @@ export async function serve({
           // next drain.
           const responseResult = forcedResult && result.status === "waiting" ? forcedResult : result;
           finalSessionEnded = responseResult.session_ended === true;
+          finishAttempt(responseResult.session_ended ? "ended" : responseResult.status);
           finishFeedbackDelivery(key, responseResult);
           if (streamHeartbeat) {
             res.end(JSON.stringify(responseResult));
@@ -1028,7 +1149,9 @@ export async function serve({
       cleanupPoll?.();
       if (claimedHolder) releasePollListener(claimedHolder, activePolls, deliveredFeedback, events);
       detachRequestClose();
-      next(error);
+      finishAttempt("error");
+      if (res.headersSent) res.destroy(error);
+      else next(error);
     }
   };
   app.get("/api/poll", handlePoll);

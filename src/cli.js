@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   createReadStream,
@@ -101,7 +101,7 @@ export const POLL_BROWSER_DISCONNECTED_RULE =
 export const POLL_COMPLETION_RULE =
   "End the session only when the user explicitly says the review is finished or asks to end it. A finished agent turn, an empty drain, a timeout, a reap, or a browser disconnect does not mean the user is done: leave the session open. A polite thanks alone is not a completion request.";
 export const POLL_WAKE_PATH_RULES = Object.freeze([
-  "After opening a review, start the first indefinite poll immediately, without --timeout-ms. The no-repoll-after-reap rule never skips this first poll.",
+  "The parent session runs `lavish-axi <html-file>` to claim a listener, open the review, and wait in one tracked command. Subagents only build or edit the artifact and return its path. Use `--view-only` only for an explicitly requested read-only page. `--no-open` suppresses the browser launch and still listens.",
   "Run the poll in the foreground when your harness allows it, so it returns the feedback directly to the agent. If your harness caps how long a foreground command may run, running the poll as a background task is expected and supported.",
   "Codex: when exec_command yields a session_id, the poll is still running. Continue waiting with repeated write_stdin calls on that same session_id until the command exits. When functions.exec yields a running cell, continue with repeated functions.wait calls on the same cell_id. Continuing a running command is not starting another poll. Use waits of at most 60 seconds so you can share progress, without adding a timeout to the poll itself. A running handle is not a completion notification: stay in the active turn and do not send a final answer while claiming to listen.",
   "Claude: start the poll as a harness-native tracked background task, retain its task identity, and handle its completion notification in the same parent session. Starting the task is required before handing back the review; opening the page alone does not start listening.",
@@ -308,7 +308,7 @@ export function createOpenOutput({ file, url, status, networkWarning = undefined
   return {
     session: { file, url, status },
     ...(networkWarning ? { network_warning: networkWarning } : {}),
-    next_step: `${networkPrefix}Do not respond to the user just yet. Now you must run \`lavish-axi poll ${file}\`. This command long-polls until the user sends feedback, ends the session, or closes the review page, and it stays silent the whole time - that is normal, never kill it. Layout issues the browser detects do not return this poll; they wait in the user's Layout issues inbox until the user queues them, then arrive as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use. ${pollExecutionGuidance()} After applying feedback, run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms to show a concise response in Lavish Editor and keep waiting for more feedback. If instead you are handing back a result without starting another long-poll, run \`lavish-axi reply ${file} --agent-reply "<message for the user>"\` to get an acceptance receipt. ${POLL_AGENT_REPLY_RULE} ${POLL_AGENT_REPLY_NEXT_POINTER} If the user ends the session, stop polling and do not reopen it by re-running \`lavish-axi ${file}\` unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${file} --reopen\`.`,
+    next_step: `${networkPrefix}This command claims a listener, opens the review, and waits for feedback. Do not respond to the user while it is running. It long-polls until the user sends feedback, ends the session, or closes the review page, and it stays silent the whole time - that is normal, never kill it. Layout issues the browser detects do not return this poll; they wait in the user's Layout issues inbox until the user queues them, then arrive as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use. ${pollExecutionGuidance()} After applying feedback, run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms to show a concise response in Lavish Editor and keep waiting for more feedback. If instead you are handing back a result without starting another long-poll, run \`lavish-axi reply ${file} --agent-reply "<message for the user>"\` to get an acceptance receipt. ${POLL_AGENT_REPLY_RULE} ${POLL_AGENT_REPLY_NEXT_POINTER} If the user ends the session, stop polling and do not reopen it by re-running \`lavish-axi ${file}\` unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${file} --reopen\`.`,
   };
 }
 
@@ -324,8 +324,8 @@ export function createUserEndedOpenOutput({ file, url, networkWarning = undefine
   };
 }
 
-async function openCommand(args) {
-  const file = firstPositionalArg(args);
+export async function openCommand(args, { openBrowser = launchBrowser } = {}) {
+  const file = firstPositionalArg(args, POLL_VALUE_FLAGS);
   if (!file) {
     throw new AxiError("HTML file path is required", "VALIDATION_ERROR", ["Run `lavish-axi <html-file>`"]);
   }
@@ -337,31 +337,69 @@ async function openCommand(args) {
     forceRestart: shouldForceRestartForLocalBuild(process.argv[1] || ""),
     reloadKey: sessionKey(absolute),
   });
-  const response = await postJson(`${baseUrl}/api/sessions`, { file: absolute, noGate, reopen });
+  const viewOnly = args.includes("--view-only");
+  const attemptId = viewOnly ? null : randomUUID();
+  const response = await postJson(`${baseUrl}/api/sessions`, {
+    file: absolute,
+    noGate,
+    reopen,
+    ...(attemptId ? { reviewAttempt: attemptId } : {}),
+    ...(nativeReviewHarness() ? { harness: nativeReviewHarness() } : {}),
+  });
+  if (attemptId) reviewEvent(attemptId, absolute, "prepared");
   if (response.status === "user-ended") {
     return createUserEndedOpenOutput({ file: absolute, url: response.url, networkWarning: response.network_warning });
   }
-  if (shouldOpenBrowser(args, process.env)) {
-    try {
-      const open = (await import("open")).default;
-      await open(response.url);
-    } catch {
-      response.status = "ready";
+  const openPage = async () => {
+    if (shouldOpenBrowser(args, process.env)) {
+      try {
+        await openBrowser(response.url);
+      } catch {
+        process.stderr.write(`Browser launch failed. Open ${response.url} manually.\n`);
+      }
     }
+  };
+  if (viewOnly) {
+    await openPage();
+    return {
+      session: { file: absolute, url: response.url, status: "view-only" },
+      ...(response.network_warning ? { network_warning: response.network_warning } : {}),
+      next_step: "This page is view-only. No feedback listener was started.",
+    };
   }
-  return createOpenOutput({
-    file: absolute,
-    url: response.url,
-    status: response.status || "opened",
-    networkWarning: response.network_warning,
+  return pollCommand(args, {
+    baseUrl,
+    absolute,
+    attemptId,
+    onReady: async () => {
+      reviewEvent(attemptId, absolute, "listening", { url: response.url });
+      process.stderr.write(`Review listener confirmed. ${response.url}\n`);
+      if (response.network_warning) process.stderr.write(`${response.network_warning}\n`);
+      await openPage();
+    },
   });
+}
+
+async function launchBrowser(url) {
+  const open = (await import("open")).default;
+  await open(url);
+}
+
+export function nativeReviewHarness(env = process.env) {
+  if (env.CLAUDE_CODE_SESSION_ID) return { name: "claude", sessionId: env.CLAUDE_CODE_SESSION_ID };
+  if (env.CODEX_THREAD_ID) return { name: "codex", sessionId: env.CODEX_THREAD_ID };
+  return null;
+}
+
+function reviewEvent(attemptId, file, event, fields = {}) {
+  process.stderr.write(`LAVISH_REVIEW_EVENT ${JSON.stringify({ v: 1, attemptId, file, event, ...fields })}\n`);
 }
 
 export function shouldOpenBrowser(args, env) {
   return !args.includes("--no-open") && env.LAVISH_AXI_NO_OPEN !== "1";
 }
 
-export async function pollCommand(args) {
+export async function pollCommand(args, review = null) {
   const file = firstPositionalArg(args, POLL_VALUE_FLAGS);
   if (!file) {
     throw new AxiError("HTML file path is required", "VALIDATION_ERROR", ["Run `lavish-axi poll <html-file>`"]);
@@ -378,9 +416,25 @@ export async function pollCommand(args) {
   const agentReply = await resolveAgentReply(args);
   // A session outlives its artifact file: prompts already queued must stay collectable even if
   // the HTML was deleted, so this addresses the record leniently instead of requiring the bytes.
-  const absolute = await canonicalSessionFile(file);
-  const baseUrl = await ensureServer();
+  const absolute = review?.absolute || (await canonicalSessionFile(file));
+  const baseUrl = review?.baseUrl || (await ensureServer());
+  if (!review && timeoutMs === null) {
+    const attemptId = randomUUID();
+    await postJson(`${baseUrl}/api/review-attempts`, {
+      file: absolute,
+      reviewAttempt: attemptId,
+      ...(nativeReviewHarness() ? { harness: nativeReviewHarness() } : {}),
+    });
+    reviewEvent(attemptId, absolute, "prepared");
+    review = {
+      attemptId,
+      onReady: async () => {
+        reviewEvent(attemptId, absolute, "listening");
+      },
+    };
+  }
   const query = new URLSearchParams({ file: absolute });
+  if (review?.attemptId) query.set("reviewAttempt", review.attemptId);
   if (timeoutMs) query.set("timeoutMs", timeoutMs);
   if (owner) query.set("owner", owner);
   if (takeover) query.set("takeover", "1");
@@ -423,7 +477,20 @@ export async function pollCommand(args) {
       // Poll ownership is claimed before the response is available. Retrying a transport failure
       // can leave the first claim alive and make the retry reject itself as LISTENER_ACTIVE.
       retries: 0,
+      onHeaders: review
+        ? async (headers) => {
+            if (headers.get("x-lavish-review-attempt") !== review.attemptId)
+              throw new AxiError("Review listener was not confirmed", "REVIEW_NOT_READY");
+            await review.onReady();
+            await postJson(`${baseUrl}/api/poll/${review.attemptId}/ready`, {});
+          }
+        : undefined,
     });
+    if (review)
+      reviewEvent(review.attemptId, absolute, "terminal", {
+        outcome: response.session_ended ? "ended" : response.status,
+        code: response.code,
+      });
     if (response.code === "LISTENER_REPLACED") {
       throw new AxiError("Lavish Editor poll listener was replaced by a takeover", "LISTENER_REPLACED", [
         `Another process now listens on this session. Re-run \`lavish-axi poll ${absolute}\` only if you intend to take listening back`,
@@ -432,6 +499,14 @@ export async function pollCommand(args) {
     // A LISTENER_REPLACED body carries no delivery_id, so nothing is acked for it.
     queueFeedbackAck({ baseUrl, key: sessionKey(absolute), response });
     return createPollOutput({ file: absolute, response, isDrain: timeoutMs !== null && Number(timeoutMs) === 0 });
+  } catch (error) {
+    if (review)
+      reviewEvent(review.attemptId, absolute, "terminal", {
+        outcome:
+          error.code === "LISTENER_ACTIVE" ? "conflict" : error.code === "LISTENER_REPLACED" ? "replaced" : "error",
+        code: error.code,
+      });
+    throw error;
   } finally {
     waitReporter?.stop();
     if (!timeoutMs) {
@@ -1589,9 +1664,12 @@ export function createServerSpawnOptions(logFd = null) {
 
 /**
  * @param {string} url
- * @param {{ retries?: number, retryDelayMs?: number, method?: string, headers?: Record<string, string>, body?: string }} [options]
+ * @param {{ retries?: number, retryDelayMs?: number, method?: string, headers?: Record<string, string>, body?: string, onHeaders?: (headers: Headers) => Promise<void> }} [options]
  */
-export async function fetchJson(url, { retries = 0, retryDelayMs = 250, method = "GET", headers, body } = {}) {
+export async function fetchJson(
+  url,
+  { retries = 0, retryDelayMs = 250, method = "GET", headers, body, onHeaders } = {},
+) {
   let response;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
@@ -1637,6 +1715,12 @@ export async function fetchJson(url, { retries = 0, retryDelayMs = 250, method =
       throw error;
     }
     throw new AxiError(`Lavish Editor request failed: ${response.status}`, "SERVER_ERROR");
+  }
+  try {
+    await onHeaders?.(response.headers);
+  } catch (error) {
+    await response.body?.cancel();
+    throw error;
   }
   try {
     return await response.json();
@@ -1951,12 +2035,12 @@ export function getCommandHelp(command) {
 // last three syncs each paid. The bodies stay the fork's de-branded text: no ht-ml.app, no
 // `lavish-axi share` or `setup hooks` in the usage block, and disabled notices for both commands.
 function createTopLevelHelp() {
-  return `lavish-axi - Lavish Editor AXI (askzy fork: share + setup hooks disabled)\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--owner <label>] [--takeover] [--agent-reply "..."] [--agent-reply-file <path>]\n  lavish-axi reply <html-file> (--agent-reply "..." | --agent-reply-file <path>)\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi stop\n  lavish-axi update [--check]\n  lavish-axi prune [--older-than 30d] [--unreplied-older-than 14d] [--open-older-than 60d] [--dry-run] [--cwd <dir>]\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback, ends the session, or closes the review page, staying silent while it waits - never kill it. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance()} ${POLL_SEND_AND_END_RULE} Use \`lavish-axi reply\` when handing a result back without waiting for more feedback: it exits 0 only after the server accepts the reply, so the review page clears its waiting message. \`poll --agent-reply\` posts a reply and then keeps waiting.\n\n`;
+  return `lavish-axi - Lavish Editor AXI (askzy fork: share + setup hooks disabled)\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--view-only] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--owner <label>] [--takeover] [--agent-reply "..."] [--agent-reply-file <path>]\n  lavish-axi reply <html-file> (--agent-reply "..." | --agent-reply-file <path>)\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi stop\n  lavish-axi update [--check]\n  lavish-axi prune [--older-than 30d] [--unreplied-older-than 14d] [--open-older-than 60d] [--dry-run] [--cwd <dir>]\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback, ends the session, or closes the review page, staying silent while it waits - never kill it. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance()} ${POLL_SEND_AND_END_RULE} Use \`lavish-axi reply\` when handing a result back without waiting for more feedback: it exits 0 only after the server accepts the reply, so the review page clears its waiting message. \`poll --agent-reply\` posts a reply and then keeps waiting.\n\n`;
 }
 
 function createCommandHelp() {
   return {
-    open: `Usage: lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n\nOpen or resume a Lavish Editor review session for an HTML artifact. Use --no-open when you need to ensure the server/session exists without opening another browser window. Use --no-gate to skip the open-time layout curtain for this browser open. If the user explicitly ended the session from the browser, this refuses to reopen it and returns guidance instead - pass --reopen to force it open when the user asks for further review or something important needs their visual attention. Sessions ended by the agent (\`lavish-axi end\`) reopen normally without the flag.\n`,
+    open: `Usage: lavish-axi <html-file> [--no-open] [--view-only] [--no-gate] [--reopen]\n\nClaim the exclusive listener, open or resume the review, and wait for feedback in this command. Use --no-open to keep listening without opening another browser window. Use --view-only only for an explicitly requested read-only page; it opens and exits without listening. Use --no-gate to skip the open-time layout curtain for this browser open. If the user explicitly ended the session from the browser, this refuses to reopen it and returns guidance instead - pass --reopen to force it open when the user asks for further review or something important needs their visual attention. Sessions ended by the agent (\`lavish-axi end\`) reopen normally without the flag.\n`,
     poll: `Usage: lavish-axi poll <html-file> [--owner <label>] [--takeover] [--agent-reply "..."] [--agent-reply-file <path>]\n\nOne poll listens per session. ${POLL_LISTENER_RULE}\n\nThis command long-polls indefinitely for queued user prompts. It stays silent while it waits - that is normal, never kill it. Browser-detected layout issues do NOT return this poll: they are filed passively in the user's Layout issues inbox and arrive as an ordinary tag "layout-warnings" prompt only after the user selects them and queues the fixes. Warning lifecycle: an issue stays unresolved and counted while queued, becomes recurring if a newer artifact revision still shows it, and is resolved only after a newer artifact load plus a complete diagnostic pass at the same viewport no longer detects it. A failed or incomplete pass preserves it as unverified rather than clearing it. The only response that arrives without user action is artifact_failures - a fatal failure that made the review surface itself unusable. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance()} Use --agent-reply after applying prior feedback to display a concise response in Lavish Editor before waiting again. When you are handing a result back and are not about to long-poll, run \`lavish-axi reply <html-file> --agent-reply "..."\` instead: that command exits 0 only after the server accepts the reply, so the review page clears its waiting message without this poll staying open. ${POLL_AGENT_REPLY_RULE} ${POLL_AGENT_REPLY_HELP_POINTER} Do not combine --agent-reply with --agent-reply-file.\n\nExamples:\n  lavish-axi poll report.html --agent-reply "Renamed the payment step."\n  lavish-axi poll report.html --agent-reply-file reply.md\n  lavish-axi poll report.html --agent-reply-file -\n\n${POLL_SEND_AND_END_RULE}\n`,
     reply: `Usage: lavish-axi reply <html-file> (--agent-reply "..." | --agent-reply-file <path>)\n\nPost an agent reply to the open Lavish Editor session and exit once the server confirms it was accepted. Exit 0 only when the server answers that the reply was sent, which is when the review page clears its waiting message. If that answer does not arrive within ${AGENT_REPLY_RECEIPT_TIMEOUT_MS / 1000} seconds, exit non-zero with a timeout error. Use this when you are handing a result back and are not about to wait for more feedback. It is not a poll: it never claims or displaces a listener, so it is safe while another poll holds the session, and a reply retires every outstanding feedback lease the same way \`poll --agent-reply\` does.\n\nUse \`lavish-axi poll <html-file> --agent-reply "..."\` instead when the reply should be followed by a long-poll. That command posts the reply and then keeps waiting, so it does not exit when the reply is accepted.\n\nPass exactly one of --agent-reply or --agent-reply-file. ${POLL_AGENT_REPLY_RULE} ${POLL_AGENT_REPLY_HELP_POINTER} Do not combine the two flags. An empty reply is refused. A session the user or agent has ended refuses the reply with SESSION_ENDED; deliver the update in this conversation instead.\n\nExamples:\n  lavish-axi reply report.html --agent-reply "Renamed the payment step."\n  lavish-axi reply report.html --agent-reply-file reply.md\n  lavish-axi reply report.html --agent-reply-file -\n`,
     end: `Usage: lavish-axi end <html-file>\n\nEnd a Lavish Editor session as the agent. ${POLL_COMPLETION_RULE} A session ended this way still reopens normally on the next \`lavish-axi <html-file>\`, unlike a user ending it from the browser, which requires --reopen.\n`,
