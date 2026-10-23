@@ -55,7 +55,7 @@ test(
     };
 
     function openArtifact(file) {
-      const output = run(process.execPath, ["bin/lavish-axi.js", file, "--no-open"], lavishEnv);
+      const output = run(process.execPath, ["bin/lavish-axi.js", file, "--no-open", "--view-only"], lavishEnv);
       const url = output.match(/url:\s*"([^"]+)"/)?.[1];
       assert.ok(url, output);
       return { file, url };

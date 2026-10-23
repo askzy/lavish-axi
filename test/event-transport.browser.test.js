@@ -136,7 +136,7 @@ test(
         );
         const output = run(
           process.execPath,
-          ["bin/lavish-axi.js", file, "--no-open", "--no-gate"],
+          ["bin/lavish-axi.js", file, "--no-open", "--view-only", "--no-gate"],
           lavishEnv,
           20_000,
           oldRoot,

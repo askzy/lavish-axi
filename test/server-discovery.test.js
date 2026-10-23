@@ -394,7 +394,7 @@ test("a symlinked state directory adopts the daemon started at its target", asyn
     });
     try {
       await withEnv(cliEnv(alias, port, "127.0.0.1"), async () => {
-        await runCli(["open", artifact, "--no-open"]);
+        await runCli(["open", artifact, "--no-open", "--view-only"]);
       });
       assert.equal(await isResolved(owner.done), false, "the original daemon was replaced");
       const health = await fetch(`http://127.0.0.1:${port}/health`).then((response) => response.json());
@@ -430,7 +430,7 @@ test(
         idleTimeoutMs: null,
       });
       try {
-        await withEnv(sweepEnv(dir, port, undefined), () => runCli(["open", artifact, "--no-open"]));
+        await withEnv(sweepEnv(dir, port, undefined), () => runCli(["open", artifact, "--no-open", "--view-only"]));
         assert.equal(await reachable("127.0.0.1", port), false, "a duplicate server started on loopback");
         assert.equal(await isResolved(pinned.done), false);
         assert.deepEqual(await stateSessions(dir), [artifact]);
@@ -465,7 +465,7 @@ test(
       });
       try {
         await openSession("127.0.0.1", port, first);
-        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", second, "--no-open"]));
+        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", second, "--no-open", "--view-only"]));
         assert.equal(await isResolved(loopbackOnly.done), true, "the loopback-only server was not replaced");
         const replacement = await health(otherHost, port);
         assert.equal(replacement.ok, true);
@@ -475,8 +475,8 @@ test(
 
         // Switching back does not replace it again: a server that already serves loopback is
         // adopted, so agents configured differently share one daemon instead of trading it.
-        await withEnv(cliEnv(dir, port, "127.0.0.1"), () => runCli(["open", first, "--no-open"]));
-        await withEnv(cliEnv(dir, port, undefined), () => runCli(["open", second, "--no-open"]));
+        await withEnv(cliEnv(dir, port, "127.0.0.1"), () => runCli(["open", first, "--no-open", "--view-only"]));
+        await withEnv(cliEnv(dir, port, undefined), () => runCli(["open", second, "--no-open", "--view-only"]));
         const after = await health(otherHost, port);
         assert.deepEqual(after.hosts, replacement.hosts);
         assert.equal(after.state_id, replacement.state_id);
@@ -513,9 +513,9 @@ test(
       try {
         assert.deepEqual(pinned.hosts, ["127.0.0.1", otherHost]);
         await openSession(otherHost, port, first);
-        await withEnv(cliEnv(dir, port, "127.0.0.1"), () => runCli(["open", second, "--no-open"]));
-        await withEnv(cliEnv(dir, port, undefined), () => runCli(["open", first, "--no-open"]));
-        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", second, "--no-open"]));
+        await withEnv(cliEnv(dir, port, "127.0.0.1"), () => runCli(["open", second, "--no-open", "--view-only"]));
+        await withEnv(cliEnv(dir, port, undefined), () => runCli(["open", first, "--no-open", "--view-only"]));
+        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", second, "--no-open", "--view-only"]));
         assert.equal(await isResolved(pinned.done), false, "the pinned server was replaced");
         assert.deepEqual((await stateSessions(dir)).sort(), [first, second].sort());
       } finally {
@@ -559,7 +559,7 @@ test(
         idleTimeoutMs: null,
       });
       try {
-        await withEnv(sweepEnv(dir, port, undefined), () => runCli(["open", artifact, "--no-open"]));
+        await withEnv(sweepEnv(dir, port, undefined), () => runCli(["open", artifact, "--no-open", "--view-only"]));
         assert.equal(await isResolved(otherInstall.done), false, "another installation's server was stopped");
         assert.equal(await isResolved(kept.done), false);
       } finally {
@@ -582,7 +582,7 @@ test(
       });
       try {
         const { key } = await openSession(otherHost, port, artifact);
-        await withEnv(sweepEnv(dir, port, undefined), () => runCli(["open", artifact, "--no-open"]));
+        await withEnv(sweepEnv(dir, port, undefined), () => runCli(["open", artifact, "--no-open", "--view-only"]));
         assert.ok(await waitFor(() => isResolved(duplicate.done)), "the duplicate daemon was not retired");
         const survivor = await health(otherHost, port);
         assert.ok(survivor.hosts.includes("127.0.0.1") && survivor.hosts.includes(otherHost), survivor.hosts.join());
@@ -615,7 +615,9 @@ test("another installation's server on loopback is never used or stopped", { tim
       idleTimeoutMs: null,
     });
     try {
-      const output = await withEnv(cliEnv(dir, port, undefined), () => captureCli(["open", artifact, "--no-open"]));
+      const output = await withEnv(cliEnv(dir, port, undefined), () =>
+        captureCli(["open", artifact, "--no-open", "--view-only"]),
+      );
       assert.match(output, /SERVER_ERROR/);
       // TOON escapes backslashes in quoted Windows paths.
       assert.ok(
@@ -658,7 +660,7 @@ test(
       });
       await new Promise((resolve) => old.listen({ host: otherHost, port }, () => resolve(undefined)));
       try {
-        await withEnv(sweepEnv(dir, port, undefined), () => runCli(["open", artifact, "--no-open"]));
+        await withEnv(sweepEnv(dir, port, undefined), () => runCli(["open", artifact, "--no-open", "--view-only"]));
         assert.equal(shutdowns, 0, "the old server at another address was asked to shut down");
         const started = await health("127.0.0.1", port);
         assert.equal(started.version, VERSION);
@@ -699,7 +701,7 @@ test(
       // before the replacement this CLI spawns can bind.
       const racer = first.done.then(() => loopbackOnly());
       try {
-        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", artifact, "--no-open"]));
+        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", artifact, "--no-open", "--view-only"]));
         const winner = await racer;
         assert.equal(await isResolved(winner.done), true, "the racing loopback-only server was adopted");
         const served = await health(otherHost, port);
@@ -760,7 +762,9 @@ test(
       });
       await new Promise((resolve) => loopbackOnly.listen({ host: "127.0.0.1", port }, () => resolve(undefined)));
       try {
-        const output = await withEnv(cliEnv(dir, port, otherHost), () => captureCli(["open", artifact, "--no-open"]));
+        const output = await withEnv(cliEnv(dir, port, otherHost), () =>
+          captureCli(["open", artifact, "--no-open", "--view-only"]),
+        );
         assert.equal(shutdowns, 2, "expected the initial replacement plus exactly one retry");
         assert.match(output, /SERVER_ERROR/);
         assert.ok(output.includes(otherHost), `expected the missing address in ${output}`);
@@ -808,7 +812,7 @@ test(
         idleTimeoutMs: null,
       });
       try {
-        await withEnv(sweepEnv(dir, port, otherHost), () => runCli(["open", artifact, "--no-open"]));
+        await withEnv(sweepEnv(dir, port, otherHost), () => runCli(["open", artifact, "--no-open", "--view-only"]));
         assert.equal(await isResolved(oldLoopback.done), true, "the old loopback daemon survived the upgrade");
         assert.equal(await isResolved(oldPinned.done), true, "the old pinned daemon survived the upgrade");
         const upgraded = await health(otherHost, port);
@@ -850,7 +854,7 @@ test(
       });
       try {
         const { key } = await openSession(otherHost, port, first);
-        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", second, "--no-open"]));
+        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", second, "--no-open", "--view-only"]));
         assert.equal(await isResolved(old.done), true, "the old server was not replaced");
         const upgraded = await health(otherHost, port);
         assert.equal(upgraded.version, VERSION);
@@ -861,7 +865,7 @@ test(
         assert.deepEqual((await stateSessions(dir)).sort(), [first, second].sort());
 
         // The other agent finds its address already served and keeps the same daemon.
-        await withEnv(cliEnv(dir, port, "::1"), () => runCli(["open", first, "--no-open"]));
+        await withEnv(cliEnv(dir, port, "::1"), () => runCli(["open", first, "--no-open", "--view-only"]));
         const after = await health(otherHost, port);
         assert.equal(after.version, VERSION);
         assert.deepEqual([...after.hosts].sort(), [...upgraded.hosts].sort());
@@ -897,7 +901,7 @@ test(
       });
       try {
         const { key } = await openSession(otherHost, port, first);
-        await withEnv(cliEnv(dir, port, "::1"), () => runCli(["open", second, "--no-open"]));
+        await withEnv(cliEnv(dir, port, "::1"), () => runCli(["open", second, "--no-open", "--view-only"]));
         assert.equal(await isResolved(old.done), true, "the old server was not replaced");
         const upgraded = await health("[::1]", port);
         assert.equal(upgraded.version, VERSION);
@@ -906,7 +910,7 @@ test(
           assert.equal(await getStatus(`${origin}/session/${key}`), 200, `review link at ${origin} stopped working`);
         }
 
-        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", first, "--no-open"]));
+        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", first, "--no-open", "--view-only"]));
         assert.deepEqual([...(await health(otherHost, port)).hosts].sort(), [...upgraded.hosts].sort());
         assert.deepEqual((await stateSessions(dir)).sort(), [first, second].sort());
       } finally {
@@ -937,7 +941,7 @@ test(
       });
       try {
         const output = await withEnv(cliEnv(dir, port, unresolvable), () =>
-          captureCli(["open", artifact, "--no-open"]),
+          captureCli(["open", artifact, "--no-open", "--view-only"]),
         );
         assert.equal(await isResolved(loopbackOnly.done), true, "a server that never asked for the host was adopted");
         assert.match(output, /network_warning/);
@@ -1010,7 +1014,7 @@ test(
         const { key } = await openSession(otherHost, port, artifact);
         tailscale = { ipv4: otherHost, magicDnsName: "after.example.ts.net" };
         // The agent pins ::1, so the replacement it starts does not detect Tailscale itself.
-        await withEnv(cliEnv(dir, port, "::1"), () => runCli(["open", artifact, "--no-open"]));
+        await withEnv(cliEnv(dir, port, "::1"), () => runCli(["open", artifact, "--no-open", "--view-only"]));
         assert.equal(await isResolved(stale.done), true, "the network-stale server was not replaced");
         const replacement = await health("127.0.0.1", port);
         assert.ok(replacement.hosts.includes(otherHost), `lost the live tailnet address: ${replacement.hosts}`);
@@ -1060,7 +1064,7 @@ test(
         assert.equal(await reachable(otherHost, port), true);
 
         // An agent pinned to the address that name resolves to finds it served.
-        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", artifact, "--no-open"]));
+        await withEnv(cliEnv(dir, port, otherHost), () => runCli(["open", artifact, "--no-open", "--view-only"]));
         assert.equal(await isResolved(server.done), false, "a server serving the address was replaced");
       } finally {
         await server.close().catch(() => {});

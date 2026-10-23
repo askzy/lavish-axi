@@ -730,7 +730,7 @@ test("fork: every agent-facing poll surface distinguishes first poll, running ha
     cli.createPollOutput({ file: "/tmp/report.html", response: { status: "feedback", prompts: [] } }).next_step,
   ];
   for (const text of outputs) {
-    assert.match(text, /first indefinite poll immediately/i);
+    assert.match(text, /claim a listener, open the review, and wait/i);
     assert.match(text, /session_id.*write_stdin/);
     assert.match(text, /functions\.exec.*functions\.wait/);
     assert.match(text, /Claude.*tracked background task.*completion notification/i);

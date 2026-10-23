@@ -60,7 +60,7 @@ test(
     };
 
     function openArtifact(file, args = []) {
-      const output = run(process.execPath, ["bin/lavish-axi.js", file, "--no-open", ...args], lavishEnv);
+      const output = run(process.execPath, ["bin/lavish-axi.js", file, "--no-open", "--view-only", ...args], lavishEnv);
       const url = output.match(/url:\s*"([^"]+)"/)?.[1];
       assert.ok(url, output);
       return url;
@@ -457,7 +457,7 @@ test("a live reload preserves the review context Lavish owns", { skip: !runBrows
   try {
     const artifact = path.join(temp, "review-context.html");
     await copyFile(path.join(fixtures, "review-context.html"), artifact);
-    const output = run(process.execPath, ["bin/lavish-axi.js", artifact, "--no-open"], lavishEnv);
+    const output = run(process.execPath, ["bin/lavish-axi.js", artifact, "--no-open", "--view-only"], lavishEnv);
     const url = output.match(/url:\s*"([^"]+)"/)?.[1];
     assert.ok(url, output);
     run("chrome-devtools-axi", ["emulate", "--viewport", "1440x1000x1"], chromeEnv);

@@ -733,7 +733,7 @@ test("open output carries a network warning and tells the agent to pass it on", 
     status: "opened",
   });
   assert.equal("network_warning" in clean, false);
-  assert.match(clean.next_step, /^Do not respond to the user just yet\./);
+  assert.match(clean.next_step, /^This command claims a listener/);
 
   const userEnded = createUserEndedOpenOutput({
     file: "/tmp/artifact.html",
@@ -758,7 +758,7 @@ test("open output keeps the user URL in session data and next_step focused on po
   // reopen etiquette. Sentence-level phrasing is free to change without touching this test.
   assert.doesNotMatch(output.next_step, /Tell the user (?:to open|to visit)/i);
   assert.doesNotMatch(output.next_step, /http:\/\/localhost:4387\/session\/abc123/);
-  assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
+  assert.match(output.next_step, /claims a listener, opens the review, and waits for feedback/);
   assert.match(output.next_step, /lavish-axi poll \/tmp\/artifact\.html/);
   assert.match(output.next_step, /keep waiting for more feedback/);
   assert.match(output.next_step, /lavish-axi reply \/tmp\/artifact\.html --agent-reply/);

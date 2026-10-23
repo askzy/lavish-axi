@@ -60,7 +60,7 @@ lease.
 
 ## Rules
 
-- After opening a review, start the first indefinite poll immediately, without --timeout-ms. The no-repoll-after-reap rule never skips this first poll.
+- The parent session runs `npx -y lavish-axi <html-file>` to claim a listener, open the review, and wait in one tracked command. Subagents only build or edit the artifact and return its path. Use `--view-only` only for an explicitly requested read-only page. `--no-open` suppresses the browser launch and still listens.
 - Run the poll in the foreground when your harness allows it, so it returns the feedback directly to the agent. If your harness caps how long a foreground command may run, running the poll as a background task is expected and supported.
 - Codex: when exec_command yields a session_id, the poll is still running. Continue waiting with repeated write_stdin calls on that same session_id until the command exits. When functions.exec yields a running cell, continue with repeated functions.wait calls on the same cell_id. Continuing a running command is not starting another poll. Use waits of at most 60 seconds so you can share progress, without adding a timeout to the poll itself. A running handle is not a completion notification: stay in the active turn and do not send a final answer while claiming to listen.
 - Claude: start the poll as a harness-native tracked background task, retain its task identity, and handle its completion notification in the same parent session. Starting the task is required before handing back the review; opening the page alone does not start listening.

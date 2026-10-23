@@ -170,7 +170,7 @@ test(
     try {
       const artifact = path.join(temp, "attach.html");
       await writeFile(artifact, ARTIFACT_HTML);
-      const output = run(process.execPath, ["bin/lavish-axi.js", artifact, "--no-open"], lavishEnv);
+      const output = run(process.execPath, ["bin/lavish-axi.js", artifact, "--no-open", "--view-only"], lavishEnv);
       const url = output.match(/url:\s*"([^"]+)"/)?.[1];
       assert.ok(url, output);
       const key = new URL(url).pathname.split("/").pop();
