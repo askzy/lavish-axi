@@ -10,6 +10,9 @@ importers:
       "@tailwindcss/browser":
         specifier: 4.2.4
         version: 4.2.4
+      "@toon-format/toon":
+        specifier: 2.1.0
+        version: 2.1.0
       axi-sdk-js:
         specifier: ^0.1.8
         version: 0.1.8

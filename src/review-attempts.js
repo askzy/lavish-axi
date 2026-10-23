@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
@@ -25,5 +26,33 @@ export function updateReviewAttempt(stateFile, id, fields) {
   mkdirSync(path.dirname(file), { recursive: true });
   writeFileSync(`${file}.tmp`, JSON.stringify(record) + "\n", { mode: 0o600 });
   renameSync(`${file}.tmp`, file);
+  if (record.harness) {
+    try {
+      const indexFile = reviewSessionIndexPath(stateFile, record.harness);
+      let index = { v: 1, active: [], recent: [] };
+      try {
+        index = JSON.parse(readFileSync(indexFile, "utf8"));
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      const active = index.active.filter((item) => item !== id);
+      if (!record.finishedAt) active.push(id);
+      const recent = [...index.recent.filter((item) => item !== id), id].slice(-64);
+      mkdirSync(path.dirname(indexFile), { recursive: true });
+      writeFileSync(`${indexFile}.tmp`, JSON.stringify({ v: 1, active, recent }) + "\n", { mode: 0o600 });
+      renameSync(`${indexFile}.tmp`, indexFile);
+    } catch {
+      process.stderr.write(
+        "[lavish-axi] Review guard session index could not be updated. Review delivery continues.\n",
+      );
+    }
+  }
   return record;
+}
+
+export function reviewSessionIndexPath(stateFile, harness) {
+  const key = createHash("sha256")
+    .update(JSON.stringify([harness.name, harness.sessionId]))
+    .digest("hex");
+  return path.join(path.dirname(stateFile), "review-attempts", "by-session", `${key}.json`);
 }

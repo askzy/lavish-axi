@@ -1,0 +1,437 @@
+{
+  "provenance": "Captured from installed Codex 0.162.1 and Claude Code 2.1.309 on 2026-10-23. Codex snapshots were captured inside Stop. Non-tool transcript content was omitted. Claude native callback was consumed by the same parent model. Review-attempt records in unit tests are constructed test state, not claims of live end-to-end validation.",
+  "codexSession": "01a16a7c-8073-7e72-ac99-a90d95e11585",
+  "codexTurn": "01a16a7c-809d-7f32-9984-aa3c46cbcd93",
+  "codexFirst": [
+    {
+      "type": "session_meta",
+      "payload": {
+        "session_id": "01a16a7c-8073-7e72-ac99-a90d95e11585",
+        "id": "01a16a7c-8073-7e72-ac99-a90d95e11585",
+        "thread_source": "user"
+      }
+    },
+    {
+      "type": "turn_context",
+      "payload": {
+        "turn_id": "01a16a7c-809d-7f32-9984-aa3c46cbcd93"
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call",
+        "id": "ctc_085ce7fab400cd0f016adbc5c6042887d2b84ee464aad1ab75",
+        "status": "completed",
+        "call_id": "call_iQr4gnXpjC5HYW9qEC0cJB2f",
+        "name": "exec",
+        "input": "// @exec: {\"yield_time_ms\": 1000}\ntext(await tools.exec_command({cmd:\"sleep 8\",yield_time_ms:1000}));\n",
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7c-809d-7f32-9984-aa3c46cbcd93",
+          "create_time": 1792787908.839581
+        }
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a16a7c-95e5-76d3-b257-01ce50eef871",
+        "call_id": "call_iQr4gnXpjC5HYW9qEC0cJB2f",
+        "output": "Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n",
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7c-809d-7f32-9984-aa3c46cbcd93",
+          "create_time": 1792787912.165591
+        }
+      }
+    }
+  ],
+  "codexSecond": [
+    {
+      "type": "session_meta",
+      "payload": {
+        "session_id": "01a16a7c-8073-7e72-ac99-a90d95e11585",
+        "id": "01a16a7c-8073-7e72-ac99-a90d95e11585",
+        "thread_source": "user"
+      }
+    },
+    {
+      "type": "turn_context",
+      "payload": {
+        "turn_id": "01a16a7c-809d-7f32-9984-aa3c46cbcd93"
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call",
+        "id": "ctc_085ce7fab400cd0f016adbc5c6042887d2b84ee464aad1ab75",
+        "status": "completed",
+        "call_id": "call_iQr4gnXpjC5HYW9qEC0cJB2f",
+        "name": "exec",
+        "input": "// @exec: {\"yield_time_ms\": 1000}\ntext(await tools.exec_command({cmd:\"sleep 8\",yield_time_ms:1000}));\n",
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7c-809d-7f32-9984-aa3c46cbcd93",
+          "create_time": 1792787908.839581
+        }
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a16a7c-95e5-76d3-b257-01ce50eef871",
+        "call_id": "call_iQr4gnXpjC5HYW9qEC0cJB2f",
+        "output": "Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n",
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7c-809d-7f32-9984-aa3c46cbcd93",
+          "create_time": 1792787912.165591
+        }
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "function_call",
+        "id": "fc_085ce7fab400cd0f016adbc5cc09b887d2976ca9968b305495",
+        "name": "wait",
+        "arguments": "{\"cell_id\":\"1\",\"max_tokens\":1000,\"yield_time_ms\":10000}",
+        "call_id": "call_ck9RuW9iXAOlpmrfdEnyNNuD",
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7c-809d-7f32-9984-aa3c46cbcd93",
+          "create_time": 1792787914.763698
+        }
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "function_call_output",
+        "id": "fco_01a16a7c-a686-7040-833c-59dded45efd3",
+        "call_id": "call_ck9RuW9iXAOlpmrfdEnyNNuD",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script completed\nWall time 0.0 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"chunk_id\":\"fa5595\",\"wall_time_seconds\":1.001021959,\"session_id\":73520,\"original_token_count\":0,\"output\":\"\"}"
+          }
+        ],
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7c-809d-7f32-9984-aa3c46cbcd93",
+          "create_time": 1792787916.422388
+        }
+      }
+    }
+  ],
+  "claudeEvents": [
+    {
+      "session_id": "fd4ab503-ad01-4584-9bab-a2eaf2e53a55",
+      "transcript_path": "/Users/justin_zeus/.claude/projects/-private-tmp-lavish-harness-probe-claude/fd4ab503-ad01-4584-9bab-a2eaf2e53a55.jsonl",
+      "cwd": "/private/tmp/lavish-harness-probe/claude",
+      "hook_event_name": "SessionStart",
+      "source": "startup"
+    },
+    {
+      "session_id": "fd4ab503-ad01-4584-9bab-a2eaf2e53a55",
+      "transcript_path": "/Users/justin_zeus/.claude/projects/-private-tmp-lavish-harness-probe-claude/fd4ab503-ad01-4584-9bab-a2eaf2e53a55.jsonl",
+      "cwd": "/private/tmp/lavish-harness-probe/claude",
+      "prompt_id": "5461bd63-e28e-42ef-942f-646a2a417f56",
+      "permission_mode": "auto",
+      "effort": {
+        "level": "medium"
+      },
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "sleep 6; echo LAVISH_CALLBACK_PROBE",
+        "description": "Run delayed echo in background",
+        "run_in_background": true
+      },
+      "tool_use_id": "toolu_01EYVqwHmXNv8uSJYC4997DD"
+    },
+    {
+      "session_id": "fd4ab503-ad01-4584-9bab-a2eaf2e53a55",
+      "transcript_path": "/Users/justin_zeus/.claude/projects/-private-tmp-lavish-harness-probe-claude/fd4ab503-ad01-4584-9bab-a2eaf2e53a55.jsonl",
+      "cwd": "/private/tmp/lavish-harness-probe/claude",
+      "prompt_id": "5461bd63-e28e-42ef-942f-646a2a417f56",
+      "permission_mode": "auto",
+      "effort": {
+        "level": "medium"
+      },
+      "hook_event_name": "PostToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "sleep 6; echo LAVISH_CALLBACK_PROBE",
+        "description": "Run delayed echo in background",
+        "run_in_background": true
+      },
+      "tool_response": {
+        "stdout": "",
+        "stderr": "",
+        "interrupted": false,
+        "isImage": false,
+        "noOutputExpected": false,
+        "backgroundTaskId": "bmdujprq4"
+      },
+      "tool_use_id": "toolu_01EYVqwHmXNv8uSJYC4997DD",
+      "duration_ms": 808
+    },
+    {
+      "session_id": "fd4ab503-ad01-4584-9bab-a2eaf2e53a55",
+      "transcript_path": "/Users/justin_zeus/.claude/projects/-private-tmp-lavish-harness-probe-claude/fd4ab503-ad01-4584-9bab-a2eaf2e53a55.jsonl",
+      "cwd": "/private/tmp/lavish-harness-probe/claude",
+      "prompt_id": "5461bd63-e28e-42ef-942f-646a2a417f56",
+      "permission_mode": "auto",
+      "effort": {
+        "level": "medium"
+      },
+      "hook_event_name": "Stop",
+      "stop_hook_active": false,
+      "last_assistant_message": "BACKGROUND_STARTED",
+      "background_tasks": [
+        {
+          "id": "bmdujprq4",
+          "type": "shell",
+          "status": "running",
+          "description": "Run delayed echo in background",
+          "command": "sleep 6; echo LAVISH_CALLBACK_PROBE"
+        }
+      ],
+      "session_crons": []
+    },
+    {
+      "session_id": "fd4ab503-ad01-4584-9bab-a2eaf2e53a55",
+      "transcript_path": "/Users/justin_zeus/.claude/projects/-private-tmp-lavish-harness-probe-claude/fd4ab503-ad01-4584-9bab-a2eaf2e53a55.jsonl",
+      "cwd": "/private/tmp/lavish-harness-probe/claude",
+      "prompt_id": "23a5dfbd-b400-4b63-83f3-d027638d7ac4",
+      "permission_mode": "auto",
+      "effort": {
+        "level": "medium"
+      },
+      "hook_event_name": "Stop",
+      "stop_hook_active": false,
+      "last_assistant_message": "CALLBACK_RECEIVED",
+      "background_tasks": [],
+      "session_crons": []
+    },
+    {
+      "session_id": "e24a5182-6941-4544-8d7c-50bbd2dd1f16",
+      "transcript_path": "/Users/justin_zeus/.claude/projects/-private-tmp-lavish-harness-probe-claude/e24a5182-6941-4544-8d7c-50bbd2dd1f16.jsonl",
+      "cwd": "/private/tmp/lavish-harness-probe/claude",
+      "hook_event_name": "SessionStart",
+      "source": "startup"
+    },
+    {
+      "session_id": "e24a5182-6941-4544-8d7c-50bbd2dd1f16",
+      "transcript_path": "/Users/justin_zeus/.claude/projects/-private-tmp-lavish-harness-probe-claude/e24a5182-6941-4544-8d7c-50bbd2dd1f16.jsonl",
+      "cwd": "/private/tmp/lavish-harness-probe/claude",
+      "prompt_id": "e54b1e42-54e8-42b4-b06e-c16035ea0124",
+      "permission_mode": "auto",
+      "effort": {
+        "level": "medium"
+      },
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "python3 -c 'import os,json; print(json.dumps({k:os.environ.get(k) for k in [\"CODEX_THREAD_ID\",\"CODEX_SESSION_ID\",\"CLAUDE_SESSION_ID\",\"CLAUDE_CODE_SESSION_ID\"]}))'",
+        "description": "Print session ID environment variables as JSON"
+      },
+      "tool_use_id": "toolu_018dCCdTSEKL7PamRycirgGP"
+    },
+    {
+      "session_id": "e24a5182-6941-4544-8d7c-50bbd2dd1f16",
+      "transcript_path": "/Users/justin_zeus/.claude/projects/-private-tmp-lavish-harness-probe-claude/e24a5182-6941-4544-8d7c-50bbd2dd1f16.jsonl",
+      "cwd": "/private/tmp/lavish-harness-probe/claude",
+      "prompt_id": "e54b1e42-54e8-42b4-b06e-c16035ea0124",
+      "permission_mode": "auto",
+      "effort": {
+        "level": "medium"
+      },
+      "hook_event_name": "PostToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "python3 -c 'import os,json; print(json.dumps({k:os.environ.get(k) for k in [\"CODEX_THREAD_ID\",\"CODEX_SESSION_ID\",\"CLAUDE_SESSION_ID\",\"CLAUDE_CODE_SESSION_ID\"]}))'",
+        "description": "Print session ID environment variables as JSON"
+      },
+      "tool_response": {
+        "stdout": "{\"CODEX_THREAD_ID\": \"01a16a7a-0943-7973-95bd-62bbc2b725ff\", \"CODEX_SESSION_ID\": \"01a16a1e-ecc0-7bc3-a23f-6a45ae26014e\", \"CLAUDE_SESSION_ID\": null, \"CLAUDE_CODE_SESSION_ID\": \"e24a5182-6941-4544-8d7c-50bbd2dd1f16\"}",
+        "stderr": "",
+        "interrupted": false,
+        "isImage": false,
+        "noOutputExpected": false
+      },
+      "tool_use_id": "toolu_018dCCdTSEKL7PamRycirgGP",
+      "duration_ms": 942
+    },
+    {
+      "session_id": "e24a5182-6941-4544-8d7c-50bbd2dd1f16",
+      "transcript_path": "/Users/justin_zeus/.claude/projects/-private-tmp-lavish-harness-probe-claude/e24a5182-6941-4544-8d7c-50bbd2dd1f16.jsonl",
+      "cwd": "/private/tmp/lavish-harness-probe/claude",
+      "prompt_id": "e54b1e42-54e8-42b4-b06e-c16035ea0124",
+      "permission_mode": "auto",
+      "effort": {
+        "level": "medium"
+      },
+      "hook_event_name": "Stop",
+      "stop_hook_active": false,
+      "last_assistant_message": "```json\n{\"CODEX_THREAD_ID\": \"01a16a7a-0943-7973-95bd-62bbc2b725ff\", \"CODEX_SESSION_ID\": \"01a16a1e-ecc0-7bc3-a23f-6a45ae26014e\", \"CLAUDE_SESSION_ID\": null, \"CLAUDE_CODE_SESSION_ID\": \"e24a5182-6941-4544-8d7c-50bbd2dd1f16\"}\n```",
+      "background_tasks": [],
+      "session_crons": []
+    }
+  ],
+  "codexFull": [
+    {
+      "type": "session_meta",
+      "payload": {
+        "session_id": "01a16a7d-f9f1-7613-956c-20b56ca4812b",
+        "id": "01a16a7d-f9f1-7613-956c-20b56ca4812b",
+        "thread_source": "user"
+      }
+    },
+    {
+      "type": "turn_context",
+      "payload": {
+        "turn_id": "01a16a7d-fa32-7713-9045-0ba306e805c1"
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call",
+        "id": "ctc_01ec7e217ecff210016adbc626335487d2ac9be323bde255ef",
+        "status": "completed",
+        "call_id": "call_wTX5moZ5h1GlXNp4DSByqBbo",
+        "name": "exec",
+        "input": "// @exec: {\"yield_time_ms\": 1000}\ntext(await tools.exec_command({cmd:\"sleep 8\",yield_time_ms:1000}));\n",
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7d-fa32-7713-9045-0ba306e805c1",
+          "create_time": 1792788005.24526
+        }
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a16a7e-0d7f-7482-95b0-314069f42e88",
+        "call_id": "call_wTX5moZ5h1GlXNp4DSByqBbo",
+        "output": "Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n",
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7d-fa32-7713-9045-0ba306e805c1",
+          "create_time": 1792788008.319184
+        }
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "function_call",
+        "id": "fc_01ec7e217ecff210016adbc62cbdc087d2a3a30f40f87d0a18",
+        "name": "wait",
+        "arguments": "{\"cell_id\":\"1\",\"max_tokens\":1000}",
+        "call_id": "call_af61qkCP12t7SO5JdhMGpFhN",
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7d-fa32-7713-9045-0ba306e805c1",
+          "create_time": 1792788011.614882
+        }
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "function_call_output",
+        "id": "fco_01a16a7e-1ffb-7113-8962-810cc0b707a3",
+        "call_id": "call_af61qkCP12t7SO5JdhMGpFhN",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script completed\nWall time 0.0 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"chunk_id\":\"b2162e\",\"wall_time_seconds\":1.001816625,\"session_id\":93012,\"original_token_count\":0,\"output\":\"\"}"
+          }
+        ],
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7d-fa32-7713-9045-0ba306e805c1",
+          "create_time": 1792788013.05177
+        }
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call",
+        "id": "ctc_01ec7e217ecff210016adbc62e879087d2b5c151834424e5f2",
+        "status": "completed",
+        "call_id": "call_LGo5hExfiu0LXNAhu7V7LJHO",
+        "name": "exec",
+        "input": "text(await tools.write_stdin({session_id:93012,chars:\"\",yield_time_ms:1000,max_output_tokens:1000}));\n",
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7d-fa32-7713-9045-0ba306e805c1",
+          "create_time": 1792788013.656954
+        }
+      }
+    },
+    {
+      "timestamp": "2026-10-23T20:40:15.940Z",
+      "ordinal": 29,
+      "type": "event_msg",
+      "payload": {
+        "type": "item_completed",
+        "thread_id": "01a16a7d-f9f1-7613-956c-20b56ca4812b",
+        "turn_id": "01a16a7d-fa32-7713-9045-0ba306e805c1",
+        "item": {
+          "type": "CommandExecution",
+          "id": "exec-48bacee6-5c06-44d8-9ebe-8c2b62a802aa",
+          "process_id": "93012",
+          "command": ["/bin/zsh", "-lc", "sleep 8"],
+          "cwd": "file:///tmp/lavish-harness-probe/codex",
+          "parsed_cmd": [
+            {
+              "type": "unknown",
+              "cmd": "sleep 8"
+            }
+          ],
+          "source": "unified_exec_startup",
+          "status": "completed",
+          "aggregated_output": "",
+          "exit_code": 0,
+          "duration": {
+            "secs": 7,
+            "nanos": 969459084
+          }
+        },
+        "started_at_ms": 1792788007970,
+        "completed_at_ms": 1792788015940
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a16a7e-2c3d-7372-82c0-c63fddfd060e",
+        "call_id": "call_LGo5hExfiu0LXNAhu7V7LJHO",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "Script completed\nWall time 1.1 seconds\nOutput:\n"
+          },
+          {
+            "type": "input_text",
+            "text": "{\"chunk_id\":\"8abc42\",\"wall_time_seconds\":0.860834667,\"exit_code\":0,\"original_token_count\":0,\"output\":\"\"}"
+          }
+        ],
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a16a7d-fa32-7713-9045-0ba306e805c1",
+          "create_time": 1792788016.189852
+        }
+      }
+    }
+  ],
+  "codexFullSession": "01a16a7d-f9f1-7613-956c-20b56ca4812b",
+  "codexFullTurn": "01a16a7d-fa32-7713-9045-0ba306e805c1"
+}
